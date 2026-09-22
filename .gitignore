@@ -60,6 +60,9 @@ dlldata.c
 # Benchmark Results
 BenchmarkDotNet.Artifacts/
 
+# Paket restore cache
+paket-files/
+
 # .NET
 project.lock.json
 project.fragment.lock.json

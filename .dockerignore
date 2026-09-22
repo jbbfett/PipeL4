@@ -1,0 +1,5 @@
+.git/
+**/bin/
+**/obj/
+BenchmarkDotNet.Artifacts/
+paket-files/

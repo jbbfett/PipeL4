@@ -1,0 +1,10 @@
+source https://api.nuget.org/v3/index.json
+
+storage: none
+
+nuget BenchmarkDotNet
+nuget FSharp.Core
+nuget FsUnit.xUnit 7.1.1
+nuget Microsoft.NET.Test.Sdk
+nuget xunit.v3 4.0.1
+nuget xunit.runner.visualstudio 4.0.0
