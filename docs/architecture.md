@@ -22,6 +22,16 @@ Client
 
 The two directions may run concurrently. Ordering inside each direction is preserved.
 
+### Raw forwarding lifecycle
+
+The raw forwarding baseline runs each direction independently with a runtime-owned pooled buffer.
+
+A normal EOF in one direction is propagated as a TCP send-side shutdown to the destination. The opposite direction remains active until it also reaches EOF, fails, or application shutdown is requested.
+
+A transport failure aborts both sides of that connection so the sibling forwarding operation cannot remain blocked. Connection failures are isolated from the listener and other connections. Application shutdown stops accepting, cancels active connections, and waits for their resources to be disposed.
+
+The future processor API must preserve directional completion and explicit buffer ownership. Processor-specific EOF, flush, and exception contracts remain open.
+
 ## Core
 
 The runtime owns:
@@ -122,5 +132,5 @@ Diagnostics may warn about blocking work, avoidable allocations, expensive seque
 - writable transformation / copy-on-write semantics;
 - scheduling and fast paths between processors;
 - buffering limits and fairness;
-- detailed exception and EOF semantics;
+- processor-specific exception, EOF, and flush semantics beyond raw forwarding;
 - plugin reload/unload behavior.

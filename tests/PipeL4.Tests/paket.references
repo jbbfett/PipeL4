@@ -1,5 +1,6 @@
 FSharp.Core
 FsUnit.xUnit
 Microsoft.NET.Test.Sdk
+Microsoft.Extensions.Logging.Abstractions
 xunit.v3
 xunit.runner.visualstudio

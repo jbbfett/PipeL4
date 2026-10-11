@@ -2,6 +2,7 @@ module PipeL4.Program
 
 open System
 open System.Threading
+open Microsoft.Extensions.Logging
 open PipeL4.Core
 
 let private usage =
@@ -21,8 +22,17 @@ let main arguments =
             eventArguments.Cancel <- true
             shutdown.Cancel())
 
+        use loggerFactory =
+            LoggerFactory.Create(fun builder ->
+                builder
+                    .SetMinimumLevel(LogLevel.Information)
+                    .AddJsonConsole()
+                |> ignore)
+
+        let logger = loggerFactory.CreateLogger("PipeL4.Core.TcpForwarder")
+
         try
-            TcpForwarder.runAsync configuration shutdown.Token
+            TcpForwarder.runAsync configuration logger shutdown.Token
             |> fun runtime -> runtime.GetAwaiter().GetResult()
 
             0

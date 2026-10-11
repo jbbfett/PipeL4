@@ -6,5 +6,7 @@ nuget BenchmarkDotNet
 nuget FSharp.Core
 nuget FsUnit.xUnit 7.1.1
 nuget Microsoft.NET.Test.Sdk
+nuget Microsoft.Extensions.Logging.Abstractions 10.0.12
+nuget Microsoft.Extensions.Logging.Console 10.0.12
 nuget xunit.v3 4.0.1
 nuget xunit.runner.visualstudio 4.0.0
