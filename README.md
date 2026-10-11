@@ -49,6 +49,28 @@ For now:
 - [Architecture](docs/architecture.md)
 - [Agent instructions](AGENTS.md)
 
+## Benchmarks
+
+The raw TCP forwarding benchmark is the pre-processor-pipeline baseline. It compares a direct IPv4 loopback connection with the same traffic sent through PipeL4. Each operation uses a persistent connection for one request/response echo exchange with a 64 B, 4 KiB, or 1 MiB payload. Reads accumulate the expected byte count and do not assume that TCP preserves write boundaries.
+
+BenchmarkDotNet reports round-trip duration, the ratio to the direct baseline, and managed allocations. `Logical MiB/s` counts the application payload once in each direction; it does not count bytes separately for both TCP legs of the proxied route. Listener creation, connection establishment, buffer allocation, and a validated preflight exchange occur during global setup rather than measurement.
+
+Run the full benchmark locally in Release mode:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- --filter '*RawTcpForwardingBenchmarks*'
+```
+
+Use BenchmarkDotNet's dry job for a smoke run:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- --filter '*RawTcpForwardingBenchmarks*' --job Dry
+```
+
+The generated reports include the runtime, operating system, CPU, and SDK context. They are written beneath `BenchmarkDotNet.Artifacts/`, which is intentionally excluded from source control.
+
+This baseline covers one persistent connection with one exchange in flight. It does not measure connection startup, concurrent-connection scaling, or pipelined streaming throughput. Allocation results cover the in-process client, echo backend, and proxy workload rather than PipeL4 alone. Copied-byte ratio and runtime buffer-memory accounting are not available in the raw forwarder and are not instrumented by this benchmark.
+
 ## License
 
 TBD

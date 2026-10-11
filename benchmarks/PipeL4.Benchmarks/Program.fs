@@ -1,14 +1,20 @@
 namespace PipeL4.Benchmarks
 
-open BenchmarkDotNet.Attributes
+open BenchmarkDotNet.Columns
+open BenchmarkDotNet.Configs
 open BenchmarkDotNet.Running
-
-type SmokeBenchmark() =
-    [<Benchmark>]
-    member _.ReturnConstant() = 42
 
 module Program =
     [<EntryPoint>]
     let main args =
-        BenchmarkSwitcher.FromAssembly(typeof<SmokeBenchmark>.Assembly).Run(args) |> ignore
+        let configuration =
+            ManualConfig.Create(DefaultConfig.Instance).AddColumn(
+                [| LogicalThroughputColumn() :> IColumn |]
+            )
+
+        BenchmarkSwitcher
+            .FromAssembly(typeof<RawTcpForwardingBenchmarks>.Assembly)
+            .Run(args, configuration)
+        |> ignore
+
         0
