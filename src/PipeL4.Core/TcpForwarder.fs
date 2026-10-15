@@ -23,6 +23,11 @@ type private ForwardingOutcome =
     | Cancelled of ForwardingDirection
     | Failed of ForwardingDirection * exn
 
+[<NoEquality; NoComparison>]
+type internal DirectionalProcessorPipelines =
+    { ClientToBackend: IByteStreamProcessor array
+      BackendToClient: IByteStreamProcessor array }
+
 [<RequireQualifiedAccess>]
 module TcpForwarder =
     [<Literal>]
@@ -30,10 +35,41 @@ module TcpForwarder =
 
     let private tryShutdownSend (socket: Socket) =
         try
-            socket.Shutdown(SocketShutdown.Send)
+            socket.Shutdown SocketShutdown.Send
         with
         | :? SocketException
         | :? ObjectDisposedException -> ()
+
+    type private SocketPipelineSink(destination: Socket) =
+        interface IProcessorPipelineSink with
+            member _.WriteAsync(bytes, cancellationToken) =
+                ValueTask(
+                    task {
+                        let mutable position = bytes.Start
+                        let mutable segment = ReadOnlyMemory<byte>.Empty
+
+                        while bytes.TryGet(&position, &segment) do
+                            let mutable sent = 0
+
+                            while sent < segment.Length do
+                                let! sentNow =
+                                    destination.SendAsync(
+                                        segment.Slice sent,
+                                        SocketFlags.None,
+                                        cancellationToken
+                                    )
+
+                                if sentNow = 0 then
+                                    raise (SocketException(int SocketError.ConnectionReset))
+
+                                sent <- sent + sentNow
+                    }
+                )
+
+            member _.CompleteAsync cancellationToken =
+                cancellationToken.ThrowIfCancellationRequested()
+                tryShutdownSend destination
+                ValueTask()
 
     let private forward
         direction
@@ -42,7 +78,7 @@ module TcpForwarder =
         (cancellationToken: CancellationToken)
         =
         task {
-            let buffer = ArrayPool<byte>.Shared.Rent(BufferSize)
+            let buffer = ArrayPool<byte>.Shared.Rent BufferSize
 
             try
                 try
@@ -87,6 +123,52 @@ module TcpForwarder =
                 ArrayPool<byte>.Shared.Return(buffer, clearArray = false)
         }
 
+    let private forwardWithProcessorPipeline
+        direction
+        (processors: IByteStreamProcessor array)
+        (source: Socket)
+        (destination: Socket)
+        (cancellationToken: CancellationToken)
+        =
+        task {
+            let sink = SocketPipelineSink destination
+            use pipeline = new ProcessorPipeline(processors, sink, MemoryPool<byte>.Shared)
+
+            try
+                let mutable reachedEndOfStream = false
+
+                while not reachedEndOfStream do
+                    let owner = MemoryPool<byte>.Shared.Rent BufferSize
+                    let mutable transferred = false
+
+                    try
+                        let! received =
+                            source.ReceiveAsync(
+                                owner.Memory.Slice(0, BufferSize),
+                                SocketFlags.None,
+                                cancellationToken
+                            )
+
+                        if received = 0 then
+                            reachedEndOfStream <- true
+                        else
+                            transferred <- true
+                            do! pipeline.PushAsync(owner, received, cancellationToken)
+                    finally
+                        if not transferred then
+                            owner.Dispose()
+
+                do! pipeline.CompleteAsync cancellationToken
+                return EndOfStream direction
+            with
+            | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                return Cancelled direction
+            | :? ObjectDisposedException when cancellationToken.IsCancellationRequested ->
+                return Cancelled direction
+            | error ->
+                return Failed(direction, error)
+        }
+
     let private logForwardingFailure (logger: ILogger) connectionId clientEndpoint backendEndpoint outcome =
         match outcome with
         | Failed(direction, error) ->
@@ -104,6 +186,7 @@ module TcpForwarder =
     let private handleConnection
         connectionId
         (configuration: ForwardingConfiguration)
+        (processorPipelineFactory: (unit -> DirectionalProcessorPipelines) option)
         (logger: ILogger)
         (client: TcpClient)
         (cancellationToken: CancellationToken)
@@ -125,21 +208,36 @@ module TcpForwarder =
                 )
 
                 use connectionCancellation =
-                    CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                    CancellationTokenSource.CreateLinkedTokenSource cancellationToken
 
-                let clientToBackend =
-                    forward
-                        ClientToBackend
-                        client.Client
-                        backend.Client
-                        connectionCancellation.Token
+                let clientToBackend, backendToClient =
+                    match processorPipelineFactory with
+                    | None ->
+                        forward
+                            ClientToBackend
+                            client.Client
+                            backend.Client
+                            connectionCancellation.Token,
+                        forward
+                            BackendToClient
+                            backend.Client
+                            client.Client
+                            connectionCancellation.Token
+                    | Some createProcessorPipelines ->
+                        let processorPipelines = createProcessorPipelines ()
 
-                let backendToClient =
-                    forward
-                        BackendToClient
-                        backend.Client
-                        client.Client
-                        connectionCancellation.Token
+                        forwardWithProcessorPipeline
+                            ClientToBackend
+                            processorPipelines.ClientToBackend
+                            client.Client
+                            backend.Client
+                            connectionCancellation.Token,
+                        forwardWithProcessorPipeline
+                            BackendToClient
+                            processorPipelines.BackendToClient
+                            backend.Client
+                            client.Client
+                            connectionCancellation.Token
 
                 let! firstCompleted = Task.WhenAny(clientToBackend, backendToClient)
                 let! firstOutcome = firstCompleted
@@ -238,8 +336,9 @@ module TcpForwarder =
         )
         |> ignore
 
-    let runAsync
+    let private run
         (configuration: ForwardingConfiguration)
+        (processorPipelineFactory: (unit -> DirectionalProcessorPipelines) option)
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
@@ -264,7 +363,7 @@ module TcpForwarder =
 
                     while not runtimeCancellation.IsCancellationRequested do
                         let! client =
-                            listener.AcceptTcpClientAsync(runtimeCancellation.Token)
+                            listener.AcceptTcpClientAsync runtimeCancellation.Token
 
                         let connectionId = Interlocked.Increment(&nextConnectionId)
 
@@ -272,6 +371,7 @@ module TcpForwarder =
                             handleConnection
                                 connectionId
                                 configuration
+                                processorPipelineFactory
                                 logger
                                 client
                                 runtimeCancellation.Token
@@ -302,3 +402,18 @@ module TcpForwarder =
             | Some error -> return raise error
             | None -> return ()
         }
+
+    let runAsync
+        (configuration: ForwardingConfiguration)
+        (logger: ILogger)
+        (cancellationToken: CancellationToken)
+        =
+        run configuration None logger cancellationToken
+
+    let internal runWithProcessorPipelinesAsync
+        (configuration: ForwardingConfiguration)
+        (processorPipelineFactory: unit -> DirectionalProcessorPipelines)
+        (logger: ILogger)
+        (cancellationToken: CancellationToken)
+        =
+        run configuration (Some processorPipelineFactory) logger cancellationToken

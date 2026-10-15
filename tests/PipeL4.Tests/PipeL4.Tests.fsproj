@@ -11,6 +11,8 @@
     <Compile Include="AssemblyInfo.fs" />
     <Compile Include="ForwardingConfigurationTests.fs" />
     <Compile Include="TcpForwarderIntegrationTests.fs" />
+    <Compile Include="ProcessorContractTests.fs" />
+    <Compile Include="ProcessorPipelineTests.fs" />
     <Compile Include="SmokeTests.fs" />
   </ItemGroup>
 

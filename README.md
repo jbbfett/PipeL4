@@ -51,7 +51,18 @@ For now:
 
 ## Benchmarks
 
-The raw TCP forwarding benchmark is the pre-processor-pipeline baseline. It compares a direct IPv4 loopback connection with the same traffic sent through PipeL4. Each operation uses a persistent connection for one request/response echo exchange with a 64 B, 4 KiB, or 1 MiB payload. Reads accumulate the expected byte count and do not assume that TCP preserves write boundaries.
+The TCP forwarding benchmark compares six IPv4 loopback routes:
+
+- `Direct` connects directly to the echo backend;
+- `RawPipeL4` uses the raw forwarding implementation;
+- `ViaEmptyProcessorPipeline` uses the processor-enabled path with no processors;
+- `ViaProcessorPipeline` uses one identity processor in each direction;
+- `ViaFourProcessorPipeline` uses four identity processors in each direction;
+- `ViaEightProcessorPipeline` uses eight identity processors in each direction.
+
+Each identity processor emits its complete input as an input-backed range and retains nothing, so the depth comparison measures pipeline scheduling, ownership, and range-management overhead rather than application logic. Tests verify through eight stages that this path preserves the runtime-owned input backing instead of making an intermediate payload copy.
+
+Each operation uses a persistent connection for one request/response echo exchange with a 64 B, 4 KiB, or 1 MiB payload. Reads accumulate the expected byte count and do not assume that TCP preserves write boundaries.
 
 BenchmarkDotNet reports round-trip duration, the ratio to the direct baseline, and managed allocations. `Logical MiB/s` counts the application payload once in each direction; it does not count bytes separately for both TCP legs of the proxied route. Listener creation, connection establishment, buffer allocation, and a validated preflight exchange occur during global setup rather than measurement.
 
@@ -69,7 +80,7 @@ dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- --filter '*RawTc
 
 The generated reports include the runtime, operating system, CPU, and SDK context. They are written beneath `BenchmarkDotNet.Artifacts/`, which is intentionally excluded from source control.
 
-This baseline covers one persistent connection with one exchange in flight. It does not measure connection startup, concurrent-connection scaling, or pipelined streaming throughput. Allocation results cover the in-process client, echo backend, and proxy workload rather than PipeL4 alone. Copied-byte ratio and runtime buffer-memory accounting are not available in the raw forwarder and are not instrumented by this benchmark.
+These scenarios cover one persistent connection with one exchange in flight. They do not measure connection startup, concurrent-connection scaling, or pipelined streaming throughput. Allocation results cover the in-process client, echo backend, and proxy workload rather than PipeL4 alone. Exact copied-byte ratios and logical/physical runtime buffer-memory counters are not yet exposed and are not approximated by this benchmark.
 
 ## License
 

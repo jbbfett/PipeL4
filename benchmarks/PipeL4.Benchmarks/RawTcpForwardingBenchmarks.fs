@@ -14,6 +14,12 @@ open BenchmarkDotNet.Running
 open Microsoft.Extensions.Logging.Abstractions
 open PipeL4.Core
 
+[<RequireQualifiedAccess>]
+type private ForwardingRoute =
+    | Direct
+    | RawPipeL4
+    | ProcessorPipeline of depth: int
+
 type LogicalThroughputColumn() =
     let calculateValue (summary: Summary) (benchmarkCase: BenchmarkCase) =
         let payloadSize =
@@ -173,13 +179,25 @@ type RawTcpForwardingBenchmarks() =
             | :? ObjectDisposedException when cancellationToken.IsCancellationRequested -> ()
         }
 
+    let passThroughProcessor () =
+        { new IByteStreamProcessor with
+            member _.ProcessAsync(input, output, _) =
+                output.AppendInput(0L, input.Bytes.Length)
+                ValueTask<ProcessorResult>({ RetainedLength = 0L }) }
+
+    let createProcessorPipelines depth () =
+        let createPipeline () = Array.init depth (fun _ -> passThroughProcessor ())
+
+        { ClientToBackend = createPipeline ()
+          BackendToClient = createPipeline () }
+
     member private _.RoundTrip() =
         task {
             do! clientStream.WriteAsync(payload.AsMemory(), CancellationToken.None)
             do! readExactly clientStream response CancellationToken.None
         }
 
-    member private this.Setup(viaPipeL4: bool) =
+    member private this.Setup(route: ForwardingRoute) =
         task {
             payload <- Array.init this.PayloadSize (fun index -> byte (index % 251))
             response <- Array.zeroCreate this.PayloadSize
@@ -196,7 +214,9 @@ type RawTcpForwardingBenchmarks() =
             let acceptBackend = listener.AcceptTcpClientAsync(setupTimeout.Token).AsTask()
 
             let! clientConnection =
-                if viaPipeL4 then
+                match route with
+                | ForwardingRoute.Direct -> connect backendPort setupTimeout.Token
+                | ForwardingRoute.RawPipeL4 ->
                     let proxyPort = reservePort ()
                     let configuration = createConfiguration proxyPort backendPort
 
@@ -205,8 +225,19 @@ type RawTcpForwardingBenchmarks() =
                         :> Task
 
                     connect proxyPort setupTimeout.Token
-                else
-                    connect backendPort setupTimeout.Token
+                | ForwardingRoute.ProcessorPipeline depth ->
+                    let proxyPort = reservePort ()
+                    let configuration = createConfiguration proxyPort backendPort
+
+                    proxyCompletion <-
+                        TcpForwarder.runWithProcessorPipelinesAsync
+                            configuration
+                            (createProcessorPipelines depth)
+                            NullLogger.Instance
+                            cancellation.Token
+                        :> Task
+
+                    connect proxyPort setupTimeout.Token
 
             client <- Some clientConnection
 
@@ -232,10 +263,22 @@ type RawTcpForwardingBenchmarks() =
     member val PayloadSize = 0 with get, set
 
     [<GlobalSetup(Target = "Direct")>]
-    member this.SetupDirect() = this.Setup(viaPipeL4 = false)
+    member this.SetupDirect() = this.Setup(ForwardingRoute.Direct)
 
-    [<GlobalSetup(Target = "ViaPipeL4")>]
-    member this.SetupViaPipeL4() = this.Setup(viaPipeL4 = true)
+    [<GlobalSetup(Target = "RawPipeL4")>]
+    member this.SetupRawPipeL4() = this.Setup(ForwardingRoute.RawPipeL4)
+
+    [<GlobalSetup(Target = "ViaEmptyProcessorPipeline")>]
+    member this.SetupViaEmptyProcessorPipeline() = this.Setup(ForwardingRoute.ProcessorPipeline 0)
+
+    [<GlobalSetup(Target = "ViaProcessorPipeline")>]
+    member this.SetupViaProcessorPipeline() = this.Setup(ForwardingRoute.ProcessorPipeline 1)
+
+    [<GlobalSetup(Target = "ViaFourProcessorPipeline")>]
+    member this.SetupViaFourProcessorPipeline() = this.Setup(ForwardingRoute.ProcessorPipeline 4)
+
+    [<GlobalSetup(Target = "ViaEightProcessorPipeline")>]
+    member this.SetupViaEightProcessorPipeline() = this.Setup(ForwardingRoute.ProcessorPipeline 8)
 
     [<GlobalCleanup>]
     member _.Cleanup() =
@@ -274,4 +317,16 @@ type RawTcpForwardingBenchmarks() =
     member this.Direct() = this.RoundTrip()
 
     [<Benchmark>]
-    member this.ViaPipeL4() = this.RoundTrip()
+    member this.RawPipeL4() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.ViaEmptyProcessorPipeline() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.ViaProcessorPipeline() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.ViaFourProcessorPipeline() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.ViaEightProcessorPipeline() = this.RoundTrip()
