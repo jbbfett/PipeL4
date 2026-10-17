@@ -1,5 +1,17 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <RestoreEnablePackagePruning>false</RestoreEnablePackagePruning>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="ProcessorApi.fs" />
+    <Compile Include="ScriptProcessor.fs" />
+    <Compile Include="ScriptCompiler.fs" />
+    <Compile Include="ScriptPipelines.fs" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="../PipeL4.Core/PipeL4.Core.fsproj" />
   </ItemGroup>

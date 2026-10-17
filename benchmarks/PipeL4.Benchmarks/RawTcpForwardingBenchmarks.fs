@@ -1,6 +1,7 @@
 namespace PipeL4.Benchmarks
 
 open System
+open System.Diagnostics
 open System.Globalization
 open System.IO
 open System.Net
@@ -15,10 +16,24 @@ open Microsoft.Extensions.Logging.Abstractions
 open PipeL4.Core
 
 [<RequireQualifiedAccess>]
+type private ScriptFixture =
+    | InputBacked
+    | GeneratedOutput
+
+    member this.FileName =
+        match this with
+        | InputBacked -> "PassThrough.fsx"
+        | GeneratedOutput -> "GeneratedOutput.fsx"
+
+    member this.ResourceName =
+        $"PipeL4.Benchmarks.Scripts.{this.FileName}"
+
+[<RequireQualifiedAccess>]
 type private ForwardingRoute =
     | Direct
     | RawPipeL4
-    | ProcessorPipeline of depth: int
+    | InternalProcessorPipeline of depth: int
+    | FsxProcessorPipeline of fixture: ScriptFixture * depth: int
 
 type LogicalThroughputColumn() =
     let calculateValue (summary: Summary) (benchmarkCase: BenchmarkCase) =
@@ -71,6 +86,7 @@ type RawTcpForwardingBenchmarks() =
     let mutable clientStream = Unchecked.defaultof<NetworkStream>
     let mutable payload = Array.empty<byte>
     let mutable response = Array.empty<byte>
+    let mutable scriptWorkspace: string option = None
 
     let endpointPort (listener: TcpListener) =
         (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -80,16 +96,22 @@ type RawTcpForwardingBenchmarks() =
         listener.Start()
         endpointPort listener
 
-    let createConfiguration listenPort backendPort =
+    let createConfiguration listenPort backendPort clientPaths serverPaths =
+        let pluginArguments optionName paths =
+            paths |> Array.collect (fun path -> [| optionName; path |])
+
         let arguments =
-            [| "--listen-address"
-               string loopback
-               "--listen-port"
-               string listenPort
-               "--backend-host"
-               string loopback
-               "--backend-port"
-               string backendPort |]
+            Array.concat
+                [| [| "--listen-address"
+                      string loopback
+                      "--listen-port"
+                      string listenPort
+                      "--backend-host"
+                      string loopback
+                      "--backend-port"
+                      string backendPort |]
+                   pluginArguments "--client-to-server-plugin" clientPaths
+                   pluginArguments "--server-to-client-plugin" serverPaths |]
 
         match ForwardingConfiguration.tryParseArguments arguments with
         | Ok configuration -> configuration
@@ -191,6 +213,71 @@ type RawTcpForwardingBenchmarks() =
         { ClientToBackend = createPipeline ()
           BackendToClient = createPipeline () }
 
+    let materializeScript (fixture: ScriptFixture) =
+        let workspace =
+            Path.Combine(
+                Path.GetTempPath(),
+                "PipeL4.Benchmarks",
+                Guid.NewGuid().ToString "N"
+            )
+
+        Directory.CreateDirectory workspace |> ignore
+        scriptWorkspace <- Some workspace
+
+        let assembly = typeof<RawTcpForwardingBenchmarks>.Assembly
+
+        use sourceStream =
+            assembly.GetManifestResourceStream(fixture.ResourceName)
+            |> Option.ofObj
+            |> Option.defaultWith (fun () ->
+                invalidOp $"Embedded benchmark script '{fixture.ResourceName}' was not found.")
+
+        use reader = new StreamReader(sourceStream)
+        let scriptPath = Path.Combine(workspace, fixture.FileName)
+        File.WriteAllText(scriptPath, reader.ReadToEnd())
+        scriptPath
+
+    let loadScriptDefinitionAsync
+        (fixture: ScriptFixture)
+        (depth: int)
+        (cancellationToken: CancellationToken)
+        : Task<PipeL4.Plugins.ScriptPipelineDefinition>
+        =
+        task {
+            let scriptPath = materializeScript fixture
+            let paths = Array.replicate depth scriptPath
+            let compiler = PipeL4.Plugins.ScriptCompiler()
+            let mutable compilationCount = 0
+            let stopwatch = Stopwatch.StartNew()
+
+            let compile (path: string) (token: CancellationToken) =
+                Interlocked.Increment(&compilationCount) |> ignore
+                compiler.CompileAndLoadAsync(path, token)
+
+            let! definition =
+                PipeL4.Plugins.ScriptPipelineLoader.loadWithCompilerAsync
+                    compile
+                    paths
+                    paths
+                    cancellationToken
+
+            stopwatch.Stop()
+
+            if compilationCount <> 1 then
+                invalidOp
+                    $"The benchmark expected one unique script compilation, but observed {compilationCount}."
+
+            Console.WriteLine(
+                "FSX startup observation: fixture={0}; depth-per-direction={1}; unique-compilations={2}; compile-load-discover-ms={3:F3}",
+                fixture.FileName,
+                depth,
+                compilationCount,
+                stopwatch.Elapsed.TotalMilliseconds
+            )
+
+            return definition
+        }
+
     member private _.RoundTrip() =
         task {
             do! clientStream.WriteAsync(payload.AsMemory(), CancellationToken.None)
@@ -218,16 +305,18 @@ type RawTcpForwardingBenchmarks() =
                 | ForwardingRoute.Direct -> connect backendPort setupTimeout.Token
                 | ForwardingRoute.RawPipeL4 ->
                     let proxyPort = reservePort ()
-                    let configuration = createConfiguration proxyPort backendPort
+                    let configuration =
+                        createConfiguration proxyPort backendPort Array.empty Array.empty
 
                     proxyCompletion <-
                         TcpForwarder.runAsync configuration NullLogger.Instance cancellation.Token
                         :> Task
 
                     connect proxyPort setupTimeout.Token
-                | ForwardingRoute.ProcessorPipeline depth ->
+                | ForwardingRoute.InternalProcessorPipeline depth ->
                     let proxyPort = reservePort ()
-                    let configuration = createConfiguration proxyPort backendPort
+                    let configuration =
+                        createConfiguration proxyPort backendPort Array.empty Array.empty
 
                     proxyCompletion <-
                         TcpForwarder.runWithProcessorPipelinesAsync
@@ -238,6 +327,27 @@ type RawTcpForwardingBenchmarks() =
                         :> Task
 
                     connect proxyPort setupTimeout.Token
+                | ForwardingRoute.FsxProcessorPipeline(fixture, depth) ->
+                    task {
+                        let proxyPort = reservePort ()
+                        let! definition =
+                            loadScriptDefinitionAsync fixture depth setupTimeout.Token
+
+                        let paths = definition.ClientToServerPaths
+
+                        let configuration =
+                            createConfiguration proxyPort backendPort paths paths
+
+                        proxyCompletion <-
+                            TcpForwarder.runWithOptionalProcessorPipelineFactoryAsync
+                                configuration
+                                definition.CreateProcessorPipelinesAsync
+                                NullLogger.Instance
+                                cancellation.Token
+                            :> Task
+
+                        return! connect proxyPort setupTimeout.Token
+                    }
 
             client <- Some clientConnection
 
@@ -269,16 +379,32 @@ type RawTcpForwardingBenchmarks() =
     member this.SetupRawPipeL4() = this.Setup(ForwardingRoute.RawPipeL4)
 
     [<GlobalSetup(Target = "ViaEmptyProcessorPipeline")>]
-    member this.SetupViaEmptyProcessorPipeline() = this.Setup(ForwardingRoute.ProcessorPipeline 0)
+    member this.SetupViaEmptyProcessorPipeline() =
+        this.Setup(ForwardingRoute.InternalProcessorPipeline 0)
 
-    [<GlobalSetup(Target = "ViaProcessorPipeline")>]
-    member this.SetupViaProcessorPipeline() = this.Setup(ForwardingRoute.ProcessorPipeline 1)
+    [<GlobalSetup(Target = "InternalProcessorPipeline")>]
+    member this.SetupInternalProcessorPipeline() =
+        this.Setup(ForwardingRoute.InternalProcessorPipeline 1)
 
-    [<GlobalSetup(Target = "ViaFourProcessorPipeline")>]
-    member this.SetupViaFourProcessorPipeline() = this.Setup(ForwardingRoute.ProcessorPipeline 4)
+    [<GlobalSetup(Target = "InternalFourStagePipeline")>]
+    member this.SetupInternalFourStagePipeline() =
+        this.Setup(ForwardingRoute.InternalProcessorPipeline 4)
 
-    [<GlobalSetup(Target = "ViaEightProcessorPipeline")>]
-    member this.SetupViaEightProcessorPipeline() = this.Setup(ForwardingRoute.ProcessorPipeline 8)
+    [<GlobalSetup(Target = "InternalEightStagePipeline")>]
+    member this.SetupInternalEightStagePipeline() =
+        this.Setup(ForwardingRoute.InternalProcessorPipeline 8)
+
+    [<GlobalSetup(Target = "FsxProcessorPipeline")>]
+    member this.SetupFsxProcessorPipeline() =
+        this.Setup(ForwardingRoute.FsxProcessorPipeline(ScriptFixture.InputBacked, 1))
+
+    [<GlobalSetup(Target = "FsxFourStagePipeline")>]
+    member this.SetupFsxFourStagePipeline() =
+        this.Setup(ForwardingRoute.FsxProcessorPipeline(ScriptFixture.InputBacked, 4))
+
+    [<GlobalSetup(Target = "FsxGeneratedOutputPipeline")>]
+    member this.SetupFsxGeneratedOutputPipeline() =
+        this.Setup(ForwardingRoute.FsxProcessorPipeline(ScriptFixture.GeneratedOutput, 1))
 
     [<GlobalCleanup>]
     member _.Cleanup() =
@@ -301,6 +427,11 @@ type RawTcpForwardingBenchmarks() =
 
             do! Task.WhenAll(echoCompletion, proxyCompletion)
 
+            match scriptWorkspace with
+            | Some workspace when Directory.Exists workspace ->
+                Directory.Delete(workspace, recursive = true)
+            | _ -> ()
+
             match lifetimeCancellation with
             | Some cancellation -> cancellation.Dispose()
             | None -> ()
@@ -311,6 +442,7 @@ type RawTcpForwardingBenchmarks() =
             lifetimeCancellation <- None
             proxyCompletion <- Task.CompletedTask
             echoCompletion <- Task.CompletedTask
+            scriptWorkspace <- None
         }
 
     [<Benchmark(Baseline = true)>]
@@ -323,10 +455,19 @@ type RawTcpForwardingBenchmarks() =
     member this.ViaEmptyProcessorPipeline() = this.RoundTrip()
 
     [<Benchmark>]
-    member this.ViaProcessorPipeline() = this.RoundTrip()
+    member this.InternalProcessorPipeline() = this.RoundTrip()
 
     [<Benchmark>]
-    member this.ViaFourProcessorPipeline() = this.RoundTrip()
+    member this.InternalFourStagePipeline() = this.RoundTrip()
 
     [<Benchmark>]
-    member this.ViaEightProcessorPipeline() = this.RoundTrip()
+    member this.InternalEightStagePipeline() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.FsxProcessorPipeline() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.FsxFourStagePipeline() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.FsxGeneratedOutputPipeline() = this.RoundTrip()

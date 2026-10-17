@@ -107,6 +107,37 @@ module ProcessorPipelineTests =
             value.AsSpan().CopyTo(output.GetSpan(value.Length))
             output.Advance(value.Length)
 
+    type private BothDisposableProcessor
+        (
+            name: string,
+            events: ResizeArray<string>,
+            disposeFailure: exn option
+        ) =
+        interface IByteStreamProcessor with
+            member _.ProcessAsync(input, output, _) =
+                output.AppendInput(0L, input.Bytes.Length)
+                completed 0L
+
+        interface IDisposable with
+            member _.Dispose() = events.Add($"sync:{name}")
+
+        interface IAsyncDisposable with
+            member _.DisposeAsync() =
+                events.Add($"async:{name}")
+
+                match disposeFailure with
+                | Some error -> ValueTask(Task.FromException(error))
+                | None -> ValueTask()
+
+    type private SyncDisposableProcessor(name: string, events: ResizeArray<string>) =
+        interface IByteStreamProcessor with
+            member _.ProcessAsync(input, output, _) =
+                output.AppendInput(0L, input.Bytes.Length)
+                completed 0L
+
+        interface IDisposable with
+            member _.Dispose() = events.Add($"sync:{name}")
+
     let private push (pipeline: ProcessorPipeline) (input: TrackingOwner) =
         pipeline.PushAsync(input, input.Buffer.Length, CancellationToken.None)
 
@@ -1637,4 +1668,68 @@ module ProcessorPipelineTests =
             sink.Bytes |> should equal expected
             inputs |> Seq.forall (fun item -> item.DisposeCount = 1) |> should equal true
             pool.Owners |> Seq.forall (fun item -> item.DisposeCount = 1) |> should equal true
+        }
+
+    [<Fact>]
+    let ``pipeline disposes processors once in reverse order and prefers async disposal`` () =
+        task {
+            let events = ResizeArray<string>()
+            let sink = RecordingSink()
+
+            let first =
+                new BothDisposableProcessor("first", events, None)
+                :> IByteStreamProcessor
+
+            let second =
+                new SyncDisposableProcessor("second", events)
+                :> IByteStreamProcessor
+
+            let third =
+                new BothDisposableProcessor("third", events, None)
+                :> IByteStreamProcessor
+
+            let pipeline =
+                new ProcessorPipeline(
+                    [| first; second; third |],
+                    sink,
+                    MemoryPool<byte>.Shared
+                )
+
+            do! push pipeline (owner "ABC")
+            do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+            do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+
+            events
+            |> Seq.toArray
+            |> should equal [| "async:third"; "sync:second"; "async:first" |]
+        }
+
+    [<Fact>]
+    let ``pipeline continues reverse disposal after a processor cleanup failure`` () =
+        task {
+            let events = ResizeArray<string>()
+            let sink = RecordingSink()
+            let expected = InvalidOperationException("dispose failed")
+
+            let processors =
+                [| new BothDisposableProcessor("first", events, None)
+                   new BothDisposableProcessor("second", events, Some expected)
+                   new BothDisposableProcessor("third", events, None) |]
+                |> Array.map (fun value -> value :> IByteStreamProcessor)
+
+            let pipeline =
+                new ProcessorPipeline(processors, sink, MemoryPool<byte>.Shared)
+
+            let! observed =
+                Assert.ThrowsAsync<InvalidOperationException>(fun () ->
+                    (pipeline :> IAsyncDisposable).DisposeAsync().AsTask())
+
+            Object.ReferenceEquals(expected, observed) |> should equal true
+
+            events
+            |> Seq.toArray
+            |> should equal [| "async:third"; "async:second"; "async:first" |]
+
+            do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+            events.Count |> should equal 3
         }

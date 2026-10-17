@@ -28,6 +28,11 @@ type internal DirectionalProcessorPipelines =
     { ClientToBackend: IByteStreamProcessor array
       BackendToClient: IByteStreamProcessor array }
 
+[<NoEquality; NoComparison>]
+type private DirectionalPipelineSelection =
+    { ClientToBackend: IByteStreamProcessor array option
+      BackendToClient: IByteStreamProcessor array option }
+
 [<RequireQualifiedAccess>]
 module TcpForwarder =
     [<Literal>]
@@ -132,41 +137,69 @@ module TcpForwarder =
         =
         task {
             let sink = SocketPipelineSink destination
-            use pipeline = new ProcessorPipeline(processors, sink, MemoryPool<byte>.Shared)
+            let pipeline = new ProcessorPipeline(processors, sink, MemoryPool<byte>.Shared)
 
-            try
-                let mutable reachedEndOfStream = false
-
-                while not reachedEndOfStream do
-                    let owner = MemoryPool<byte>.Shared.Rent BufferSize
-                    let mutable transferred = false
-
+            let! outcome =
+                task {
                     try
-                        let! received =
-                            source.ReceiveAsync(
-                                owner.Memory.Slice(0, BufferSize),
-                                SocketFlags.None,
-                                cancellationToken
-                            )
+                        let mutable reachedEndOfStream = false
 
-                        if received = 0 then
-                            reachedEndOfStream <- true
-                        else
-                            transferred <- true
-                            do! pipeline.PushAsync(owner, received, cancellationToken)
-                    finally
-                        if not transferred then
-                            owner.Dispose()
+                        while not reachedEndOfStream do
+                            let owner = MemoryPool<byte>.Shared.Rent BufferSize
+                            let mutable transferred = false
 
-                do! pipeline.CompleteAsync cancellationToken
-                return EndOfStream direction
-            with
-            | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
-                return Cancelled direction
-            | :? ObjectDisposedException when cancellationToken.IsCancellationRequested ->
-                return Cancelled direction
-            | error ->
-                return Failed(direction, error)
+                            try
+                                let! received =
+                                    source.ReceiveAsync(
+                                        owner.Memory.Slice(0, BufferSize),
+                                        SocketFlags.None,
+                                        cancellationToken
+                                    )
+
+                                if received = 0 then
+                                    reachedEndOfStream <- true
+                                else
+                                    transferred <- true
+                                    do! pipeline.PushAsync(owner, received, cancellationToken)
+                            finally
+                                if not transferred then
+                                    owner.Dispose()
+
+                        do! pipeline.CompleteAsync cancellationToken
+                        return EndOfStream direction
+                    with
+                    | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                        return Cancelled direction
+                    | :? ObjectDisposedException when cancellationToken.IsCancellationRequested ->
+                        return Cancelled direction
+                    | error ->
+                        return Failed(direction, error)
+                }
+
+            let! disposalFailure =
+                task {
+                    try
+                        do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+                        return None
+                    with error ->
+                        return Some error
+                }
+
+            match outcome, disposalFailure with
+            | value, None -> return value
+            | Failed(failedDirection, error), Some disposalError ->
+                return
+                    Failed(
+                        failedDirection,
+                        AggregateException(
+                            "Processor pipeline execution and disposal both failed.",
+                            error,
+                            disposalError
+                        )
+                    )
+            | EndOfStream completedDirection, Some disposalError
+            | Cancelled completedDirection, Some disposalError ->
+                return Failed(completedDirection, disposalError)
         }
 
     let private logForwardingFailure (logger: ILogger) connectionId clientEndpoint backendEndpoint outcome =
@@ -186,7 +219,7 @@ module TcpForwarder =
     let private handleConnection
         connectionId
         (configuration: ForwardingConfiguration)
-        (processorPipelineFactory: (unit -> DirectionalProcessorPipelines) option)
+        (processorPipelineFactory: (unit -> ValueTask<DirectionalPipelineSelection>) option)
         (logger: ILogger)
         (client: TcpClient)
         (cancellationToken: CancellationToken)
@@ -210,8 +243,17 @@ module TcpForwarder =
                 use connectionCancellation =
                     CancellationTokenSource.CreateLinkedTokenSource cancellationToken
 
-                let clientToBackend, backendToClient =
+                let! processorPipelines =
                     match processorPipelineFactory with
+                    | None -> Task.FromResult None
+                    | Some createProcessorPipelines ->
+                        task {
+                            let! pipelines = createProcessorPipelines().AsTask()
+                            return Some pipelines
+                        }
+
+                let clientToBackend, backendToClient =
+                    match processorPipelines with
                     | None ->
                         forward
                             ClientToBackend
@@ -223,21 +265,33 @@ module TcpForwarder =
                             backend.Client
                             client.Client
                             connectionCancellation.Token
-                    | Some createProcessorPipelines ->
-                        let processorPipelines = createProcessorPipelines ()
+                    | Some processorPipelines ->
+                        let forwardDirection direction processors source destination =
+                            match processors with
+                            | Some values ->
+                                forwardWithProcessorPipeline
+                                    direction
+                                    values
+                                    source
+                                    destination
+                                    connectionCancellation.Token
+                            | None ->
+                                forward
+                                    direction
+                                    source
+                                    destination
+                                    connectionCancellation.Token
 
-                        forwardWithProcessorPipeline
+                        forwardDirection
                             ClientToBackend
                             processorPipelines.ClientToBackend
                             client.Client
-                            backend.Client
-                            connectionCancellation.Token,
-                        forwardWithProcessorPipeline
+                            backend.Client,
+                        forwardDirection
                             BackendToClient
                             processorPipelines.BackendToClient
                             backend.Client
                             client.Client
-                            connectionCancellation.Token
 
                 let! firstCompleted = Task.WhenAny(clientToBackend, backendToClient)
                 let! firstOutcome = firstCompleted
@@ -338,7 +392,7 @@ module TcpForwarder =
 
     let private run
         (configuration: ForwardingConfiguration)
-        (processorPipelineFactory: (unit -> DirectionalProcessorPipelines) option)
+        (processorPipelineFactory: (unit -> ValueTask<DirectionalPipelineSelection>) option)
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
@@ -416,4 +470,53 @@ module TcpForwarder =
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
-        run configuration (Some processorPipelineFactory) logger cancellationToken
+        let createSelection () =
+            let pipelines = processorPipelineFactory ()
+
+            ValueTask<DirectionalPipelineSelection>(
+                { ClientToBackend = Some pipelines.ClientToBackend
+                  BackendToClient = Some pipelines.BackendToClient }
+            )
+
+        run configuration (Some createSelection) logger cancellationToken
+
+    let internal runWithOptionalProcessorPipelinesAsync
+        (configuration: ForwardingConfiguration)
+        (processorPipelineFactory: unit -> DirectionalProcessorPipelines)
+        (logger: ILogger)
+        (cancellationToken: CancellationToken)
+        =
+        let optional processors =
+            if Array.isEmpty processors then None else Some processors
+
+        let createSelection () =
+            let pipelines = processorPipelineFactory ()
+
+            ValueTask<DirectionalPipelineSelection>(
+                { ClientToBackend = optional pipelines.ClientToBackend
+                  BackendToClient = optional pipelines.BackendToClient }
+            )
+
+        run configuration (Some createSelection) logger cancellationToken
+
+    let internal runWithOptionalProcessorPipelineFactoryAsync
+        (configuration: ForwardingConfiguration)
+        (processorPipelineFactory: unit -> ValueTask<DirectionalProcessorPipelines>)
+        (logger: ILogger)
+        (cancellationToken: CancellationToken)
+        =
+        let optional processors =
+            if Array.isEmpty processors then None else Some processors
+
+        let createSelection () =
+            ValueTask<DirectionalPipelineSelection>(
+                task {
+                    let! pipelines = processorPipelineFactory().AsTask()
+
+                    return
+                        { ClientToBackend = optional pipelines.ClientToBackend
+                          BackendToClient = optional pipelines.BackendToClient }
+                }
+            )
+
+        run configuration (Some createSelection) logger cancellationToken

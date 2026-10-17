@@ -49,22 +49,33 @@ For now:
 - [Architecture](docs/architecture.md)
 - [Agent instructions](AGENTS.md)
 
+## Running with script plugins
+
+Configure F# script processors independently for each direction with repeatable options. Options
+are executed in argument order within their direction:
+
+```sh
+dotnet run --project src/PipeL4 -- \
+  --listen-address 127.0.0.1 \
+  --listen-port 5000 \
+  --backend-host 127.0.0.1 \
+  --backend-port 6000 \
+  --client-to-server-plugin ./plugins/example.fsx
+```
+
+Use `--client-to-server-plugin <path>` for traffic sent to the configured backend and
+`--server-to-client-plugin <path>` for traffic returned to the client. Repeating an option adds
+another stage, so `--client-to-server-plugin a.fsx --client-to-server-plugin b.fsx` executes
+`a.fsx` before `b.fsx`. Configured scripts compile and validate before the listener starts.
+
 ## Benchmarks
 
-The TCP forwarding benchmark compares six IPv4 loopback routes:
-
-- `Direct` connects directly to the echo backend;
-- `RawPipeL4` uses the raw forwarding implementation;
-- `ViaEmptyProcessorPipeline` uses the processor-enabled path with no processors;
-- `ViaProcessorPipeline` uses one identity processor in each direction;
-- `ViaFourProcessorPipeline` uses four identity processors in each direction;
-- `ViaEightProcessorPipeline` uses eight identity processors in each direction.
-
-Each identity processor emits its complete input as an input-backed range and retains nothing, so the depth comparison measures pipeline scheduling, ownership, and range-management overhead rather than application logic. Tests verify through eight stages that this path preserves the runtime-owned input backing instead of making an intermediate payload copy.
-
-Each operation uses a persistent connection for one request/response echo exchange with a 64 B, 4 KiB, or 1 MiB payload. Reads accumulate the expected byte count and do not assume that TCP preserves write boundaries.
-
-BenchmarkDotNet reports round-trip duration, the ratio to the direct baseline, and managed allocations. `Logical MiB/s` counts the application payload once in each direction; it does not count bytes separately for both TCP legs of the proxied route. Listener creation, connection establishment, buffer allocation, and a validated preflight exchange occur during global setup rather than measurement.
+The IPv4 loopback suite compares direct and raw proxy traffic with the empty processor path,
+internal identity processors (one, four, and eight stages), compiled input-backed `.fsx`
+processors (one and four stages), and a generated-output `.fsx` processor. Each measured
+operation is one request/response exchange over a persistent connection with a 64 B, 4 KiB,
+or 1 MiB payload. Compilation, discovery, listener startup, connection establishment, processor
+construction, and a validated preflight exchange occur in global setup.
 
 Run the full benchmark locally in Release mode:
 
@@ -78,9 +89,9 @@ Use BenchmarkDotNet's dry job for a smoke run:
 dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- --filter '*RawTcpForwardingBenchmarks*' --job Dry
 ```
 
-The generated reports include the runtime, operating system, CPU, and SDK context. They are written beneath `BenchmarkDotNet.Artifacts/`, which is intentionally excluded from source control.
-
-These scenarios cover one persistent connection with one exchange in flight. They do not measure connection startup, concurrent-connection scaling, or pipelined streaming throughput. Allocation results cover the in-process client, echo backend, and proxy workload rather than PipeL4 alone. Exact copied-byte ratios and logical/physical runtime buffer-memory counters are not yet exposed and are not approximated by this benchmark.
+See the [benchmark README](benchmarks/PipeL4.Benchmarks/README.md) for route definitions,
+methodology, limitations, and the latest dated branch-exit results. Reports are written beneath
+`BenchmarkDotNet.Artifacts/`, which is intentionally excluded from source control.
 
 ## License
 

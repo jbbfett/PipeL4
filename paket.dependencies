@@ -3,6 +3,7 @@ source https://api.nuget.org/v3/index.json
 storage: none
 
 nuget BenchmarkDotNet
+nuget FSharp.Compiler.Service 43.12.401
 nuget FSharp.Core
 nuget FsUnit.xUnit 7.1.1
 nuget Microsoft.NET.Test.Sdk

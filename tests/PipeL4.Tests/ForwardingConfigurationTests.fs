@@ -42,6 +42,37 @@ module ForwardingConfigurationTests =
         configuration.BackendEndpoint
         |> should equal (IPEndPoint(IPAddress.Parse "127.0.0.2", 8081))
 
+        configuration.ClientToServerPluginPaths |> should be Empty
+        configuration.ServerToClientPluginPaths |> should be Empty
+
+    [<Fact>]
+    let ``parses repeatable directional plugin paths in occurrence order`` () =
+        let arguments =
+            Array.concat
+                [| validArguments
+                   [| "--client-to-server-plugin"
+                      "./plugins/first.fsx"
+                      "--server-to-client-plugin"
+                      "./plugins/reverse.fsx"
+                      "--client-to-server-plugin"
+                      "./plugins/second.fsx"
+                      "--client-to-server-plugin"
+                      "./plugins/first.fsx" |] |]
+
+        let configuration = parse arguments
+
+        configuration.ClientToServerPluginPaths
+        |> Seq.toArray
+        |> should
+            equal
+            [| "./plugins/first.fsx"
+               "./plugins/second.fsx"
+               "./plugins/first.fsx" |]
+
+        configuration.ServerToClientPluginPaths
+        |> Seq.toArray
+        |> should equal [| "./plugins/reverse.fsx" |]
+
     [<Fact>]
     let ``parses IPv6 arguments in any order`` () =
         let arguments =
@@ -93,6 +124,14 @@ module ForwardingConfigurationTests =
         |> expectError "a duplicate argument"
 
         [| "--listen-address" |] |> expectError "an argument without a value"
+
+        Array.append validArguments [| "--client-to-server-plugin" |]
+        |> expectError "a client-to-server plugin without a value"
+
+        Array.append
+            validArguments
+            [| "--server-to-client-plugin"; "--client-to-server-plugin"; "plugin.fsx" |]
+        |> expectError "a server-to-client plugin followed by another option"
 
     [<Fact>]
     let ``rejects invalid listen and backend IP addresses`` () =

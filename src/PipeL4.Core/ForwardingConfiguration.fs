@@ -5,46 +5,93 @@ open System.Collections.Generic
 open System.Net
 
 [<Sealed>]
-type ForwardingConfiguration private (listenEndpoint: IPEndPoint, backendEndpoint: IPEndPoint) =
+type ForwardingConfiguration private (
+    listenEndpoint: IPEndPoint,
+    backendEndpoint: IPEndPoint,
+    clientToServerPluginPaths: string array,
+    serverToClientPluginPaths: string array
+) =
     member _.ListenEndpoint = listenEndpoint
     member _.BackendEndpoint = backendEndpoint
+    member _.ClientToServerPluginPaths: IReadOnlyList<string> = clientToServerPluginPaths
+    member _.ServerToClientPluginPaths: IReadOnlyList<string> = serverToClientPluginPaths
 
-    static member internal Create(listenEndpoint, backendEndpoint) =
-        ForwardingConfiguration(listenEndpoint, backendEndpoint)
+    static member internal Create(
+        listenEndpoint,
+        backendEndpoint,
+        clientToServerPluginPaths,
+        serverToClientPluginPaths
+    ) =
+        ForwardingConfiguration(
+            listenEndpoint,
+            backendEndpoint,
+            clientToServerPluginPaths,
+            serverToClientPluginPaths
+        )
 
 [<RequireQualifiedAccess>]
 module ForwardingConfiguration =
-    let private optionNames =
+    [<Literal>]
+    let private ClientToServerPluginOption = "--client-to-server-plugin"
+
+    [<Literal>]
+    let private ServerToClientPluginOption = "--server-to-client-plugin"
+
+    let private requiredOptionNames =
         [ "--listen-address"
           "--listen-port"
           "--backend-host"
           "--backend-port" ]
 
-    let private knownOptions = Set.ofList optionNames
+    let private knownOptions =
+        Set.ofList(
+            ClientToServerPluginOption
+            :: ServerToClientPluginOption
+            :: requiredOptionNames
+        )
+
+    [<NoEquality; NoComparison>]
+    type private CollectedArguments =
+        { Values: Dictionary<string, string>
+          ClientToServerPluginPaths: ResizeArray<string>
+          ServerToClientPluginPaths: ResizeArray<string> }
 
     let private collectArguments (arguments: string array) =
-        let values = Dictionary<string, string>(StringComparer.Ordinal)
+        let collected =
+            { Values = Dictionary<string, string>(StringComparer.Ordinal)
+              ClientToServerPluginPaths = ResizeArray()
+              ServerToClientPluginPaths = ResizeArray() }
 
         let rec collect index =
             if index = arguments.Length then
-                Ok values
+                Ok collected
             else
                 let optionName = arguments[index]
 
                 if not (knownOptions.Contains optionName) then
                     Error $"Unknown argument '{optionName}'."
-                elif values.ContainsKey optionName then
-                    Error $"Argument '{optionName}' was specified more than once."
                 elif index + 1 >= arguments.Length || knownOptions.Contains arguments[index + 1] then
                     Error $"Missing value for argument '{optionName}'."
                 else
-                    values.Add(optionName, arguments[index + 1])
-                    collect (index + 2)
+                    let value = arguments[index + 1]
+
+                    match optionName with
+                    | ClientToServerPluginOption ->
+                        collected.ClientToServerPluginPaths.Add value
+                        collect (index + 2)
+                    | ServerToClientPluginOption ->
+                        collected.ServerToClientPluginPaths.Add value
+                        collect (index + 2)
+                    | _ when collected.Values.ContainsKey optionName ->
+                        Error $"Argument '{optionName}' was specified more than once."
+                    | _ ->
+                        collected.Values.Add(optionName, value)
+                        collect (index + 2)
 
         collect 0
 
     let private findMissingOption (values: Dictionary<string, string>) =
-        optionNames |> List.tryFind (values.ContainsKey >> not)
+        requiredOptionNames |> List.tryFind (values.ContainsKey >> not)
 
     let private tryParseAddress optionName (value: string): Result<IPAddress, string> =
         match IPAddress.TryParse value with
@@ -62,10 +109,12 @@ module ForwardingConfiguration =
     let tryParseArguments (arguments: string array) =
         match collectArguments arguments with
         | Error error -> Error error
-        | Ok values ->
-            match findMissingOption values with
+        | Ok collected ->
+            match findMissingOption collected.Values with
             | Some optionName -> Error $"Missing required argument '{optionName}'."
             | None ->
+                let values = collected.Values
+
                 match tryParseAddress "--listen-address" values["--listen-address"] with
                 | Error error -> Error error
                 | Ok listenAddress ->
@@ -80,6 +129,8 @@ module ForwardingConfiguration =
                             | Ok backendPort ->
                                 ForwardingConfiguration.Create(
                                     IPEndPoint(listenAddress, listenPort),
-                                    IPEndPoint(backendAddress, backendPort)
+                                    IPEndPoint(backendAddress, backendPort),
+                                    collected.ClientToServerPluginPaths.ToArray(),
+                                    collected.ServerToClientPluginPaths.ToArray()
                                 )
                                 |> Ok

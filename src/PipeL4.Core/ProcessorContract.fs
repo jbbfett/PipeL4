@@ -29,6 +29,35 @@ type internal IByteStreamProcessor =
         cancellationToken: CancellationToken ->
             ValueTask<ProcessorResult>
 
+/// Optional context supplied by an adapter for failures associated with one processor stage.
+/// The executor applies it to invocation and contract-validation failures before they leave the
+/// stage boundary.
+type internal IProcessorFailureContext =
+    abstract ContextualizeFailure:
+        error: exn * cancellationToken: CancellationToken -> exn
+
+[<RequireQualifiedAccess>]
+module internal ProcessorLifetime =
+    let disposeAllAsync (processors: IByteStreamProcessor array) =
+        ValueTask<exn array>(
+            task {
+                let failures = ResizeArray<exn>()
+
+                for index = processors.Length - 1 downto 0 do
+                    try
+                        match processors[index] with
+                        | :? IAsyncDisposable as disposable ->
+                            do! disposable.DisposeAsync().AsTask()
+                        | :? IDisposable as disposable ->
+                            disposable.Dispose()
+                        | _ -> ()
+                    with error ->
+                        failures.Add error
+
+                return failures.ToArray()
+            }
+        )
+
 [<RequireQualifiedAccess>]
 module internal ProcessorContract =
     let getInputRange input offset length =

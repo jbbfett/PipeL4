@@ -4,9 +4,10 @@ open System
 open System.Threading
 open Microsoft.Extensions.Logging
 open PipeL4.Core
+open PipeL4.Plugins
 
 let private usage =
-    "Usage: PipeL4 --listen-address <ip> --listen-port <port> --backend-host <ip> --backend-port <port>"
+    "Usage: PipeL4 --listen-address <ip> --listen-port <port> --backend-host <ip> --backend-port <port> [--client-to-server-plugin <path>]... [--server-to-client-plugin <path>]..."
 
 [<EntryPoint>]
 let main arguments =
@@ -32,10 +33,14 @@ let main arguments =
         let logger = loggerFactory.CreateLogger("PipeL4.Core.TcpForwarder")
 
         try
-            TcpForwarder.runAsync configuration logger shutdown.Token
+            ScriptTcpForwarder.runAsync configuration logger shutdown.Token
             |> fun runtime -> runtime.GetAwaiter().GetResult()
 
             0
-        with error ->
+        with
+        | :? ScriptPluginConfigurationException as error ->
+            eprintfn "Plugin configuration error: %s" error.Message
+            2
+        | error ->
             eprintfn "Runtime error: %s" error.Message
             1

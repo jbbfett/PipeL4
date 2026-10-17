@@ -13,6 +13,10 @@
     <Compile Include="TcpForwarderIntegrationTests.fs" />
     <Compile Include="ProcessorContractTests.fs" />
     <Compile Include="ProcessorPipelineTests.fs" />
+    <Compile Include="ScriptProcessorTests.fs" />
+    <Compile Include="ScriptCompilerTests.fs" />
+    <Compile Include="ScriptPipelineTests.fs" />
+    <Compile Include="ScriptTcpForwarderIntegrationTests.fs" />
     <Compile Include="SmokeTests.fs" />
   </ItemGroup>
 

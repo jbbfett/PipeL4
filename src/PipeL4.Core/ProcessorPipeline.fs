@@ -2,6 +2,7 @@ namespace PipeL4.Core
 
 open System
 open System.Buffers
+open System.Runtime.ExceptionServices
 open System.Threading
 open System.Threading.Tasks
 
@@ -251,6 +252,20 @@ type internal ProcessorPipeline
     let mutable state = Running
     let mutable busy = 0
 
+    let raisePreserving (error: exn) =
+        ExceptionDispatchInfo.Capture(error).Throw()
+        Unchecked.defaultof<_>
+
+    let contextualizeFailure
+        (processor: IByteStreamProcessor)
+        (cancellationToken: CancellationToken)
+        (error: exn)
+        =
+        match processor with
+        | :? IProcessorFailureContext as context ->
+            context.ContextualizeFailure(error, cancellationToken)
+        | _ -> error
+
     let releasePending () =
         for stage in stages do
             PipelineRanges.release stage.Pending
@@ -266,6 +281,42 @@ type internal ProcessorPipeline
     let abort () =
         state <- Faulted
         releasePending ()
+
+    let disposeAsync () =
+        task {
+            if Interlocked.CompareExchange(&busy, 1, 0) <> 0 then
+                invalidOp "A pipeline operation is still in progress."
+
+            let failures = ResizeArray<exn>()
+
+            try
+                if state <> Disposed then
+                    try
+                        releasePending ()
+                    with error ->
+                        failures.Add error
+
+                    state <- Disposed
+
+                    let! processorFailures =
+                        ProcessorLifetime.disposeAllAsync processors
+                        |> _.AsTask()
+
+                    failures.AddRange processorFailures
+            finally
+                Volatile.Write(&busy, 0)
+
+            match failures.Count with
+            | 0 -> ()
+            | 1 -> raisePreserving failures[0]
+            | _ ->
+                raise (
+                    AggregateException(
+                        "Multiple processor pipeline resources failed during disposal.",
+                        failures
+                    )
+                )
+        }
 
     let writeRanges (ranges: ResizeArray<OwnedRange>) (cancellationToken: CancellationToken) =
         task {
@@ -291,18 +342,39 @@ type internal ProcessorPipeline
                         { Bytes = PipelineRanges.asSequence stage.Pending
                           IsCompleted = isCompleted }
 
-                    use output =
-                        new InvocationOutput(input, stage.Pending, pool)
+                    let mutable stagedOutput: ResizeArray<OwnedRange> option = None
 
-                    let! result =
-                        stage.Processor.ProcessAsync(input, output, cancellationToken).AsTask()
+                    try
+                        use output =
+                            new InvocationOutput(input, stage.Pending, pool)
 
-                    cancellationToken.ThrowIfCancellationRequested()
-                    ProcessorContract.getRetainedSuffix input result |> ignore
-                    output.Seal()
-                    let emitted = output.TakeRanges()
+                        let! result =
+                            stage.Processor.ProcessAsync(input, output, cancellationToken).AsTask()
 
-                    PipelineRanges.retainSuffix stage.Pending input.Bytes.Length result.RetainedLength
+                        cancellationToken.ThrowIfCancellationRequested()
+                        ProcessorContract.getRetainedSuffix input result |> ignore
+                        output.Seal()
+                        let emitted = output.TakeRanges()
+                        stagedOutput <- Some emitted
+
+                        PipelineRanges.retainSuffix
+                            stage.Pending
+                            input.Bytes.Length
+                            result.RetainedLength
+                    with error ->
+                        match stagedOutput with
+                        | Some emitted -> PipelineRanges.release emitted
+                        | None -> ()
+
+                        return
+                            raisePreserving (
+                                contextualizeFailure
+                                    stage.Processor
+                                    cancellationToken
+                                    error
+                            )
+
+                    let emitted = stagedOutput.Value
 
                     if index + 1 < stages.Length then
                         hasNewInput <- emitted.Count > 0
@@ -384,12 +456,7 @@ type internal ProcessorPipeline
 
     interface IDisposable with
         member _.Dispose() =
-            if Interlocked.CompareExchange(&busy, 1, 0) <> 0 then
-                invalidOp "A pipeline operation is still in progress."
+            disposeAsync().GetAwaiter().GetResult()
 
-            try
-                if state <> Disposed then
-                    releasePending ()
-                    state <- Disposed
-            finally
-                Volatile.Write(&busy, 0)
+    interface IAsyncDisposable with
+        member _.DisposeAsync() = ValueTask(disposeAsync ())

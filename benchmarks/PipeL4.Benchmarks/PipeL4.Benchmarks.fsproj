@@ -11,7 +11,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Scripts/PassThrough.fsx" LogicalName="PipeL4.Benchmarks.Scripts.PassThrough.fsx" />
+    <EmbeddedResource Include="Scripts/GeneratedOutput.fsx" LogicalName="PipeL4.Benchmarks.Scripts.GeneratedOutput.fsx" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="../../src/PipeL4.Core/PipeL4.Core.fsproj" />
+    <ProjectReference Include="../../src/PipeL4.Plugins/PipeL4.Plugins.fsproj" />
   </ItemGroup>
 
   <Import Project="..\..\.paket\Paket.Restore.targets" />
