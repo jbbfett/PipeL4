@@ -6,6 +6,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="ConnectionStateBenchmarks.fs" />
     <Compile Include="RawTcpForwardingBenchmarks.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
@@ -13,6 +14,8 @@
   <ItemGroup>
     <EmbeddedResource Include="Scripts/PassThrough.fsx" LogicalName="PipeL4.Benchmarks.Scripts.PassThrough.fsx" />
     <EmbeddedResource Include="Scripts/GeneratedOutput.fsx" LogicalName="PipeL4.Benchmarks.Scripts.GeneratedOutput.fsx" />
+    <EmbeddedResource Include="Scripts/StateAccess.fsx" LogicalName="PipeL4.Benchmarks.Scripts.StateAccess.fsx" />
+    <EmbeddedResource Include="Scripts/CachedState.fsx" LogicalName="PipeL4.Benchmarks.Scripts.CachedState.fsx" />
   </ItemGroup>
 
   <ItemGroup>

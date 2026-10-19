@@ -179,8 +179,11 @@ module ScriptPipelineTests =
             definition.ServerToClientPaths
             |> should equal [| Path.GetFullPath firstPath |]
 
-            let! firstConnection = definition.CreateProcessorPipelinesAsync().AsTask()
-            let! secondConnection = definition.CreateProcessorPipelinesAsync().AsTask()
+            let! firstConnection =
+                definition.CreateProcessorPipelinesAsync(ConnectionState()).AsTask()
+
+            let! secondConnection =
+                definition.CreateProcessorPipelinesAsync(ConnectionState()).AsTask()
 
             firstConnection.ClientToBackend.Length |> should equal 3
             firstConnection.BackendToClient.Length |> should equal 1
@@ -296,7 +299,8 @@ module ScriptPipelineTests =
                     configuration.ServerToClientPluginPaths
                     CancellationToken.None
 
-            let! pipelines = definition.CreateProcessorPipelinesAsync().AsTask()
+            let! pipelines =
+                definition.CreateProcessorPipelinesAsync(ConnectionState()).AsTask()
 
             use pipeline =
                 new ProcessorPipeline(
@@ -405,7 +409,8 @@ module ScriptPipelineTests =
                         configuration.ServerToClientPluginPaths
                         CancellationToken.None
 
-                let! pipelines = definition.CreateProcessorPipelinesAsync().AsTask()
+                let! pipelines =
+                    definition.CreateProcessorPipelinesAsync(ConnectionState()).AsTask()
 
                 use pipeline =
                     new ProcessorPipeline(
@@ -485,7 +490,8 @@ type Processor() =
 
             let! error =
                 Assert.ThrowsAsync<ScriptProcessorFailureException>(fun () ->
-                    definition.CreateProcessorPipelinesAsync().AsTask() :> Task)
+                    definition.CreateProcessorPipelinesAsync(ConnectionState()).AsTask()
+                    :> Task)
 
             error.Direction |> should equal "client-to-server"
             error.StageNumber |> should equal 2
@@ -496,7 +502,8 @@ type Processor() =
             staticProperty<int> coordination "AsyncDisposed" |> should equal 1
             staticProperty<int> coordination "SyncDisposed" |> should equal 0
 
-            let! pipelines = definition.CreateProcessorPipelinesAsync().AsTask()
+            let! pipelines =
+                definition.CreateProcessorPipelinesAsync(ConnectionState()).AsTask()
 
             let! disposalFailures =
                 ProcessorLifetime.disposeAllAsync pipelines.ClientToBackend
@@ -563,7 +570,8 @@ type Processor() =
                     configuration.ServerToClientPluginPaths
                     CancellationToken.None
 
-            let! pipelines = definition.CreateProcessorPipelinesAsync().AsTask()
+            let! pipelines =
+                definition.CreateProcessorPipelinesAsync(ConnectionState()).AsTask()
             let pipeline =
                 new ProcessorPipeline(
                     pipelines.ClientToBackend,
@@ -585,4 +593,189 @@ type Processor() =
 
             do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
             staticProperty<string> coordination "Events" |> should equal "2,1"
+        }
+
+    [<Fact>]
+    let ``independent scripts share typed state across ordered and repeated stages`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let writerSource =
+                """module SharedWriter
+
+open System
+open System.Collections.Concurrent
+open System.Threading
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Coordination private () =
+    static let references = ConcurrentQueue<obj>()
+    static let instances = ConcurrentQueue<int>()
+    static let mutable nextInstance = 0
+    static member NextInstance() = Interlocked.Increment(&nextInstance)
+    static member Record(instanceNumber: int, value: obj) =
+        instances.Enqueue(instanceNumber)
+        references.Enqueue(value)
+    static member References = references.ToArray()
+    static member Instances = instances.ToArray()
+
+type Processor(connectionState: IConnectionState) =
+    let instanceNumber = Coordination.NextInstance()
+
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                let shared =
+                    connectionState.GetOrAdd(
+                        "requests",
+                        fun () -> ConcurrentDictionary<string, int64>()
+                    )
+
+                shared.AddOrUpdate("count", 1L, fun _ current -> current + 1L)
+                |> ignore
+                Coordination.Record(instanceNumber, shared)
+
+            output.AppendInput(0L, input.Bytes.Length)
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let readerSource =
+                """module SharedReader
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Coordination private () =
+    static let references = ConcurrentQueue<obj>()
+    static let observations = ConcurrentQueue<int64>()
+    static let mutable missingWasAbsent = false
+    static let mutable mismatchWasRejected = false
+    static let mutable recoveredOriginal = false
+    static member Record(value: obj, count: int64) =
+        references.Enqueue(value)
+        observations.Enqueue(count)
+    static member MissingWasAbsent with get () = missingWasAbsent and set value = missingWasAbsent <- value
+    static member MismatchWasRejected with get () = mismatchWasRejected and set value = mismatchWasRejected <- value
+    static member RecoveredOriginal with get () = recoveredOriginal and set value = recoveredOriginal <- value
+    static member References = references.ToArray()
+    static member Observations = observations.ToArray()
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                Coordination.MissingWasAbsent <-
+                    connectionState.TryGet<obj>("missing").IsNone
+
+                let shared =
+                    connectionState.TryGet<ConcurrentDictionary<string, int64>>("requests")
+                    |> Option.defaultWith (fun () -> invalidOp "Shared state was missing.")
+
+                Coordination.MismatchWasRejected <-
+                    try
+                        connectionState.TryGet<int>("requests") |> ignore
+                        false
+                    with :? InvalidOperationException ->
+                        true
+
+                let recovered =
+                    connectionState.TryGet<ConcurrentDictionary<string, int64>>("requests")
+                    |> Option.defaultWith (fun () -> invalidOp "Shared state was corrupted.")
+
+                Coordination.RecoveredOriginal <- Object.ReferenceEquals(shared, recovered)
+                Coordination.Record(shared, shared["count"])
+
+            output.AppendInput(0L, input.Bytes.Length)
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let writerPath = workspace.WriteSource("SharedWriter.fsx", writerSource)
+            let readerPath = workspace.WriteSource("SharedReader.fsx", readerSource)
+            let configuration =
+                createConfiguration
+                    [| writerPath; readerPath; writerPath |]
+                    Array.empty
+
+            let! writerResult =
+                workspace.Compiler.CompileAndLoadAsync(writerPath, CancellationToken.None)
+
+            let! readerResult =
+                workspace.Compiler.CompileAndLoadAsync(readerPath, CancellationToken.None)
+
+            let writerPlugin = expectCompiled writerResult
+            let readerPlugin = expectCompiled readerResult
+
+            let! definition =
+                ScriptPipelineLoader.loadWithCompilerAsync
+                    (fun path _ ->
+                        if path = Path.GetFullPath writerPath then
+                            Task.FromResult(Compiled(writerPlugin, Array.empty))
+                        else
+                            Task.FromResult(Compiled(readerPlugin, Array.empty)))
+                    configuration.ClientToServerPluginPaths
+                    configuration.ServerToClientPluginPaths
+                    CancellationToken.None
+
+            let runConnection () =
+                task {
+                    let state = ConnectionState()
+                    let! pipelines =
+                        definition.CreateProcessorPipelinesAsync(state).AsTask()
+
+                    let pipeline =
+                        new ProcessorPipeline(
+                            pipelines.ClientToBackend,
+                            discardSink,
+                            MemoryPool<byte>.Shared
+                        )
+
+                    do!
+                        pipeline.PushAsync(
+                            new TestOwner([| 1uy |]),
+                            1,
+                            CancellationToken.None
+                        )
+
+                    do! pipeline.CompleteAsync CancellationToken.None
+                    do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+                    do! (state :> IAsyncDisposable).DisposeAsync().AsTask()
+                }
+
+            do! runConnection ()
+            do! runConnection ()
+
+            let writerCoordination = requireType writerPlugin.Assembly "Coordination"
+            let readerCoordination = requireType readerPlugin.Assembly "Coordination"
+            let writerReferences = staticProperty<obj array> writerCoordination "References"
+            let readerReferences = staticProperty<obj array> readerCoordination "References"
+
+            writerReferences.Length |> should equal 4
+            readerReferences.Length |> should equal 2
+            Object.ReferenceEquals(writerReferences[0], writerReferences[1])
+            |> should equal true
+            Object.ReferenceEquals(writerReferences[0], readerReferences[0])
+            |> should equal true
+            Object.ReferenceEquals(writerReferences[2], writerReferences[3])
+            |> should equal true
+            Object.ReferenceEquals(writerReferences[2], readerReferences[1])
+            |> should equal true
+            Object.ReferenceEquals(writerReferences[0], writerReferences[2])
+            |> should equal false
+
+            staticProperty<int array> writerCoordination "Instances"
+            |> Array.sort
+            |> should equal [| 1; 2; 3; 4 |]
+
+            staticProperty<int64 array> readerCoordination "Observations"
+            |> should equal [| 1L; 1L |]
+
+            staticProperty<bool> readerCoordination "MissingWasAbsent"
+            |> should equal true
+            staticProperty<bool> readerCoordination "MismatchWasRejected"
+            |> should equal true
+            staticProperty<bool> readerCoordination "RecoveredOriginal"
+            |> should equal true
         }

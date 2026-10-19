@@ -109,13 +109,15 @@ across asynchronous suspension. Advancing writable memory commits it to the runt
 the plugin must not use it; no invocation memory or output object may be retained after completion.
 
 Each compiled script must contain exactly one visible, concrete, non-generic class that implements
-`PipeL4.Plugins.IByteStreamProcessor` and has a public parameterless constructor. Discovery uses
-that explicit interface rather than compiler-generated script type names. Construction is deferred
-until a connection's directional pipelines are created. A constructor failure terminates only that
-connection, disposes any stages already constructed for it, and does not invalidate the reusable
-compiled definition. Every configured stage receives a fresh processor instance for each connection
-direction; compiled definitions and their constructor metadata are reused, but mutable processor
-instances are not shared across connections, opposite directions, or repeated stages.
+`PipeL4.Plugins.IByteStreamProcessor` and has either a public parameterless constructor or a public
+constructor accepting `PipeL4.Plugins.IConnectionState`. The state-aware constructor is preferred
+when both are present. Discovery uses the explicit processor interface rather than compiler-generated
+script type names. Construction is deferred until a connection's directional pipelines are created.
+A constructor failure terminates only that connection, disposes any stages already constructed for
+it, and does not invalidate the reusable compiled definition. Every configured stage receives a
+fresh processor instance for each connection direction; compiled definitions and their constructor
+metadata are reused, but mutable processor instances are not shared across connections, opposite
+directions, or repeated stages.
 
 When a directional pipeline ends, its processor instances are disposed in reverse stage order.
 Processors may implement the standard `IAsyncDisposable` or `IDisposable` interfaces for their own
@@ -137,10 +139,42 @@ Plugins may observe, transform, drop, delay, buffer, frame, and maintain protoco
 
 ## State
 
-Formal plugin state scopes are not yet part of the public API. The current per-stage,
-per-direction, per-connection processor-instance lifetime provides execution isolation only; it is
-not the supported state model. A later design will define per-direction state and state shared by
-both directions of one connection, including its concurrency requirements.
+The runtime creates exactly one internal connection-state registry for every accepted TCP
+connection, including connections that use only raw forwarding. The per-connection processor
+factory receives that registry once, so every stage in both directions can be associated with the
+same instance. Registries are never shared between connections. `PipeL4.Plugins` creates one
+non-owning `IConnectionState` view of that registry per connection and passes the same view to every
+state-aware script processor constructor in both directions. The processor invocation signature is
+unchanged, and parameterless processors do not need state-related boilerplate.
+
+Processor instance fields remain the natural place for stage-local state. The runtime does not
+provide additional per-stage, per-direction, per-plugin, per-listener, or process-wide registries.
+
+Connection state uses ordinal string keys and exact declared .NET types. A key publishes at most
+one value through thread-safe `GetOrAdd` initialization; concurrent first access executes the
+published key's factory once. A factory failure is propagated and cached for the remainder of the
+connection, without publishing or owning a partial value. `TryGet` can query a missing key without
+adding one, and accessing a published key through a different type is an error. Independently
+compiled scripts can share standard .NET types or another type with common CLR identity; types
+declared separately in different script assemblies are incompatible even when structurally alike.
+
+The registry guarantees thread-safe operations and safe publication, but it does not make mutable
+stored values thread-safe. The two traffic directions remain concurrent, and no ordering between a
+write in one direction and a read in the other is implied. State changes are not transactional with
+processor execution and are not rolled back if an invocation later fails. State access and mutation
+do not schedule processor execution or otherwise trigger pipeline processing.
+
+Successfully published values are connection-owned. The registry remains alive after either
+direction half-closes and is released only after both directional operations, final EOF processing,
+active invocations, and processor cleanup have ended, or after whole-connection termination. Owned
+values are disposed sequentially in reverse publication order, preferring `IAsyncDisposable` over
+`IDisposable`; duplicate references are disposed once, and one cleanup failure does not skip other
+values. Beginning disposal atomically closes the registry to new operations, which fail rather than
+recreating state. Operations admitted before that transition, including an in-progress factory,
+are allowed to finish before owned values are collected and disposed.
+
+Connection state is independent from retained pipeline input and generated output. It neither owns
+network buffers nor participates in logical or physical byte-memory accounting.
 
 ## Memory
 

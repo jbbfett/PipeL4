@@ -4,6 +4,16 @@ open System.Buffers
 open System.Threading
 open System.Threading.Tasks
 
+/// Runtime-owned typed state shared by every processor participating in one TCP connection.
+/// The registry is safe for concurrent access, but stored mutable values must provide their own
+/// synchronization when processors can access them concurrently.
+type IConnectionState =
+    /// Returns the value already published for the key, or creates and publishes it once.
+    abstract GetOrAdd<'T>: key: string * factory: (unit -> 'T) -> 'T
+
+    /// Returns the published value for the key without creating one.
+    abstract TryGet<'T>: key: string -> 'T option
+
 /// The logical input available to one processor invocation.
 /// The sequence and its underlying memory are runtime-owned and must not be retained after
 /// ProcessAsync completes. A retained suffix is presented again by the runtime on a later invocation.

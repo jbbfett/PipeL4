@@ -5,6 +5,15 @@ open System.Reflection
 open System.Runtime.ExceptionServices
 open System.Threading.Tasks
 
+type internal ConnectionStateAdapter(state: PipeL4.Core.ConnectionState) =
+    do
+        if obj.ReferenceEquals(state, null) then
+            nullArg (nameof state)
+
+    interface IConnectionState with
+        member _.GetOrAdd<'T>(key, factory) = state.GetOrAdd<'T>(key, factory)
+        member _.TryGet<'T>(key) = state.TryGet<'T>(key)
+
 type private ProcessorOutputAdapter(output: PipeL4.Core.IProcessorOutput) =
     interface IProcessorOutput with
         member _.AppendInput(offset, length) = output.AppendInput(offset, length)
@@ -48,18 +57,33 @@ type internal ScriptProcessorAdapter(processor: IByteStreamProcessor) =
                 ValueTask()
             | _ -> ValueTask()
 
-type internal CompiledScriptProcessor internal (assembly: Assembly, constructor: ConstructorInfo) =
+[<NoEquality; NoComparison>]
+type internal ProcessorConstructor =
+    | Parameterless of ConstructorInfo
+    | ConnectionStateAware of ConstructorInfo
+
+type internal CompiledScriptProcessor internal (assembly: Assembly, constructor: ProcessorConstructor) =
     member _.Assembly = assembly
 
     member _.ProcessorType =
-        match constructor.DeclaringType with
+        let constructorInfo =
+            match constructor with
+            | Parameterless value
+            | ConnectionStateAware value -> value
+
+        match constructorInfo.DeclaringType with
         | null -> invalidOp "The discovered processor constructor has no declaring type."
         | processorType -> processorType
 
-    member _.CreateProcessor() : PipeL4.Core.IByteStreamProcessor =
+    member _.CreateProcessor(connectionState: IConnectionState) : PipeL4.Core.IByteStreamProcessor =
+        if obj.ReferenceEquals(connectionState, null) then
+            nullArg (nameof connectionState)
+
         let instance =
             try
-                constructor.Invoke(Array.empty)
+                match constructor with
+                | Parameterless value -> value.Invoke(Array.empty)
+                | ConnectionStateAware value -> value.Invoke([| box connectionState |])
             with :? TargetInvocationException as error ->
                 match Option.ofObj error.InnerException with
                 | Some innerError ->
@@ -94,9 +118,12 @@ module internal ScriptProcessorDiscovery =
                         && not processorType.ContainsGenericParameters
                         && typeof<IByteStreamProcessor>.IsAssignableFrom processorType
                     then
-                        match processorType.GetConstructor(Type.EmptyTypes) with
-                        | null -> None
-                        | constructor -> Some(processorType, constructor)
+                        match processorType.GetConstructor([| typeof<IConnectionState> |]) with
+                        | null ->
+                            match processorType.GetConstructor(Type.EmptyTypes) with
+                            | null -> None
+                            | constructor -> Some(processorType, Parameterless constructor)
+                        | constructor -> Some(processorType, ConnectionStateAware constructor)
                     else
                         None)
                 |> Array.sortBy (fun (processorType, _) -> displayName processorType)
@@ -105,7 +132,7 @@ module internal ScriptProcessorDiscovery =
             | [| _, constructor |] -> Ok(CompiledScriptProcessor(assembly, constructor))
             | [||] ->
                 Error
-                    "The script must define exactly one public, concrete, non-generic IByteStreamProcessor class with a public parameterless constructor; no usable implementation was found."
+                    "The script must define exactly one public, concrete, non-generic IByteStreamProcessor class with a public parameterless or IConnectionState constructor; no usable implementation was found."
             | values ->
                 let names =
                     values

@@ -1,12 +1,14 @@
 namespace PipeL4.Tests
 
 open System
+open System.Collections.Concurrent
 open System.IO
 open System.Net
 open System.Net.Sockets
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
+open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Logging.Abstractions
 open PipeL4.Core
 open Xunit
@@ -19,6 +21,62 @@ module TcpForwarderIntegrationTests =
         { ListenPort: int
           Shutdown: CancellationTokenSource
           Completion: Task }
+
+    type private SignalingAsyncDisposable
+        (
+            disposed: TaskCompletionSource<unit>,
+            failure: exn option
+        ) =
+        interface IAsyncDisposable with
+            member _.DisposeAsync() =
+                disposed.TrySetResult(()) |> ignore
+
+                match failure with
+                | Some error -> ValueTask(Task.FromException error)
+                | None -> ValueTask()
+
+    type private GatedAsyncDisposable
+        (
+            started: TaskCompletionSource<unit>,
+            release: TaskCompletionSource<unit>,
+            completed: TaskCompletionSource<unit>
+        ) =
+        interface IAsyncDisposable with
+            member _.DisposeAsync() =
+                ValueTask(
+                    task {
+                        started.TrySetResult(()) |> ignore
+                        do! release.Task
+                        completed.TrySetResult(()) |> ignore
+                    }
+                )
+
+    type private NoopScope() =
+        interface IDisposable with
+            member _.Dispose() = ()
+
+    type private RecordingLogger() =
+        let firstFailure = TaskCompletionSource<exn>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        member _.FirstFailure = firstFailure.Task
+
+        interface ILogger with
+            member _.BeginScope<'TState when 'TState: not null>(_state: 'TState) =
+                new NoopScope() :> IDisposable
+
+            member _.IsEnabled(_logLevel) = true
+
+            member _.Log<'TState>
+                (
+                    _logLevel: LogLevel,
+                    _eventId: EventId,
+                    _state: 'TState,
+                    error: exn | null,
+                    _formatter: Func<'TState, exn | null, string>
+                ) =
+                match Option.ofObj error with
+                | Some error -> firstFailure.TrySetResult(error) |> ignore
+                | None -> ()
 
     let private endpointPort (listener: TcpListener) =
         (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -215,7 +273,7 @@ module TcpForwarderIntegrationTests =
             output.AppendInput(0L, input.Bytes.Length)
             completed 0L)
 
-    let private passThroughPipelines () =
+    let private passThroughPipelines (_: ConnectionState) =
         { ClientToBackend = [| passThroughProcessor () |]
           BackendToClient = [| passThroughProcessor () |] }
 
@@ -226,6 +284,24 @@ module TcpForwarderIntegrationTests =
                     configuration
                     processorPipelineFactory
                     NullLogger.Instance
+                    cancellationToken)
+            backendPort
+            testCancellationToken
+            body
+
+    let private runWithProcessorProxyAndLogger
+        processorPipelineFactory
+        (logger: ILogger)
+        backendPort
+        testCancellationToken
+        body
+        =
+        runWithForwarder
+            (fun configuration cancellationToken ->
+                TcpForwarder.runWithProcessorPipelinesAsync
+                    configuration
+                    processorPipelineFactory
+                    logger
                     cancellationToken)
             backendPort
             testCancellationToken
@@ -298,7 +374,7 @@ module TcpForwarderIntegrationTests =
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-            let createPipelines () =
+            let createPipelines (_: ConnectionState) =
                 let blocked =
                     processor (fun input output cancellationToken ->
                         if input.IsCompleted then
@@ -381,7 +457,7 @@ module TcpForwarderIntegrationTests =
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let mutable createdConnections = 0
 
-            let createPipelines () =
+            let createPipelines (_: ConnectionState) =
                 let connectionNumber = Interlocked.Increment(&createdConnections)
 
                 let clientToBackend =
@@ -478,7 +554,7 @@ module TcpForwarderIntegrationTests =
             let mutable stageBSawCompletion = false
             let mutable stageBFinalLength = 0L
 
-            let createPipelines () =
+            let createPipelines (_: ConnectionState) =
                 let retainUntilEnd =
                     processor (fun input output _ ->
                         if input.IsCompleted then
@@ -566,7 +642,7 @@ module TcpForwarderIntegrationTests =
             use backendListener = new TcpListener(loopback, 0)
             backendListener.Start()
 
-            let createPipelines () =
+            let createPipelines (_: ConnectionState) =
                 let failOnMarker =
                     processor (fun input output _ ->
                         if not input.Bytes.IsEmpty && input.Bytes.FirstSpan[0] = 255uy then
@@ -1199,4 +1275,482 @@ module TcpForwarderIntegrationTests =
                         do! expectDisconnect (secondBackend.GetStream()) timeout.Token
                         do! expectConnectionFailure proxy.ListenPort timeout.Token
                     })
+        }
+
+    [<Fact>]
+    let ``connection state is shared across stages and directions but isolated between connections`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let contexts = ConcurrentQueue<int * ConnectionState * obj>()
+            let observations = ConcurrentQueue<int * string * obj>()
+            let mutable nextConnection = 0
+
+            let createPipelines (state: ConnectionState) =
+                let connectionNumber = Interlocked.Increment(&nextConnection)
+                let expected = state.GetOrAdd("shared", fun () -> obj())
+                contexts.Enqueue((connectionNumber, state, expected))
+
+                let observe stageName =
+                    processor (fun input output _ ->
+                        if not input.Bytes.IsEmpty then
+                            let observed =
+                                state.TryGet<obj>("shared")
+                                |> Option.defaultWith (fun () -> failwith "Shared state was missing.")
+
+                            observations.Enqueue((connectionNumber, stageName, observed))
+
+                        output.AppendInput(0L, input.Bytes.Length)
+                        completed 0L)
+
+                { ClientToBackend = [| observe "first"; observe "second" |]
+                  BackendToClient = [| observe "reverse" |] }
+
+            do!
+                runWithProcessorProxy
+                    createPipelines
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptFirst =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! firstClient = connect proxy.ListenPort timeout.Token
+                            use! firstBackend = acceptFirst
+
+                            let acceptSecond =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! secondClient = connect proxy.ListenPort timeout.Token
+                            use! secondBackend = acceptSecond
+
+                            let firstRequest = [| 1uy; 2uy |]
+                            let secondRequest = [| 3uy; 4uy; 5uy |]
+
+                            do!
+                                Task.WhenAll(
+                                    firstClient.GetStream().WriteAsync(firstRequest, timeout.Token).AsTask(),
+                                    secondClient.GetStream().WriteAsync(secondRequest, timeout.Token).AsTask()
+                                )
+
+                            let! firstForwarded =
+                                readExactly
+                                    (firstBackend.GetStream())
+                                    firstRequest.Length
+                                    timeout.Token
+
+                            let! secondForwarded =
+                                readExactly
+                                    (secondBackend.GetStream())
+                                    secondRequest.Length
+                                    timeout.Token
+
+                            firstForwarded |> should equal firstRequest
+                            secondForwarded |> should equal secondRequest
+
+                            let firstResponse = [| 6uy |]
+                            let secondResponse = [| 7uy; 8uy |]
+
+                            do!
+                                Task.WhenAll(
+                                    firstBackend.GetStream().WriteAsync(firstResponse, timeout.Token).AsTask(),
+                                    secondBackend.GetStream().WriteAsync(secondResponse, timeout.Token).AsTask()
+                                )
+
+                            let! firstReturned =
+                                readExactly
+                                    (firstClient.GetStream())
+                                    firstResponse.Length
+                                    timeout.Token
+
+                            let! secondReturned =
+                                readExactly
+                                    (secondClient.GetStream())
+                                    secondResponse.Length
+                                    timeout.Token
+
+                            firstReturned |> should equal firstResponse
+                            secondReturned |> should equal secondResponse
+
+                            let created = contexts.ToArray() |> Array.sortBy (fun (number, _, _) -> number)
+                            created.Length |> should equal 2
+                            let _, firstState, firstValue = created[0]
+                            let _, secondState, secondValue = created[1]
+                            Object.ReferenceEquals(firstState, secondState) |> should equal false
+                            Object.ReferenceEquals(firstValue, secondValue) |> should equal false
+
+                            let observed = observations.ToArray()
+
+                            for number, _, expected in created do
+                                let connectionObservations =
+                                    observed
+                                    |> Array.filter (fun (observedNumber, _, _) -> observedNumber = number)
+
+                                connectionObservations
+                                |> Array.map (fun (_, stageName, _) -> stageName)
+                                |> Array.sort
+                                |> should equal [| "first"; "reverse"; "second" |]
+
+                                connectionObservations
+                                |> Array.forall (fun (_, _, value) -> Object.ReferenceEquals(expected, value))
+                                |> should equal true
+                        })
+        }
+
+    [<Fact>]
+    let ``connection state survives half-close and asynchronous cleanup is awaited`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let disposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseDisposal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let disposalCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let reverseObserved = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let createPipelines (state: ConnectionState) =
+                state.GetOrAdd(
+                    "lifetime",
+                    fun () ->
+                        new GatedAsyncDisposable(
+                            disposalStarted,
+                            releaseDisposal,
+                            disposalCompleted
+                        )
+                )
+                |> ignore
+
+                state.GetOrAdd("marker", fun () -> obj()) |> ignore
+
+                let reverse =
+                    processor (fun input output _ ->
+                        if not input.Bytes.IsEmpty then
+                            state.TryGet<obj>("marker").IsSome |> should equal true
+                            reverseObserved.TrySetResult(()) |> ignore
+
+                        output.AppendInput(0L, input.Bytes.Length)
+                        completed 0L)
+
+                { ClientToBackend = [| passThroughProcessor () |]
+                  BackendToClient = [| reverse |] }
+
+            try
+                do!
+                    runWithProcessorProxy
+                        createPipelines
+                        (endpointPort backendListener)
+                        timeout.Token
+                        (fun proxy ->
+                            task {
+                                let acceptBackend =
+                                    backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                                use! client = connect proxy.ListenPort timeout.Token
+                                use! backend = acceptBackend
+                                let clientStream = client.GetStream()
+                                let backendStream = backend.GetStream()
+                                let request = [| 11uy; 12uy |]
+                                do! clientStream.WriteAsync(request, timeout.Token)
+                                let! forwarded = readExactly backendStream request.Length timeout.Token
+                                forwarded |> should equal request
+
+                                client.Client.Shutdown(SocketShutdown.Send)
+                                do! expectEndOfStream backendStream timeout.Token
+                                disposalStarted.Task.IsCompleted |> should equal false
+
+                                let response = [| 13uy; 14uy; 15uy |]
+                                do! backendStream.WriteAsync(response, timeout.Token)
+                                let! returned = readExactly clientStream response.Length timeout.Token
+                                returned |> should equal response
+                                do! reverseObserved.Task.WaitAsync(timeout.Token)
+
+                                backend.Client.Shutdown(SocketShutdown.Send)
+                                do! expectEndOfStream clientStream timeout.Token
+                                do! disposalStarted.Task.WaitAsync(timeout.Token)
+
+                                proxy.Shutdown.Cancel()
+                                proxy.Completion.IsCompleted |> should equal false
+                                releaseDisposal.TrySetResult(()) |> ignore
+                                do! proxy.Completion.WaitAsync(timeout.Token)
+                                disposalCompleted.Task.IsCompletedSuccessfully |> should equal true
+                            })
+            finally
+                releaseDisposal.TrySetResult(()) |> ignore
+        }
+
+    [<Fact>]
+    let ``state cleanup follows processor failure`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let disposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let createPipelines (state: ConnectionState) =
+                let failing =
+                    processor (fun input _ _ ->
+                        if not input.Bytes.IsEmpty then
+                            state.GetOrAdd(
+                                "owned",
+                                fun () -> new SignalingAsyncDisposable(disposed, None)
+                            )
+                            |> ignore
+
+                            invalidOp "processor failed"
+
+                        completed 0L)
+
+                { ClientToBackend = [| failing |]
+                  BackendToClient = [| passThroughProcessor () |] }
+
+            do!
+                runWithProcessorProxy
+                    createPipelines
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connect proxy.ListenPort timeout.Token
+                            use! backend = acceptBackend
+                            do! client.GetStream().WriteAsync([| 21uy |], timeout.Token)
+                            do! expectDisconnect (client.GetStream()) timeout.Token
+                            do! expectDisconnect (backend.GetStream()) timeout.Token
+                            do! disposed.Task.WaitAsync(timeout.Token)
+                        })
+        }
+
+    [<Fact>]
+    let ``state factory failure cleans previously published values`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let disposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let createPipelines (state: ConnectionState) =
+                let failing =
+                    processor (fun input _ _ ->
+                        if not input.Bytes.IsEmpty then
+                            state.GetOrAdd(
+                                "owned",
+                                fun () -> new SignalingAsyncDisposable(disposed, None)
+                            )
+                            |> ignore
+
+                            state.GetOrAdd<obj>("failed", fun () -> invalidOp "state creation failed")
+                            |> ignore
+
+                        completed 0L)
+
+                { ClientToBackend = [| failing |]
+                  BackendToClient = [| passThroughProcessor () |] }
+
+            do!
+                runWithProcessorProxy
+                    createPipelines
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connect proxy.ListenPort timeout.Token
+                            use! backend = acceptBackend
+                            do! client.GetStream().WriteAsync([| 31uy |], timeout.Token)
+                            do! expectDisconnect (client.GetStream()) timeout.Token
+                            do! expectDisconnect (backend.GetStream()) timeout.Token
+                            do! disposed.Task.WaitAsync(timeout.Token)
+                        })
+        }
+
+    [<Fact>]
+    let ``pipeline initialization and state cleanup failures are both reported`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let disposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let cleanupFailure = InvalidOperationException("state disposal failed")
+            let logger = RecordingLogger()
+
+            let createPipelines (state: ConnectionState) : DirectionalProcessorPipelines =
+                state.GetOrAdd(
+                    "owned",
+                    fun () -> new SignalingAsyncDisposable(disposed, Some cleanupFailure)
+                )
+                |> ignore
+
+                invalidOp "pipeline initialization failed"
+
+            do!
+                runWithProcessorProxyAndLogger
+                    createPipelines
+                    logger
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connect proxy.ListenPort timeout.Token
+                            use! backend = acceptBackend
+                            do! expectDisconnect (client.GetStream()) timeout.Token
+                            do! expectDisconnect (backend.GetStream()) timeout.Token
+                            do! disposed.Task.WaitAsync(timeout.Token)
+
+                            let! logged = logger.FirstFailure.WaitAsync(timeout.Token)
+                            logged |> should be ofExactType<AggregateException>
+                            let aggregate = logged :?> AggregateException
+                            aggregate.InnerExceptions.Count |> should equal 2
+
+                            aggregate.InnerExceptions
+                            |> Seq.map _.Message
+                            |> Seq.toArray
+                            |> should equal [| "pipeline initialization failed"; "state disposal failed" |]
+                        })
+        }
+
+    [<Fact>]
+    let ``application cancellation cleans connection state`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let registered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let disposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let createPipelines (state: ConnectionState) =
+                state.GetOrAdd(
+                    "owned",
+                    fun () ->
+                        registered.TrySetResult(()) |> ignore
+                        new SignalingAsyncDisposable(disposed, None)
+                )
+                |> ignore
+
+                passThroughPipelines state
+
+            do!
+                runWithProcessorProxy
+                    createPipelines
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connect proxy.ListenPort timeout.Token
+                            use! backend = acceptBackend
+                            do! registered.Task.WaitAsync(timeout.Token)
+                            proxy.Shutdown.Cancel()
+                            do! proxy.Completion.WaitAsync(timeout.Token)
+                            do! disposed.Task.WaitAsync(timeout.Token)
+                            do! expectDisconnect (client.GetStream()) timeout.Token
+                            do! expectDisconnect (backend.GetStream()) timeout.Token
+                        })
+        }
+
+    [<Fact>]
+    let ``slow state initialization does not block another key or TCP direction`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000)
+            use backendListener = new TcpListener(loopback, 0)
+            use releaseSlow = new ManualResetEventSlim(false)
+            backendListener.Start()
+            let slowStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let fastCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let createPipelines (state: ConnectionState) =
+                let slow =
+                    processor (fun input output cancellationToken ->
+                        if not input.Bytes.IsEmpty then
+                            let initialization =
+                                Task.Factory.StartNew(
+                                    (fun () ->
+                                        state.GetOrAdd(
+                                            "slow",
+                                            fun () ->
+                                                slowStarted.TrySetResult(()) |> ignore
+                                                releaseSlow.Wait(cancellationToken)
+                                                obj()
+                                        )),
+                                    CancellationToken.None,
+                                    TaskCreationOptions.LongRunning,
+                                    TaskScheduler.Default
+                                )
+
+                            ValueTask<ProcessorResult>(
+                                task {
+                                    let! _ = initialization.WaitAsync(cancellationToken)
+                                    output.AppendInput(0L, input.Bytes.Length)
+                                    return { RetainedLength = 0L }
+                                }
+                            )
+                        else
+                            completed 0L)
+
+                let fast =
+                    processor (fun input output _ ->
+                        if not input.Bytes.IsEmpty then
+                            state.GetOrAdd("fast", fun () -> obj()) |> ignore
+                            fastCompleted.TrySetResult(()) |> ignore
+
+                        output.AppendInput(0L, input.Bytes.Length)
+                        completed 0L)
+
+                { ClientToBackend = [| slow |]
+                  BackendToClient = [| fast |] }
+
+            try
+                do!
+                    runWithProcessorProxy
+                        createPipelines
+                        (endpointPort backendListener)
+                        timeout.Token
+                        (fun proxy ->
+                            task {
+                                let acceptBackend =
+                                    backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                                use! client = connect proxy.ListenPort timeout.Token
+                                use! backend = acceptBackend
+                                let fromClient = [| 41uy |]
+                                let fromBackend = [| 42uy |]
+
+                                do!
+                                    Task.WhenAll(
+                                        client.GetStream().WriteAsync(fromClient, timeout.Token).AsTask(),
+                                        backend.GetStream().WriteAsync(fromBackend, timeout.Token).AsTask()
+                                    )
+
+                                do! slowStarted.Task.WaitAsync(timeout.Token)
+                                do! fastCompleted.Task.WaitAsync(timeout.Token)
+
+                                let! receivedAtClient =
+                                    readExactly
+                                        (client.GetStream())
+                                        fromBackend.Length
+                                        timeout.Token
+
+                                receivedAtClient |> should equal fromBackend
+                                releaseSlow.Set()
+
+                                let! receivedAtBackend =
+                                    readExactly
+                                        (backend.GetStream())
+                                        fromClient.Length
+                                        timeout.Token
+
+                                receivedAtBackend |> should equal fromClient
+                            })
+            finally
+                releaseSlow.Set()
         }

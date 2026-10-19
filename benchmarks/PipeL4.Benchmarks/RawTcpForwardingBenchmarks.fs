@@ -19,11 +19,15 @@ open PipeL4.Core
 type private ScriptFixture =
     | InputBacked
     | GeneratedOutput
+    | StateAccess
+    | CachedState
 
     member this.FileName =
         match this with
         | InputBacked -> "PassThrough.fsx"
         | GeneratedOutput -> "GeneratedOutput.fsx"
+        | StateAccess -> "StateAccess.fsx"
+        | CachedState -> "CachedState.fsx"
 
     member this.ResourceName =
         $"PipeL4.Benchmarks.Scripts.{this.FileName}"
@@ -207,7 +211,7 @@ type RawTcpForwardingBenchmarks() =
                 output.AppendInput(0L, input.Bytes.Length)
                 ValueTask<ProcessorResult>({ RetainedLength = 0L }) }
 
-    let createProcessorPipelines depth () =
+    let createProcessorPipelines depth (_: ConnectionState) =
         let createPipeline () = Array.init depth (fun _ -> passThroughProcessor ())
 
         { ClientToBackend = createPipeline ()
@@ -406,6 +410,14 @@ type RawTcpForwardingBenchmarks() =
     member this.SetupFsxGeneratedOutputPipeline() =
         this.Setup(ForwardingRoute.FsxProcessorPipeline(ScriptFixture.GeneratedOutput, 1))
 
+    [<GlobalSetup(Target = "FsxWithStateAccess")>]
+    member this.SetupFsxWithStateAccess() =
+        this.Setup(ForwardingRoute.FsxProcessorPipeline(ScriptFixture.StateAccess, 1))
+
+    [<GlobalSetup(Target = "FsxWithCachedState")>]
+    member this.SetupFsxWithCachedState() =
+        this.Setup(ForwardingRoute.FsxProcessorPipeline(ScriptFixture.CachedState, 1))
+
     [<GlobalCleanup>]
     member _.Cleanup() =
         task {
@@ -471,3 +483,9 @@ type RawTcpForwardingBenchmarks() =
 
     [<Benchmark>]
     member this.FsxGeneratedOutputPipeline() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.FsxWithStateAccess() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.FsxWithCachedState() = this.RoundTrip()

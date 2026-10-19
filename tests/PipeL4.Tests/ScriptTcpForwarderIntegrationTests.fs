@@ -53,9 +53,16 @@ module ScriptTcpForwarderIntegrationTests =
     type private RecordingLogger() =
         let failures = ConcurrentQueue<exn>()
         let firstFailure = TaskCompletionSource<exn>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let failureRecorded = new SemaphoreSlim(0)
 
         member _.Failures = failures.ToArray()
         member _.FirstFailure = firstFailure.Task
+
+        member _.WaitForFailureCountAsync(expectedCount, cancellationToken: CancellationToken) =
+            task {
+                while failures.Count < expectedCount do
+                    do! failureRecorded.WaitAsync(cancellationToken)
+            }
 
         interface ILogger with
             member _.BeginScope<'TState when 'TState: not null>(_state: 'TState) =
@@ -75,6 +82,7 @@ module ScriptTcpForwarderIntegrationTests =
                 | Some error ->
                     failures.Enqueue error
                     firstFailure.TrySetResult(error) |> ignore
+                    failureRecorded.Release() |> ignore
                 | None -> ()
 
     let private endpointPort (listener: TcpListener) =
@@ -307,11 +315,18 @@ module ScriptTcpForwarderIntegrationTests =
             (fun cancellationToken ->
                 TcpForwarder.runWithOptionalProcessorPipelinesAsync
                     configuration
-                    (fun () ->
+                    (fun connectionState ->
+                        let publicConnectionState =
+                            ConnectionStateAdapter(connectionState) :> IConnectionState
+
                         { ClientToBackend =
-                            clientPlugins |> Array.map _.CreateProcessor()
+                            clientPlugins
+                            |> Array.map (fun plugin ->
+                                plugin.CreateProcessor(publicConnectionState))
                           BackendToClient =
-                            serverPlugins |> Array.map _.CreateProcessor() })
+                            serverPlugins
+                            |> Array.map (fun plugin ->
+                                plugin.CreateProcessor(publicConnectionState)) })
                     NullLogger.Instance
                     cancellationToken)
             listenPort
@@ -343,6 +358,15 @@ module ScriptTcpForwarderIntegrationTests =
         match (requireProperty value propertyName).GetValue(null) with
         | :? Task as task -> task
         | _ -> failwithf "Property '%s.%s' was not a Task." value.FullName propertyName
+
+    let private staticProperty<'value> (value: Type) propertyName =
+        match (requireProperty value propertyName).GetValue(null) with
+        | :? 'value as propertyValue -> propertyValue
+        | _ ->
+            failwithf
+                "Property '%s.%s' had an unexpected value."
+                value.FullName
+                propertyName
 
     let private generatedTransformSource moduleName delta =
         String.concat
@@ -733,19 +757,36 @@ type Processor() =
                 """module FinalizeAtEof
 
 open System
+open System.Collections.Concurrent
 open System.Threading.Tasks
 open PipeL4.Plugins
 
-type Processor() =
+type Processor(connectionState: IConnectionState) =
     interface IByteStreamProcessor with
         member _.ProcessAsync(input, output, _) =
             if input.IsCompleted then
+                let shared =
+                    connectionState.TryGet<ConcurrentDictionary<string, int64>>("eof-state")
+                    |> Option.defaultWith (fun () -> invalidOp "EOF state was missing.")
+
+                if shared["retained"] <> input.Bytes.Length then
+                    invalidOp "The retained length did not survive until EOF."
+
+                shared["finalized"] <- 1L
+                connectionState.GetOrAdd("eof-published", fun () -> obj()) |> ignore
                 output.AppendInput(0L, input.Bytes.Length)
                 let marker = [| 33uy |]
                 marker.AsSpan().CopyTo(output.GetSpan(1))
                 output.Advance(1)
                 ValueTask<ProcessorResult>({ RetainedLength = 0L })
             else
+                let shared =
+                    connectionState.GetOrAdd(
+                        "eof-state",
+                        fun () -> ConcurrentDictionary<string, int64>()
+                    )
+
+                shared["retained"] <- input.Bytes.Length
                 ValueTask<ProcessorResult>({ RetainedLength = input.Bytes.Length })
 """
 
@@ -1011,12 +1052,56 @@ type Processor() =
                 """module InvocationAndDisposalFailure
 
 open System
+open System.Collections.Concurrent
+open System.Threading
 open System.Threading.Tasks
 open PipeL4.Plugins
 
-type Processor() =
+type Coordination private () =
+    static let events = ConcurrentQueue<string>()
+    static let allStateDisposals = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let mutable stateDisposals = 0
+    static member RecordStateDisposal(name: string) =
+        events.Enqueue(name)
+        if Interlocked.Increment(&stateDisposals) = 3 then
+            allStateDisposals.TrySetResult(()) |> ignore
+    static member Events = events.ToArray()
+    static member AllStateDisposals = allStateDisposals.Task
+
+type StateValue(name: string, failure: exn option) =
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
+            Coordination.RecordStateDisposal(name)
+            match failure with
+            | Some error -> ValueTask(Task.FromException(error))
+            | None -> ValueTask()
+
+type Processor(connectionState: IConnectionState) =
+    let mutable initialized = false
+
     interface IByteStreamProcessor with
         member _.ProcessAsync(input, output, _) =
+            if not initialized then
+                connectionState.GetOrAdd(
+                    "state-first",
+                    fun () -> StateValue("first", Some(InvalidOperationException("first state disposal failed")))
+                )
+                |> ignore
+
+                connectionState.GetOrAdd(
+                    "state-middle",
+                    fun () -> StateValue("middle", None)
+                )
+                |> ignore
+
+                connectionState.GetOrAdd(
+                    "state-last",
+                    fun () -> StateValue("last", Some(InvalidOperationException("last state disposal failed")))
+                )
+                |> ignore
+
+                initialized <- true
+
             output.AppendInput(0L, input.Bytes.Length)
             let generated = [| 88uy |]
             generated.AsSpan().CopyTo(output.GetSpan(1))
@@ -1025,7 +1110,7 @@ type Processor() =
 
     interface IAsyncDisposable with
         member _.DisposeAsync() =
-            ValueTask(Task.FromException(InvalidOperationException("disposal failed")))
+            ValueTask(Task.FromException(InvalidOperationException("processor disposal failed")))
 """
 
             let scriptPath = workspace.WriteSource("InvocationAndDisposalFailure.fsx", source)
@@ -1039,11 +1124,16 @@ type Processor() =
                     Array.empty
 
             let logger = RecordingLogger()
+            let! plugin = compilePlugin workspace scriptPath
+            let coordination = requireType plugin.Assembly "InvocationAndDisposalFailure.Coordination"
+            let allStateDisposals = requireStaticTask coordination "AllStateDisposals"
+            let compiler _ _ = Task.FromResult(Compiled(plugin, Array.empty))
 
             do!
                 runWithForwarder
                     (fun cancellationToken ->
-                        ScriptTcpForwarder.runAsync
+                        ScriptTcpForwarder.runWithCompilerAsync
+                            compiler
                             configuration
                             logger
                             cancellationToken)
@@ -1061,19 +1151,30 @@ type Processor() =
                             do! failedClientStream.WriteAsync(bytes "fail", timeout.Token)
                             do! expectDisconnect failedBackendStream timeout.Token
                             do! expectDisconnect failedClientStream timeout.Token
+                            do! allStateDisposals.WaitAsync(timeout.Token)
+                            do! logger.WaitForFailureCountAsync(2, timeout.Token)
 
                             let! logged = logger.FirstFailure.WaitAsync(timeout.Token)
                             logged |> should be ofExactType<AggregateException>
 
-                            let failures = exceptionTree logged |> Seq.toArray
+                            let failures =
+                                logger.Failures
+                                |> Array.collect (exceptionTree >> Seq.toArray)
 
                             failures
                             |> Array.exists (fun error -> error.Message = "invocation failed")
                             |> should equal true
 
-                            failures
-                            |> Array.exists (fun error -> error.Message = "disposal failed")
-                            |> should equal true
+                            for expectedMessage in
+                                [| "processor disposal failed"
+                                   "first state disposal failed"
+                                   "last state disposal failed" |] do
+                                failures
+                                |> Array.exists (fun error -> error.Message = expectedMessage)
+                                |> should equal true
+
+                            staticProperty<string array> coordination "Events"
+                            |> should equal [| "last"; "middle"; "first" |]
 
                             let contexts =
                                 failures
@@ -1310,6 +1411,9 @@ type Coordination private () =
     static let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
     static let cancelled = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
     static let disposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let stateDisposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let stateDisposalRelease = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let stateDisposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
     static let mutable retainedCount = 0
     static let mutable startedCount = 0
     static let mutable cancelledCount = 0
@@ -1318,6 +1422,8 @@ type Coordination private () =
     static member Started = started.Task
     static member Cancelled = cancelled.Task
     static member Disposed = disposed.Task
+    static member StateDisposalStarted = stateDisposalStarted.Task
+    static member StateDisposed = stateDisposed.Task
     static member SignalRetained() =
         if Interlocked.Increment(&retainedCount) = 2 then retained.TrySetResult(()) |> ignore
     static member SignalStarted() =
@@ -1326,9 +1432,23 @@ type Coordination private () =
         if Interlocked.Increment(&cancelledCount) = 2 then cancelled.TrySetResult(()) |> ignore
     static member SignalDisposed() =
         if Interlocked.Increment(&disposedCount) = 2 then disposed.TrySetResult(()) |> ignore
+    static member SignalStateDisposalStarted() = stateDisposalStarted.TrySetResult(()) |> ignore
+    static member ReleaseStateDisposal() = stateDisposalRelease.TrySetResult(()) |> ignore
+    static member WaitForStateDisposalRelease() = stateDisposalRelease.Task
+    static member SignalStateDisposed() = stateDisposed.TrySetResult(()) |> ignore
 
-type Processor() =
+type OwnedState() =
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
+            ValueTask(task {
+                Coordination.SignalStateDisposalStarted()
+                do! Coordination.WaitForStateDisposalRelease()
+                Coordination.SignalStateDisposed()
+            })
+
+type Processor(connectionState: IConnectionState) =
     let mutable calls = 0
+    let owned = connectionState.GetOrAdd("shutdown-owned", fun () -> OwnedState())
 
     interface IByteStreamProcessor with
         member _.ProcessAsync(input, output, cancellationToken) =
@@ -1370,6 +1490,9 @@ type Processor() =
             let started = requireStaticTask coordination "Started"
             let cancelled = requireStaticTask coordination "Cancelled"
             let disposed = requireStaticTask coordination "Disposed"
+            let stateDisposalStarted = requireStaticTask coordination "StateDisposalStarted"
+            let stateDisposed = requireStaticTask coordination "StateDisposed"
+            let releaseStateDisposal = requireMethod coordination "ReleaseStateDisposal"
 
             do!
                 runWithCompiledProxy
@@ -1379,36 +1502,203 @@ type Processor() =
                     timeout.Token
                     (fun proxy ->
                         task {
-                            let acceptBackend =
-                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                            try
+                                let acceptBackend =
+                                    backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
 
-                            use! client = connectEventually proxy timeout.Token
-                            use! backend = acceptBackend
-                            let clientStream = client.GetStream()
-                            let backendStream = backend.GetStream()
+                                use! client = connectEventually proxy timeout.Token
+                                use! backend = acceptBackend
+                                let clientStream = client.GetStream()
+                                let backendStream = backend.GetStream()
 
-                            do!
-                                Task.WhenAll(
-                                    clientStream.WriteAsync(bytes "A", timeout.Token).AsTask(),
-                                    backendStream.WriteAsync(bytes "B", timeout.Token).AsTask()
-                                )
+                                do!
+                                    Task.WhenAll(
+                                        clientStream.WriteAsync(bytes "A", timeout.Token).AsTask(),
+                                        backendStream.WriteAsync(bytes "B", timeout.Token).AsTask()
+                                    )
 
-                            do! retained.WaitAsync(timeout.Token)
+                                do! retained.WaitAsync(timeout.Token)
 
-                            do!
-                                Task.WhenAll(
-                                    clientStream.WriteAsync(bytes "C", timeout.Token).AsTask(),
-                                    backendStream.WriteAsync(bytes "D", timeout.Token).AsTask()
-                                )
+                                do!
+                                    Task.WhenAll(
+                                        clientStream.WriteAsync(bytes "C", timeout.Token).AsTask(),
+                                        backendStream.WriteAsync(bytes "D", timeout.Token).AsTask()
+                                    )
 
-                            do! started.WaitAsync(timeout.Token)
-                            proxy.Shutdown.Cancel()
-                            do! proxy.Completion.WaitAsync(timeout.Token)
-                            do! cancelled.WaitAsync(timeout.Token)
-                            do! disposed.WaitAsync(timeout.Token)
-                            do! expectDisconnect clientStream timeout.Token
-                            do! expectDisconnect backendStream timeout.Token
-                            do! expectConnectionFailure proxy.ListenPort timeout.Token
+                                do! started.WaitAsync(timeout.Token)
+                                proxy.Shutdown.Cancel()
+                                do! cancelled.WaitAsync(timeout.Token)
+                                do! disposed.WaitAsync(timeout.Token)
+                                do! stateDisposalStarted.WaitAsync(timeout.Token)
+                                proxy.Completion.IsCompleted |> should equal false
+                                releaseStateDisposal.Invoke(null, Array.empty) |> ignore
+                                do! proxy.Completion.WaitAsync(timeout.Token)
+                                stateDisposed.IsCompletedSuccessfully |> should equal true
+                                do! expectDisconnect clientStream timeout.Token
+                                do! expectDisconnect backendStream timeout.Token
+                                do! expectConnectionFailure proxy.ListenPort timeout.Token
+                            finally
+                                releaseStateDisposal.Invoke(null, Array.empty) |> ignore
+                        })
+        }
+
+    [<Fact>]
+    let ``shutdown drains stateful async work after the opposite direction completed`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let completedPath =
+                workspace.WriteSource(
+                    "CompletedStateDirection.fsx",
+                    """module CompletedStateDirection
+
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    let shared =
+        connectionState.GetOrAdd(
+            "cancel-after-half-close",
+            fun () -> ConcurrentDictionary<string, int64>()
+        )
+
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                shared["request"] <- input.Bytes.Length
+
+            output.AppendInput(0L, input.Bytes.Length)
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+                )
+
+            let activePath =
+                workspace.WriteSource(
+                    "ActiveStateDirection.fsx",
+                    """module ActiveStateDirection
+
+open System
+open System.Collections.Concurrent
+open System.Threading
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Coordination private () =
+    static let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let cancelled = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let processorDisposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let stateDisposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let stateDisposalRelease = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let stateDisposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static member Started = started.Task
+    static member Cancelled = cancelled.Task
+    static member ProcessorDisposed = processorDisposed.Task
+    static member StateDisposalStarted = stateDisposalStarted.Task
+    static member StateDisposed = stateDisposed.Task
+    static member SignalStarted() = started.TrySetResult(()) |> ignore
+    static member SignalCancelled() = cancelled.TrySetResult(()) |> ignore
+    static member SignalProcessorDisposed() = processorDisposed.TrySetResult(()) |> ignore
+    static member SignalStateDisposalStarted() = stateDisposalStarted.TrySetResult(()) |> ignore
+    static member ReleaseStateDisposal() = stateDisposalRelease.TrySetResult(()) |> ignore
+    static member WaitForStateDisposalRelease() = stateDisposalRelease.Task
+    static member SignalStateDisposed() = stateDisposed.TrySetResult(()) |> ignore
+
+type OwnedState() =
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
+            ValueTask(task {
+                Coordination.SignalStateDisposalStarted()
+                do! Coordination.WaitForStateDisposalRelease()
+                Coordination.SignalStateDisposed()
+            })
+
+type Processor(connectionState: IConnectionState) =
+    let shared =
+        connectionState.GetOrAdd(
+            "cancel-after-half-close",
+            fun () -> ConcurrentDictionary<string, int64>()
+        )
+
+    let owned = connectionState.GetOrAdd("cancel-after-half-close-owned", fun () -> OwnedState())
+
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, _, cancellationToken) =
+            if input.IsCompleted then
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+            else
+                ValueTask<ProcessorResult>(task {
+                    if not (shared.ContainsKey("request")) then
+                        invalidOp "The completed direction's state mutation was missing."
+
+                    Coordination.SignalStarted()
+
+                    try
+                        do! Task.Delay(Timeout.Infinite, cancellationToken)
+                    finally
+                        Coordination.SignalCancelled()
+
+                    return { RetainedLength = 0L }
+                })
+
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
+            Coordination.SignalProcessorDisposed()
+            ValueTask()
+"""
+                )
+
+            let! completedPlugin = compilePlugin workspace completedPath
+            let! activePlugin = compilePlugin workspace activePath
+            let coordination = requireType activePlugin.Assembly "ActiveStateDirection.Coordination"
+            let started = requireStaticTask coordination "Started"
+            let cancelled = requireStaticTask coordination "Cancelled"
+            let processorDisposed = requireStaticTask coordination "ProcessorDisposed"
+            let stateDisposalStarted = requireStaticTask coordination "StateDisposalStarted"
+            let stateDisposed = requireStaticTask coordination "StateDisposed"
+            let releaseStateDisposal = requireMethod coordination "ReleaseStateDisposal"
+
+            do!
+                runWithCompiledProxy
+                    [| completedPlugin |]
+                    [| activePlugin |]
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            try
+                                let acceptBackend =
+                                    backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                                use! client = connectEventually proxy timeout.Token
+                                use! backend = acceptBackend
+                                let clientStream = client.GetStream()
+                                let backendStream = backend.GetStream()
+                                let request = bytes "complete-first"
+                                do! clientStream.WriteAsync(request, timeout.Token)
+                                let! forwarded = readExactly backendStream request.Length timeout.Token
+                                forwarded |> should equal request
+
+                                client.Client.Shutdown(SocketShutdown.Send)
+                                do! expectEndOfStream backendStream timeout.Token
+
+                                do! backendStream.WriteAsync(bytes "await-cancellation", timeout.Token)
+                                do! started.WaitAsync(timeout.Token)
+                                proxy.Shutdown.Cancel()
+                                do! cancelled.WaitAsync(timeout.Token)
+                                do! processorDisposed.WaitAsync(timeout.Token)
+                                do! stateDisposalStarted.WaitAsync(timeout.Token)
+                                proxy.Completion.IsCompleted |> should equal false
+                                releaseStateDisposal.Invoke(null, Array.empty) |> ignore
+                                do! proxy.Completion.WaitAsync(timeout.Token)
+                                stateDisposed.IsCompletedSuccessfully |> should equal true
+                                do! expectDisconnect clientStream timeout.Token
+                                do! expectDisconnect backendStream timeout.Token
+                            finally
+                                releaseStateDisposal.Invoke(null, Array.empty) |> ignore
                         })
         }
 
@@ -1503,7 +1793,7 @@ type Processor() =
         }
 
     [<Fact>]
-    let ``real script processors execute concurrently across connections`` () =
+    let ``real script state factories execute concurrently across connections`` () =
         task {
             use timeout = new CancellationTokenSource(30_000)
             use workspace = new TestWorkspace()
@@ -1519,7 +1809,7 @@ open PipeL4.Plugins
 
 type Coordination private () =
     static let allStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-    static let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let release = new ManualResetEventSlim(false)
     static let mutable started = 0
 
     static member AllStarted = allStarted.Task
@@ -1528,23 +1818,30 @@ type Coordination private () =
         if Interlocked.Increment(&started) = 4 then
             allStarted.TrySetResult(()) |> ignore
 
-    static member Release() = release.TrySetResult(()) |> ignore
+    static member Release() = release.Set()
 
-    static member WaitAsync(cancellationToken: CancellationToken) =
-        release.Task.WaitAsync(cancellationToken)
+    static member Create(cancellationToken: CancellationToken) =
+        Coordination.SignalStarted()
+        release.Wait(cancellationToken)
+        obj()
 
-type Processor() =
+type Processor(connectionState: IConnectionState) =
     interface IByteStreamProcessor with
         member _.ProcessAsync(input, output, cancellationToken) =
             if input.IsCompleted then
                 ValueTask<ProcessorResult>({ RetainedLength = 0L })
             else
-                ValueTask<ProcessorResult>(task {
-                    Coordination.SignalStarted()
-                    do! Coordination.WaitAsync(cancellationToken)
-                    output.AppendInput(0L, input.Bytes.Length)
-                    return { RetainedLength = 0L }
-                })
+                let value =
+                    connectionState.GetOrAdd(
+                        "concurrent-entry",
+                        fun () -> Coordination.Create(cancellationToken)
+                    )
+
+                if obj.ReferenceEquals(value, null) then
+                    invalidOp "The connection-state factory returned null."
+
+                output.AppendInput(0L, input.Bytes.Length)
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
 """
 
             let scriptPath = workspace.WriteSource("ConcurrentEntry.fsx", source)
@@ -1864,4 +2161,890 @@ type Processor() =
                         :> Task)
 
                 do! expectConnectionFailure listenPort timeout.Token
+        }
+
+    [<Fact>]
+    let ``independent scripts share connection state across a TCP half-close`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let clientSource =
+                """module ClientStatePublisher
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Coordination private () =
+    static let mutable reference: obj = null
+    static let disposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static member Reference with get () = reference and set (value: obj) = reference <- value
+    static member Disposed = disposed.Task
+    static member SignalDisposed() = disposed.TrySetResult(()) |> ignore
+
+type OwnedValue() =
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
+            Coordination.SignalDisposed()
+            ValueTask()
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                connectionState.GetOrAdd("owned", fun () -> OwnedValue()) |> ignore
+
+                let shared =
+                    connectionState.GetOrAdd(
+                        "cross-direction",
+                        fun () -> ConcurrentDictionary<string, int64>()
+                    )
+
+                shared["request"] <- input.Bytes.Length
+                Coordination.Reference <- shared
+
+            output.AppendInput(0L, input.Bytes.Length)
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let serverSource =
+                """module ServerStateObserver
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Coordination private () =
+    static let mutable reference: obj = null
+    static member Reference with get () = reference and set (value: obj) = reference <- value
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                let shared =
+                    connectionState.TryGet<ConcurrentDictionary<string, int64>>("cross-direction")
+                    |> Option.defaultWith (fun () -> invalidOp "Cross-direction state was missing.")
+
+                if not (shared.ContainsKey("request")) then
+                    invalidOp "The request marker was missing."
+
+                let reverse =
+                    connectionState.GetOrAdd(
+                        "reverse-published",
+                        fun () -> ConcurrentDictionary<string, int64>()
+                    )
+
+                reverse["response"] <- input.Bytes.Length
+                Coordination.Reference <- shared
+
+            output.AppendInput(0L, input.Bytes.Length)
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let clientPath = workspace.WriteSource("ClientStatePublisher.fsx", clientSource)
+            let serverPath = workspace.WriteSource("ServerStateObserver.fsx", serverSource)
+            let! clientPlugin = compilePlugin workspace clientPath
+            let! serverPlugin = compilePlugin workspace serverPath
+
+            do!
+                runWithCompiledProxy
+                    [| clientPlugin |]
+                    [| serverPlugin |]
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+                            let request = bytes "request"
+                            do! clientStream.WriteAsync(request, timeout.Token)
+                            let! forwarded = readExactly backendStream request.Length timeout.Token
+                            forwarded |> should equal request
+
+                            client.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream backendStream timeout.Token
+
+                            let clientCoordination =
+                                requireType clientPlugin.Assembly "Coordination"
+
+                            let disposed = requireStaticTask clientCoordination "Disposed"
+                            disposed.IsCompleted |> should equal false
+
+                            let response = bytes "response"
+                            do! backendStream.WriteAsync(response, timeout.Token)
+                            let! returned = readExactly clientStream response.Length timeout.Token
+                            returned |> should equal response
+
+                            let serverCoordination =
+                                requireType serverPlugin.Assembly "Coordination"
+
+                            let published =
+                                staticProperty<obj> clientCoordination "Reference"
+
+                            let observed =
+                                staticProperty<obj> serverCoordination "Reference"
+
+                            Object.ReferenceEquals(published, observed)
+                            |> should equal true
+
+                            disposed.IsCompleted |> should equal false
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream clientStream timeout.Token
+                            do! disposed.WaitAsync(timeout.Token)
+                        })
+        }
+
+    [<Fact>]
+    let ``opposite directions safely race to initialize one public state value`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let source =
+                """module ConcurrentStateInitialization
+
+open System
+open System.Collections.Concurrent
+open System.Threading
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Coordination private () =
+    static let ready = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let references = ConcurrentQueue<obj>()
+    static let mutable arrivals = 0
+    static let mutable factoryCalls = 0
+    static member Arrive() =
+        if Interlocked.Increment(&arrivals) = 2 then
+            ready.TrySetResult(()) |> ignore
+        ready.Task
+    static member Create() =
+        Interlocked.Increment(&factoryCalls) |> ignore
+        ConcurrentDictionary<string, int64>()
+    static member Record(value: obj) = references.Enqueue(value)
+    static member FactoryCalls = Volatile.Read(&factoryCalls)
+    static member References = references.ToArray()
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, cancellationToken) =
+            ValueTask<ProcessorResult>(
+                task {
+                    if not input.Bytes.IsEmpty then
+                        do! Coordination.Arrive().WaitAsync(cancellationToken)
+                        let shared = connectionState.GetOrAdd("race", Coordination.Create)
+                        Coordination.Record(shared)
+
+                    output.AppendInput(0L, input.Bytes.Length)
+                    return { RetainedLength = 0L }
+                }
+            )
+"""
+
+            let scriptPath = workspace.WriteSource("ConcurrentStateInitialization.fsx", source)
+            let! plugin = compilePlugin workspace scriptPath
+
+            do!
+                runWithCompiledProxy
+                    [| plugin |]
+                    [| plugin |]
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+                            let fromClient = bytes "client"
+                            let fromBackend = bytes "backend"
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+                            let receiveAtBackend =
+                                readExactly backendStream fromClient.Length timeout.Token
+
+                            let receiveAtClient =
+                                readExactly clientStream fromBackend.Length timeout.Token
+
+                            do!
+                                Task.WhenAll(
+                                    clientStream.WriteAsync(fromClient, timeout.Token).AsTask(),
+                                    backendStream.WriteAsync(fromBackend, timeout.Token).AsTask()
+                                )
+
+                            let! atBackend = receiveAtBackend
+                            let! atClient = receiveAtClient
+                            atBackend |> should equal fromClient
+                            atClient |> should equal fromBackend
+
+                            let coordination = requireType plugin.Assembly "Coordination"
+                            staticProperty<int> coordination "FactoryCalls"
+                            |> should equal 1
+
+                            let references =
+                                staticProperty<obj array> coordination "References"
+
+                            references.Length |> should equal 2
+                            Object.ReferenceEquals(references[0], references[1])
+                            |> should equal true
+                        })
+        }
+
+    [<Fact>]
+    let ``separate TCP connections isolate state and clean it after completion or failure`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let source =
+                """module ConnectionStateLifetime
+
+open System
+open System.Collections.Concurrent
+open System.Threading
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Coordination private () =
+    static let states = ConcurrentQueue<IConnectionState>()
+    static let values = ConcurrentQueue<obj>()
+    static let allDisposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let mutable disposalCount = 0
+    static let mutable mutationCount = 0
+    static member Record(state: IConnectionState, value: obj) =
+        states.Enqueue(state)
+        values.Enqueue(value)
+    static member RecordMutation() = Interlocked.Increment(&mutationCount) |> ignore
+    static member RecordDisposal() =
+        if Interlocked.Increment(&disposalCount) = 3 then
+            allDisposed.TrySetResult(()) |> ignore
+    static member States = states.ToArray()
+    static member Values = values.ToArray()
+    static member MutationCount = Volatile.Read(&mutationCount)
+    static member AllDisposed = allDisposed.Task
+
+type OwnedValue() =
+    member _.Modify() = Coordination.RecordMutation()
+
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
+            Coordination.RecordDisposal()
+            ValueTask()
+
+type Processor(connectionState: IConnectionState) =
+    let mutable initialized = false
+
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                if not initialized then
+                    let value = connectionState.GetOrAdd("owned", fun () -> OwnedValue())
+                    Coordination.Record(connectionState, value)
+                    initialized <- true
+
+                let value = connectionState.GetOrAdd("owned", fun () -> OwnedValue())
+                value.Modify()
+
+                if input.Bytes.FirstSpan[0] = 255uy then
+                    invalidOp "requested plugin failure"
+
+            output.AppendInput(0L, input.Bytes.Length)
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let scriptPath = workspace.WriteSource("ConnectionStateLifetime.fsx", source)
+            let! plugin = compilePlugin workspace scriptPath
+            let coordination = requireType plugin.Assembly "Coordination"
+            let allDisposed = requireStaticTask coordination "AllDisposed"
+
+            do!
+                runWithCompiledProxy
+                    [| plugin |]
+                    Array.empty
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptNormalBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! normalClient = connectEventually proxy timeout.Token
+                            use! normalBackend = acceptNormalBackend
+                            let normalClientStream = normalClient.GetStream()
+                            let normalBackendStream = normalBackend.GetStream()
+                            let payload = [| 1uy |]
+                            do! normalClientStream.WriteAsync(payload, timeout.Token)
+                            let! forwarded = readExactly normalBackendStream 1 timeout.Token
+                            forwarded |> should equal payload
+                            normalClient.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream normalBackendStream timeout.Token
+                            normalBackend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream normalClientStream timeout.Token
+
+                            let acceptFailedBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! failedClient = connectEventually proxy timeout.Token
+                            use! failedBackend = acceptFailedBackend
+                            do! failedClient.GetStream().WriteAsync([| 255uy |], timeout.Token)
+                            do! expectDisconnect (failedClient.GetStream()) timeout.Token
+                            do! expectDisconnect (failedBackend.GetStream()) timeout.Token
+
+                            let acceptRetryBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! retryClient = connect proxy.ListenPort timeout.Token
+                            use! retryBackend = acceptRetryBackend
+                            let retryClientStream = retryClient.GetStream()
+                            let retryBackendStream = retryBackend.GetStream()
+                            let retryPayload = [| 2uy |]
+                            do! retryClientStream.WriteAsync(retryPayload, timeout.Token)
+                            let! retried =
+                                readExactly retryBackendStream retryPayload.Length timeout.Token
+
+                            retried |> should equal retryPayload
+                            retryClient.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream retryBackendStream timeout.Token
+                            retryBackend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream retryClientStream timeout.Token
+                            do! allDisposed.WaitAsync(timeout.Token)
+
+                            let states =
+                                staticProperty<IConnectionState array> coordination "States"
+
+                            let values = staticProperty<obj array> coordination "Values"
+                            states.Length |> should equal 3
+                            values.Length |> should equal 3
+                            staticProperty<int> coordination "MutationCount" |> should equal 3
+
+                            for first in 0 .. states.Length - 1 do
+                                for second in first + 1 .. states.Length - 1 do
+                                    Object.ReferenceEquals(states[first], states[second])
+                                    |> should equal false
+
+                                    Object.ReferenceEquals(values[first], values[second])
+                                    |> should equal false
+
+                            for state in states do
+                                Assert.Throws<ObjectDisposedException>(fun () ->
+                                    state.TryGet<obj>("owned") |> ignore)
+                                |> ignore
+                        })
+        }
+
+    [<Fact>]
+    let ``configured independent stages share state while upstream input remains retained`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let writerSource =
+                """module RetainingStateWriter
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    let mutable invocation = 0L
+
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if input.IsCompleted || input.Bytes.IsEmpty then
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+            else
+                invocation <- invocation + 1L
+
+                let shared =
+                    connectionState.GetOrAdd(
+                        "ordered-shared-state",
+                        fun () -> ConcurrentDictionary<string, int64>()
+                    )
+
+                if invocation = 1L then
+                    shared["publisher"] <- 41L
+
+                let mutable observed = 0L
+                shared.TryGetValue("observer", &observed) |> ignore
+                let trigger = [| byte observed |]
+                trigger.AsSpan().CopyTo(output.GetSpan(trigger.Length))
+                output.Advance(trigger.Length)
+                ValueTask<ProcessorResult>({ RetainedLength = input.Bytes.Length })
+"""
+
+            let observerSource =
+                """module SharedStateObserver
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if input.Bytes.IsEmpty then
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+            else
+                let shared =
+                    connectionState.TryGet<ConcurrentDictionary<string, int64>>(
+                        "ordered-shared-state"
+                    )
+                    |> Option.defaultWith (fun () -> invalidOp "Shared state was missing.")
+
+                let publisher = shared["publisher"]
+
+                let observer =
+                    shared.AddOrUpdate("observer", 42L, fun _ current -> current)
+
+                let generated =
+                    [| byte publisher
+                       byte observer
+                       input.Bytes.FirstSpan[0] |]
+
+                generated.AsSpan().CopyTo(output.GetSpan(generated.Length))
+                output.Advance(generated.Length)
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let writerPath = workspace.WriteSource("RetainingStateWriter.fsx", writerSource)
+            let observerPath = workspace.WriteSource("SharedStateObserver.fsx", observerSource)
+
+            do!
+                runWithScriptProxy
+                    [| writerPath; observerPath |]
+                    Array.empty
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+
+                            do! clientStream.WriteAsync([| 1uy |], timeout.Token)
+                            let! first = readExactly backendStream 3 timeout.Token
+                            first |> should equal [| 41uy; 42uy; 0uy |]
+
+                            do! clientStream.WriteAsync([| 2uy |], timeout.Token)
+                            let! second = readExactly backendStream 3 timeout.Token
+                            second |> should equal [| 41uy; 42uy; 42uy |]
+
+                            client.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream backendStream timeout.Token
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream clientStream timeout.Token
+                        })
+        }
+
+    [<Fact>]
+    let ``configured opposite directions causally share and modify state`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let requestSource =
+                """module RequestStateProcessor
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                let shared =
+                    connectionState.GetOrAdd(
+                        "bidirectional-state",
+                        fun () -> ConcurrentDictionary<string, int64>()
+                    )
+
+                let requests =
+                    shared.AddOrUpdate("requests", 1L, fun _ current -> current + 1L)
+
+                let mutable responses = 0L
+                shared.TryGetValue("responses", &responses) |> ignore
+                let marker = [| byte requests; byte responses |]
+                marker.AsSpan().CopyTo(output.GetSpan(marker.Length))
+                output.Advance(marker.Length)
+                output.AppendInput(0L, input.Bytes.Length)
+
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let responseSource =
+                """module ResponseStateProcessor
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                let shared =
+                    connectionState.TryGet<ConcurrentDictionary<string, int64>>(
+                        "bidirectional-state"
+                    )
+                    |> Option.defaultWith (fun () -> invalidOp "Request state was missing.")
+
+                let responses =
+                    shared.AddOrUpdate("responses", 1L, fun _ current -> current + 1L)
+
+                let requests = shared["requests"]
+                let marker = [| byte requests; byte responses |]
+                marker.AsSpan().CopyTo(output.GetSpan(marker.Length))
+                output.Advance(marker.Length)
+                output.AppendInput(0L, input.Bytes.Length)
+
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let requestPath = workspace.WriteSource("RequestStateProcessor.fsx", requestSource)
+            let responsePath = workspace.WriteSource("ResponseStateProcessor.fsx", responseSource)
+
+            do!
+                runWithScriptProxy
+                    [| requestPath |]
+                    [| responsePath |]
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+
+                            do! clientStream.WriteAsync([| 101uy |], timeout.Token)
+                            let! firstRequest = readExactly backendStream 3 timeout.Token
+                            firstRequest |> should equal [| 1uy; 0uy; 101uy |]
+
+                            do! backendStream.WriteAsync([| 201uy |], timeout.Token)
+                            let! firstResponse = readExactly clientStream 3 timeout.Token
+                            firstResponse |> should equal [| 1uy; 1uy; 201uy |]
+
+                            do! clientStream.WriteAsync([| 102uy |], timeout.Token)
+                            let! secondRequest = readExactly backendStream 3 timeout.Token
+                            secondRequest |> should equal [| 2uy; 1uy; 102uy |]
+
+                            client.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream backendStream timeout.Token
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream clientStream timeout.Token
+                        })
+        }
+
+    [<Fact>]
+    let ``configured script state is isolated between concurrent TCP connections`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let source =
+                """module ConnectionIsolationProcessor
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                let shared =
+                    connectionState.GetOrAdd(
+                        "connection-isolation",
+                        fun () -> ConcurrentDictionary<string, int64>()
+                    )
+
+                let suppliedIdentifier = int64 input.Bytes.FirstSpan[0]
+                let identifier = shared.GetOrAdd("identifier", suppliedIdentifier)
+                let count = shared.AddOrUpdate("count", 1L, fun _ current -> current + 1L)
+                let generated = [| byte identifier; byte count |]
+                generated.AsSpan().CopyTo(output.GetSpan(generated.Length))
+                output.Advance(generated.Length)
+
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let scriptPath = workspace.WriteSource("ConnectionIsolationProcessor.fsx", source)
+
+            do!
+                runWithScriptProxy
+                    [| scriptPath |]
+                    Array.empty
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackendA =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! clientA = connectEventually proxy timeout.Token
+                            use! backendA = acceptBackendA
+
+                            let acceptBackendB =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! clientB = connectEventually proxy timeout.Token
+                            use! backendB = acceptBackendB
+                            let clientStreamA = clientA.GetStream()
+                            let clientStreamB = clientB.GetStream()
+                            let backendStreamA = backendA.GetStream()
+                            let backendStreamB = backendB.GetStream()
+                            let receiveFirstA = readExactly backendStreamA 2 timeout.Token
+                            let receiveFirstB = readExactly backendStreamB 2 timeout.Token
+
+                            do!
+                                Task.WhenAll(
+                                    clientStreamA.WriteAsync([| 10uy |], timeout.Token).AsTask(),
+                                    clientStreamB.WriteAsync([| 20uy |], timeout.Token).AsTask()
+                                )
+
+                            let! firstA = receiveFirstA
+                            let! firstB = receiveFirstB
+                            firstA |> should equal [| 10uy; 1uy |]
+                            firstB |> should equal [| 20uy; 1uy |]
+
+                            do! clientStreamB.WriteAsync([| 21uy |], timeout.Token)
+                            let! secondB = readExactly backendStreamB 2 timeout.Token
+                            secondB |> should equal [| 20uy; 2uy |]
+
+                            do! clientStreamA.WriteAsync([| 11uy |], timeout.Token)
+                            let! secondA = readExactly backendStreamA 2 timeout.Token
+                            secondA |> should equal [| 10uy; 2uy |]
+
+                            clientA.Client.Shutdown(SocketShutdown.Send)
+                            clientB.Client.Shutdown(SocketShutdown.Send)
+
+                            let! _ =
+                                Task.WhenAll(
+                                    expectEndOfStream backendStreamA timeout.Token,
+                                    expectEndOfStream backendStreamB timeout.Token
+                                )
+
+                            backendA.Client.Shutdown(SocketShutdown.Send)
+                            backendB.Client.Shutdown(SocketShutdown.Send)
+
+                            let! _ =
+                                Task.WhenAll(
+                                    expectEndOfStream clientStreamA timeout.Token,
+                                    expectEndOfStream clientStreamB timeout.Token
+                                )
+
+                            ()
+                        })
+        }
+
+    [<Fact>]
+    let ``repeated configured stages keep local fields separate while sharing state`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let source =
+                """module RepeatedSharedStateProcessor
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    let mutable calls = 0L
+
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                calls <- calls + 1L
+
+                let shared =
+                    connectionState.GetOrAdd(
+                        "repeated-shared-state",
+                        fun () -> ConcurrentDictionary<string, int64>()
+                    )
+
+                let visits =
+                    shared.AddOrUpdate("visits", 1L, fun _ current -> current + 1L)
+
+                let marker = [| byte calls; byte visits |]
+                marker.AsSpan().CopyTo(output.GetSpan(marker.Length))
+                output.Advance(marker.Length)
+                output.AppendInput(0L, input.Bytes.Length)
+
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let scriptPath = workspace.WriteSource("RepeatedSharedStateProcessor.fsx", source)
+
+            do!
+                runWithScriptProxy
+                    [| scriptPath; scriptPath |]
+                    Array.empty
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+
+                            do! clientStream.WriteAsync([| 88uy |], timeout.Token)
+                            let! first = readExactly backendStream 5 timeout.Token
+                            first |> should equal [| 1uy; 2uy; 1uy; 1uy; 88uy |]
+
+                            do! clientStream.WriteAsync([| 89uy |], timeout.Token)
+                            let! second = readExactly backendStream 5 timeout.Token
+                            second |> should equal [| 2uy; 4uy; 2uy; 3uy; 89uy |]
+
+                            client.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream backendStream timeout.Token
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream clientStream timeout.Token
+                        })
+        }
+
+    [<Fact>]
+    let ``state written without output is visible to a later configured stage invocation`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let writerSource =
+                """module OutputlessStateWriter
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    let mutable receivedInput = false
+
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if input.IsCompleted then
+                if receivedInput then
+                    let shared =
+                        connectionState.TryGet<ConcurrentDictionary<string, int64>>(
+                            "outputless-state"
+                        )
+                        |> Option.defaultWith (fun () -> invalidOp "Outputless state was missing.")
+
+                    let trigger = [| byte shared["value"] |]
+                    trigger.AsSpan().CopyTo(output.GetSpan(trigger.Length))
+                    output.Advance(trigger.Length)
+
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+            else
+                if not input.Bytes.IsEmpty then
+                    let shared =
+                        connectionState.GetOrAdd(
+                            "outputless-state",
+                            fun () -> ConcurrentDictionary<string, int64>()
+                        )
+
+                    shared["value"] <- 7L
+                    receivedInput <- true
+
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let observerSource =
+                """module OutputlessStateObserver
+
+open System
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor(connectionState: IConnectionState) =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if not input.Bytes.IsEmpty then
+                let shared =
+                    connectionState.TryGet<ConcurrentDictionary<string, int64>>(
+                        "outputless-state"
+                    )
+                    |> Option.defaultWith (fun () -> invalidOp "Outputless state was not visible.")
+
+                let generated = [| byte shared["value"]; input.Bytes.FirstSpan[0] |]
+                generated.AsSpan().CopyTo(output.GetSpan(generated.Length))
+                output.Advance(generated.Length)
+
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let writerPath = workspace.WriteSource("OutputlessStateWriter.fsx", writerSource)
+            let observerPath = workspace.WriteSource("OutputlessStateObserver.fsx", observerSource)
+
+            do!
+                runWithScriptProxy
+                    [| writerPath; observerPath |]
+                    Array.empty
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+
+                            do! clientStream.WriteAsync(bytes "silent-state", timeout.Token)
+                            client.Client.Shutdown(SocketShutdown.Send)
+
+                            let! observed = readExactly backendStream 2 timeout.Token
+                            observed |> should equal [| 7uy; 7uy |]
+                            do! expectEndOfStream backendStream timeout.Token
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream clientStream timeout.Token
+                        })
         }

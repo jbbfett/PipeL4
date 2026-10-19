@@ -2,6 +2,7 @@ namespace PipeL4.Tests
 
 open System
 open System.Buffers
+open System.Collections.Concurrent
 open System.IO
 open System.Runtime.Loader
 open System.Runtime.InteropServices
@@ -9,10 +10,16 @@ open System.Text
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
+open PipeL4.Core
 open PipeL4.Plugins
 open Xunit
 
 module ScriptCompilerTests =
+    let private unusedConnectionState =
+        { new IConnectionState with
+            member _.GetOrAdd<'T>(_: string, factory: unit -> 'T) : 'T = factory ()
+            member _.TryGet<'T>(_: string) : 'T option = None }
+
     let private bytes (text: string) = Encoding.ASCII.GetBytes text
 
     let private sequenceBytes (sequence: ReadOnlySequence<byte>) =
@@ -393,7 +400,7 @@ let configurationType = typeof<ForwardingConfiguration>
 
             let error =
                 Assert.Throws<InvalidOperationException>(fun () ->
-                    plugin.CreateProcessor() |> ignore)
+                    plugin.CreateProcessor(unusedConnectionState) |> ignore)
 
             error.Message |> should equal "constructor failure"
         }
@@ -411,10 +418,80 @@ let configurationType = typeof<ForwardingConfiguration>
 
             let! result = compile workspace.Compiler scriptPath
             let plugin, _ = expectCompiledPlugin result
-            let first = plugin.CreateProcessor()
-            let second = plugin.CreateProcessor()
+            let first = plugin.CreateProcessor(unusedConnectionState)
+            let second = plugin.CreateProcessor(unusedConnectionState)
 
             Object.ReferenceEquals(first, second) |> should equal false
+        }
+
+    [<Fact>]
+    let ``state-aware constructor receives the public connection state and is preferred`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let source =
+                """module StatefulConstructor
+
+open System.Collections.Concurrent
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Selection private () =
+    static let mutable selected = ""
+    static member Selected
+        with get () = selected
+        and set value = selected <- value
+
+type Processor private (selection: string, connectionState: IConnectionState option) =
+    do
+        Selection.Selected <- selection
+
+        match connectionState with
+        | Some state ->
+            state.GetOrAdd(
+                "requests",
+                fun () -> ConcurrentDictionary<string, int64>()
+            )
+            |> ignore
+        | None -> ()
+
+    new() = Processor("parameterless", None)
+    new(connectionState: IConnectionState) = Processor("connection-state", Some connectionState)
+
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            output.AppendInput(0L, input.Bytes.Length)
+            ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+
+            let scriptPath = workspace.WriteSource("StatefulConstructor.fsx", source)
+            let! result = compile workspace.Compiler scriptPath
+            let plugin, _ = expectCompiledPlugin result
+            let state = ConnectionState()
+            let publicState = ConnectionStateAdapter(state) :> IConnectionState
+            let processor = plugin.CreateProcessor(publicState)
+
+            let selectionType =
+                plugin.Assembly.GetTypes()
+                |> Array.find (fun value -> value.Name = "Selection")
+
+            let selectedProperty =
+                match selectionType.GetProperty "Selected" with
+                | null -> failwith "The constructor selection property was not found."
+                | value -> value
+
+            selectedProperty.GetValue(null)
+            |> should equal (box "connection-state")
+
+            state.TryGet<ConcurrentDictionary<string, int64>>("requests").IsSome
+            |> should equal true
+
+            let! failures =
+                ProcessorLifetime.disposeAllAsync [| processor |]
+                |> _.AsTask()
+
+            failures |> should be Empty
+            do! (state :> IAsyncDisposable).DisposeAsync().AsTask()
         }
 
     [<Fact>]
@@ -492,7 +569,7 @@ type Processor() =
 
             use pipeline =
                 new PipeL4.Core.ProcessorPipeline(
-                    [| plugin.CreateProcessor() |],
+                    [| plugin.CreateProcessor(unusedConnectionState) |],
                     sink,
                     MemoryPool<byte>.Shared
                 )

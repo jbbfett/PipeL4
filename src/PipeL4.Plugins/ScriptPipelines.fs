@@ -110,9 +110,9 @@ type internal ConfiguredScriptStage(scriptPath: string, plugin: CompiledScriptPr
     member _.ScriptPath = scriptPath
     member _.Plugin = plugin
 
-    member _.CreateProcessor(direction, stageNumber) =
+    member _.CreateProcessor(connectionState, direction, stageNumber) =
         try
-            let processor = plugin.CreateProcessor()
+            let processor = plugin.CreateProcessor(connectionState)
 
             ContextualScriptProcessor(
                 scriptPath,
@@ -144,15 +144,23 @@ type internal ScriptPipelineDefinition internal (
     member internal _.ServerToClientPaths =
         serverToClientStages |> Array.map _.ScriptPath
 
-    member _.CreateProcessorPipelinesAsync() =
+    member _.CreateProcessorPipelinesAsync(connectionState: ConnectionState) =
         ValueTask<DirectionalProcessorPipelines>(
             task {
                 let created = ResizeArray<PipeL4.Core.IByteStreamProcessor>()
+                let publicConnectionState =
+                    ConnectionStateAdapter(connectionState) :> IConnectionState
 
                 let create direction (stages: ConfiguredScriptStage array) =
                     stages
                     |> Array.mapi (fun index stage ->
-                        let processor = stage.CreateProcessor(direction, index + 1)
+                        let processor =
+                            stage.CreateProcessor(
+                                publicConnectionState,
+                                direction,
+                                index + 1
+                            )
+
                         created.Add processor
                         processor)
 

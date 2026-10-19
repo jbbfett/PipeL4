@@ -219,150 +219,212 @@ module TcpForwarder =
     let private handleConnection
         connectionId
         (configuration: ForwardingConfiguration)
-        (processorPipelineFactory: (unit -> ValueTask<DirectionalPipelineSelection>) option)
+        (processorPipelineFactory: (ConnectionState -> ValueTask<DirectionalPipelineSelection>) option)
         (logger: ILogger)
         (client: TcpClient)
         (cancellationToken: CancellationToken)
         =
         task {
-            use client = client
-            use backend = new TcpClient(configuration.BackendEndpoint.AddressFamily)
-
+            let connectionState = ConnectionState()
             let clientEndpoint = client.Client.RemoteEndPoint
 
-            try
-                do! backend.ConnectAsync(configuration.BackendEndpoint, cancellationToken)
+            let runConnection () : Task =
+                task {
+                    use client = client
+                    use backend = new TcpClient(configuration.BackendEndpoint.AddressFamily)
 
-                logger.LogInformation(
-                    "Connection {ConnectionId} established from {ClientEndpoint} to {BackendEndpoint}",
-                    [| box connectionId
-                       box clientEndpoint
-                       box configuration.BackendEndpoint |]
-                )
+                    do! backend.ConnectAsync(configuration.BackendEndpoint, cancellationToken)
 
-                use connectionCancellation =
-                    CancellationTokenSource.CreateLinkedTokenSource cancellationToken
+                    logger.LogInformation(
+                        "Connection {ConnectionId} established from {ClientEndpoint} to {BackendEndpoint}",
+                        [| box connectionId
+                           box clientEndpoint
+                           box configuration.BackendEndpoint |]
+                    )
 
-                let! processorPipelines =
-                    match processorPipelineFactory with
-                    | None -> Task.FromResult None
-                    | Some createProcessorPipelines ->
-                        task {
-                            let! pipelines = createProcessorPipelines().AsTask()
-                            return Some pipelines
-                        }
+                    use connectionCancellation =
+                        CancellationTokenSource.CreateLinkedTokenSource cancellationToken
 
-                let clientToBackend, backendToClient =
-                    match processorPipelines with
-                    | None ->
-                        forward
-                            ClientToBackend
-                            client.Client
-                            backend.Client
-                            connectionCancellation.Token,
-                        forward
-                            BackendToClient
-                            backend.Client
-                            client.Client
-                            connectionCancellation.Token
-                    | Some processorPipelines ->
-                        let forwardDirection direction processors source destination =
-                            match processors with
-                            | Some values ->
-                                forwardWithProcessorPipeline
-                                    direction
-                                    values
-                                    source
-                                    destination
-                                    connectionCancellation.Token
-                            | None ->
-                                forward
-                                    direction
-                                    source
-                                    destination
-                                    connectionCancellation.Token
+                    let! processorPipelines =
+                        match processorPipelineFactory with
+                        | None -> Task.FromResult None
+                        | Some createProcessorPipelines ->
+                            task {
+                                let! pipelines =
+                                    createProcessorPipelines connectionState
+                                    |> _.AsTask()
 
-                        forwardDirection
-                            ClientToBackend
-                            processorPipelines.ClientToBackend
-                            client.Client
-                            backend.Client,
-                        forwardDirection
-                            BackendToClient
-                            processorPipelines.BackendToClient
-                            backend.Client
-                            client.Client
+                                return Some pipelines
+                            }
 
-                let! firstCompleted = Task.WhenAny(clientToBackend, backendToClient)
-                let! firstOutcome = firstCompleted
+                    let clientToBackend, backendToClient =
+                        match processorPipelines with
+                        | None ->
+                            forward
+                                ClientToBackend
+                                client.Client
+                                backend.Client
+                                connectionCancellation.Token,
+                            forward
+                                BackendToClient
+                                backend.Client
+                                client.Client
+                                connectionCancellation.Token
+                        | Some processorPipelines ->
+                            let forwardDirection direction processors source destination =
+                                match processors with
+                                | Some values ->
+                                    forwardWithProcessorPipeline
+                                        direction
+                                        values
+                                        source
+                                        destination
+                                        connectionCancellation.Token
+                                | None ->
+                                    forward
+                                        direction
+                                        source
+                                        destination
+                                        connectionCancellation.Token
 
-                let other =
-                    if Object.ReferenceEquals(firstCompleted, clientToBackend) then
-                        backendToClient
-                    else
-                        clientToBackend
+                            forwardDirection
+                                ClientToBackend
+                                processorPipelines.ClientToBackend
+                                client.Client
+                                backend.Client,
+                            forwardDirection
+                                BackendToClient
+                                processorPipelines.BackendToClient
+                                backend.Client
+                                client.Client
 
-                match firstOutcome with
-                | Failed _ ->
-                    connectionCancellation.Cancel()
-                    client.Dispose()
-                    backend.Dispose()
-                | Cancelled _ when cancellationToken.IsCancellationRequested ->
-                    connectionCancellation.Cancel()
-                    client.Dispose()
-                    backend.Dispose()
-                | EndOfStream _
-                | Cancelled _ -> ()
+                    let! firstCompleted = Task.WhenAny(clientToBackend, backendToClient)
+                    let! firstOutcome = firstCompleted
 
-                let! otherOutcome = other
+                    let other =
+                        if Object.ReferenceEquals(firstCompleted, clientToBackend) then
+                            backendToClient
+                        else
+                            clientToBackend
 
-                logForwardingFailure
-                    logger
-                    connectionId
-                    clientEndpoint
-                    configuration.BackendEndpoint
-                    firstOutcome
+                    match firstOutcome with
+                    | Failed _ ->
+                        connectionCancellation.Cancel()
+                        client.Dispose()
+                        backend.Dispose()
+                    | Cancelled _ when cancellationToken.IsCancellationRequested ->
+                        connectionCancellation.Cancel()
+                        client.Dispose()
+                        backend.Dispose()
+                    | EndOfStream _
+                    | Cancelled _ -> ()
 
-                logForwardingFailure
-                    logger
-                    connectionId
-                    clientEndpoint
-                    configuration.BackendEndpoint
-                    otherOutcome
+                    let! otherOutcome = other
 
-                let completionReason =
-                    if cancellationToken.IsCancellationRequested then
-                        "shutdown"
-                    else
-                        match firstOutcome, otherOutcome with
-                        | Failed _, _
-                        | _, Failed _ -> "failure"
-                        | _ -> "completed"
+                    logForwardingFailure
+                        logger
+                        connectionId
+                        clientEndpoint
+                        configuration.BackendEndpoint
+                        firstOutcome
 
-                logger.LogInformation(
-                    "Connection {ConnectionId} closed with reason {CompletionReason}",
-                    [| box connectionId; box completionReason |]
-                )
-            with
-            | :? OperationCanceledException when cancellationToken.IsCancellationRequested -> ()
-            | :? SocketException as error ->
-                if not cancellationToken.IsCancellationRequested then
+                    logForwardingFailure
+                        logger
+                        connectionId
+                        clientEndpoint
+                        configuration.BackendEndpoint
+                        otherOutcome
+
+                    let completionReason =
+                        if cancellationToken.IsCancellationRequested then
+                            "shutdown"
+                        else
+                            match firstOutcome, otherOutcome with
+                            | Failed _, _
+                            | _, Failed _ -> "failure"
+                            | _ -> "completed"
+
+                    logger.LogInformation(
+                        "Connection {ConnectionId} closed with reason {CompletionReason}",
+                        [| box connectionId; box completionReason |]
+                    )
+                }
+
+            let! (connectionFailure: exn option) =
+                task {
+                    try
+                        do! runConnection ()
+                        return None
+                    with error ->
+                        return Some error
+                }
+
+            let! (stateDisposalFailure: exn option) =
+                task {
+                    try
+                        do! (connectionState :> IAsyncDisposable).DisposeAsync().AsTask()
+                        return None
+                    with error ->
+                        return Some error
+                }
+
+            let combineFailures (primaryError: exn) (disposalError: exn option) : exn =
+                match disposalError with
+                | None -> primaryError
+                | Some cleanupError ->
+                    AggregateException(
+                        "Connection execution and connection-state disposal both failed.",
+                        primaryError,
+                        cleanupError
+                    )
+                    :> exn
+
+            let logStateDisposalFailureDuringShutdown () =
+                match stateDisposalFailure with
+                | Some error ->
                     logger.LogWarning(
                         error,
+                        "Connection {ConnectionId} state disposal failed during shutdown",
+                        [| box connectionId |]
+                    )
+                | None -> ()
+
+            match connectionFailure with
+            | Some (:? OperationCanceledException) when cancellationToken.IsCancellationRequested ->
+                logStateDisposalFailureDuringShutdown ()
+            | Some (:? SocketException as error) ->
+                if cancellationToken.IsCancellationRequested then
+                    logStateDisposalFailureDuringShutdown ()
+                else
+                    logger.LogWarning(
+                        combineFailures error stateDisposalFailure,
                         "Connection {ConnectionId} could not connect from {ClientEndpoint} to {BackendEndpoint}",
                         [| box connectionId
                            box clientEndpoint
                            box configuration.BackendEndpoint |]
                     )
-            | error ->
-                if not cancellationToken.IsCancellationRequested then
+            | Some error ->
+                if cancellationToken.IsCancellationRequested then
+                    logStateDisposalFailureDuringShutdown ()
+                else
                     logger.LogError(
-                        error,
+                        combineFailures error stateDisposalFailure,
                         "Connection {ConnectionId} failed unexpectedly from {ClientEndpoint} to {BackendEndpoint}",
                         [| box connectionId
                            box clientEndpoint
                            box configuration.BackendEndpoint |]
                     )
+            | None ->
+                match stateDisposalFailure with
+                | Some error ->
+                    logger.LogWarning(
+                        error,
+                        "Connection {ConnectionId} state disposal failed from {ClientEndpoint} to {BackendEndpoint}",
+                        [| box connectionId
+                           box clientEndpoint
+                           box configuration.BackendEndpoint |]
+                    )
+                | None -> ()
         }
 
     let private trackConnection
@@ -392,7 +454,7 @@ module TcpForwarder =
 
     let private run
         (configuration: ForwardingConfiguration)
-        (processorPipelineFactory: (unit -> ValueTask<DirectionalPipelineSelection>) option)
+        (processorPipelineFactory: (ConnectionState -> ValueTask<DirectionalPipelineSelection>) option)
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
@@ -466,12 +528,12 @@ module TcpForwarder =
 
     let internal runWithProcessorPipelinesAsync
         (configuration: ForwardingConfiguration)
-        (processorPipelineFactory: unit -> DirectionalProcessorPipelines)
+        (processorPipelineFactory: ConnectionState -> DirectionalProcessorPipelines)
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
-        let createSelection () =
-            let pipelines = processorPipelineFactory ()
+        let createSelection connectionState =
+            let pipelines = processorPipelineFactory connectionState
 
             ValueTask<DirectionalPipelineSelection>(
                 { ClientToBackend = Some pipelines.ClientToBackend
@@ -482,15 +544,15 @@ module TcpForwarder =
 
     let internal runWithOptionalProcessorPipelinesAsync
         (configuration: ForwardingConfiguration)
-        (processorPipelineFactory: unit -> DirectionalProcessorPipelines)
+        (processorPipelineFactory: ConnectionState -> DirectionalProcessorPipelines)
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
         let optional processors =
             if Array.isEmpty processors then None else Some processors
 
-        let createSelection () =
-            let pipelines = processorPipelineFactory ()
+        let createSelection connectionState =
+            let pipelines = processorPipelineFactory connectionState
 
             ValueTask<DirectionalPipelineSelection>(
                 { ClientToBackend = optional pipelines.ClientToBackend
@@ -501,17 +563,19 @@ module TcpForwarder =
 
     let internal runWithOptionalProcessorPipelineFactoryAsync
         (configuration: ForwardingConfiguration)
-        (processorPipelineFactory: unit -> ValueTask<DirectionalProcessorPipelines>)
+        (processorPipelineFactory: ConnectionState -> ValueTask<DirectionalProcessorPipelines>)
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
         let optional processors =
             if Array.isEmpty processors then None else Some processors
 
-        let createSelection () =
+        let createSelection connectionState =
             ValueTask<DirectionalPipelineSelection>(
                 task {
-                    let! pipelines = processorPipelineFactory().AsTask()
+                    let! pipelines =
+                        processorPipelineFactory connectionState
+                        |> _.AsTask()
 
                     return
                         { ClientToBackend = optional pipelines.ClientToBackend
