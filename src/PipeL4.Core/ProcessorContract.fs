@@ -41,7 +41,7 @@ module internal ProcessorLifetime =
     let disposeAllAsync (processors: IByteStreamProcessor array) =
         ValueTask<exn array>(
             task {
-                let failures = ResizeArray<exn>()
+                let mutable failures: ResizeArray<exn> option = None
 
                 for index = processors.Length - 1 downto 0 do
                     try
@@ -52,9 +52,17 @@ module internal ProcessorLifetime =
                             disposable.Dispose()
                         | _ -> ()
                     with error ->
-                        failures.Add error
+                        match failures with
+                        | Some values -> values.Add error
+                        | None ->
+                            let values = ResizeArray<exn>()
+                            values.Add error
+                            failures <- Some values
 
-                return failures.ToArray()
+                return
+                    match failures with
+                    | Some values -> values.ToArray()
+                    | None -> Array.empty
             }
         )
 

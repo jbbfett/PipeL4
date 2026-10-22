@@ -51,6 +51,13 @@ Run a smoke check of every benchmark case:
 dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- --filter '*' --job Dry
 ```
 
+Run the allocation-only processor-pipeline comparison:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- \
+  --filter '*ProcessorPipelineAllocationBenchmarks*' --job short
+```
+
 Reports are written under `BenchmarkDotNet.Artifacts/`, which is ignored by Git.
 
 ## Connection-state operations
@@ -86,6 +93,332 @@ concurrent-connection scaling. Allocation results include the in-process client,
 proxy workload rather than PipeL4 alone. Exact copied-byte ratios and logical/physical runtime
 buffer-memory counters are not exposed and are not approximated here. A deterministic integration
 test, rather than BenchmarkDotNet, supplies the limited concurrent-connection serialization check.
+
+## Observability overhead and branch-exit review: 2026-10-21
+
+### Branch-exit follow-up: 2026-10-22
+
+The historical forwarding tables in this section are retained as implementation deltas. They
+compare `b6fc7bf` with `a96f504`, and `a96f504` changed both observability and cleanup/ownership
+behavior. They must not be read as isolated observability-component overhead. The focused before /
+after measurement below compares the current pre-change commit `1435302` with the working tree
+that applies the lazy cleanup-failure collection change.
+
+The intervening history confirms the confounders: `f5b8e7f` and `098e8de` changed logical-retention
+teardown, `68d7948` and `7e6557e` added and hardened physical-capacity ownership, `7ebc87f` added
+activity metrics/snapshots, `2081d0e` corrected async timing and snapshot immutability, and
+`a96f504` hardened accounting and cleanup. The historical total is therefore an implementation
+delta across ownership, cleanup, and observability—not an instrumentation-only experiment.
+
+The focused harness was added identically to both revisions. Each measured operation rents one
+`MemoryPool<byte>` owner, pushes 4 KiB through a no-op sink and `StageCount` pass-through stages,
+and disposes the resulting pipeline state. It performs no EOF operation and no second direction.
+Therefore the measured invocation count is exactly `StageCount` (0, 1, 4, or 8); no TCP round-trip
+invocation multiplier is assumed.
+
+The TCP forwarding methods intentionally report allocation per completed exchange only. Their
+read loop can split a payload into multiple chunks, so a round trip does not have a fixed
+`2 * depth` processor-invocation count, especially at 1 MiB. No per-invocation forwarding number
+is derived from those rows.
+
+| Stage count | Actual invocations / push | Before `1435302` | After lazy collection | Change | Change / invocation |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 96 B | 96 B | 0 B | n/a |
+| 1 | 1 | 824 B | 696 B | -128 B (-15.5%) | -128 B |
+| 4 | 4 | 2,576 B | 2,160 B | -416 B (-16.1%) | -104 B |
+| 8 | 8 | 4,912 B | 4,112 B | -800 B (-16.3%) | -100 B |
+
+Both focused runs used Release, .NET SDK 10.0.113 / .NET 10.0.13, BenchmarkDotNet 0.15.8, and
+`ShortRun` (three warmups and three measured iterations). The benchmark project and harness files
+were byte-for-byte identical in the detached pre-change clone and the working tree.
+
+The reduction is the successful-path cost of not constructing empty cleanup-failure collectors.
+The measured slope is 584 B per added stage before the change and 488 B after it; the avoidable
+part is 128 B for the first invoked stage and about 96 B for each additional invoked stage in this
+harness. These are per-push managed allocations, not a claim about a TCP round trip.
+
+Two follow-up probes kept the other suspected sites unchanged. Inlining the local timing helper
+did not change the allocation rows, so the helper remains in place and exact invocation duration
+semantics are unchanged. Replacing `Seq.sumBy` with `for` traversal increased the four-stage and
+eight-stage rows (2,232/4,280 B for sequence traversal and 2,328/4,504 B for indexed traversal,
+versus 2,160/4,112 B with `Seq.sumBy`), so `Seq.sumBy` was retained; no optimization is claimed
+there.
+
+As a bounded forwarding cross-check, empty-pipeline current/baseline runs were interleaved
+current → baseline → current → baseline for all three payloads. The 64 B and 4 KiB rows both
+reported 976 B on the empty route in every run. The 1 MiB rows varied by TCP segmentation (about
+7.5–7.6 KiB), so they are classified as noisy. A single bounded interleaved pair for the internal
+four-stage route reported about 5.13 KiB after versus 5.8 KiB before for the small payloads; this
+was not used as a latency attribution because the short run was noisy. The direct allocation
+benchmark above is the authoritative allocation comparison.
+
+This report compares the unchanged forwarding suite at the pre-observability merge base `b6fc7bf`
+with the completed `a96f504` branch. The baseline was checked out in a clean detached temporary
+clone because the container's `.git` directory does not permit creating worktree metadata. Both
+runs used the same host, Release configuration, SDK/runtime, BenchmarkDotNet configuration, routes,
+and payloads, and were run sequentially. The benchmark project source for
+`RawTcpForwardingBenchmarks` is byte-for-byte unchanged between the two revisions.
+
+Environment: Ubuntu 24.04.5 LTS; Intel Core i5-8365U, 4 physical/8 logical cores; .NET SDK
+10.0.112; .NET 10.0.12 x64 RyuJIT; BenchmarkDotNet 0.15.8; concurrent workstation GC. The host
+reported a permission error when BenchmarkDotNet attempted to raise process priority. Paket restore,
+Release build, and the all-case dry job completed before the measured runs. Generated reports stay in
+ignored `BenchmarkDotNet.Artifacts/` directories.
+
+The forwarding command was run once at `b6fc7bf` and once on the current branch:
+
+```sh
+dotnet restore PipeL4.sln /p:PaketDisableGlobalRestore=true
+dotnet build PipeL4.sln -c Release --no-restore
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
+  --filter '*RawTcpForwardingBenchmarks*'
+```
+
+The setup boundary includes compilation and discovery of embedded `.fsx` scripts, pipeline and
+processor construction, listener and connection creation, and a validated preflight exchange. The
+steady-state operation is one request/response on an already established persistent connection. It
+accumulates the expected response bytes and verifies the exchange; it does not include setup or
+teardown. `Logical MiB/s` counts the request and response payload once each. `Mean`, `Error`, and
+`StdDev` below are BenchmarkDotNet values; allocation is managed bytes per measured exchange.
+
+### Snapshot microbenchmarks
+
+The focused suite uses `MemoryDiagnoser` and seeds all counters, pipeline stages, direction metrics,
+and one tracked physical lease in `GlobalSetup`. The measured operations only call the existing
+snapshot paths and return scalar checksums so the results remain observable without changing public
+APIs. There is no background writer benchmark. The existing bounded concurrent snapshot tests cover
+active-processing contention, correctness, deadlock, and lifetime behavior.
+
+| Stages | Stage snapshot (ns mean +/- error, StdDev; B) | Direction snapshot (ns mean +/- error, StdDev; B) | Connection snapshot (ns mean +/- error, StdDev; B) |
+|---:|---:|---:|---:|
+| 1 | 71.94 +/- 1.024 (2.022); 208 | 79.85 +/- 1.375 (1.219); 208 | 162.80 +/- 3.299 (2.925); 416 |
+| 4 | 206.29 +/- 4.172 (3.902); 760 | 196.19 +/- 3.924 (6.224); 760 | 410.19 +/- 6.256 (5.852); 1,520 |
+| 8 | 362.33 +/- 7.143 (8.772); 1,496 | 314.50 +/- 5.527 (9.235); 1,496 | 623.13 +/- 9.346 (8.743); 2,992 |
+
+The stage-count rows are nonzero; the latest run had no distribution warning for these nine cases.
+Connection snapshots allocate two direction snapshots, as expected; the tracked physical lease is
+acquired before measurement and released during global cleanup. Outliers were removed by
+BenchmarkDotNet's normal statistical policy. These are snapshot costs, not forwarding throughput
+costs. The four-stage connection value of 410.19 ns is one retained run, not a general guarantee:
+the retained artifacts also contain 347.398 ns and 348.13 ns for the same operation. Report the
+latency as an approximate 347–410 ns host-sensitive range; the 1,520 B allocation result is the
+more reproducible observation.
+
+### Forwarding results and comparison method
+
+The complete 33-case forwarding tables (Direct, RawPipeL4, empty pipeline, internal 1/4/8 stages,
+and `.fsx` 1/4-stage variants for 64 B, 4 KiB, and 1 MiB) are recorded below after the sequential
+baseline/current runs. Direct and empty-pipeline rows are controls. For each matching route and
+payload, latency overhead is `(current mean - baseline mean) / baseline mean`; relative throughput
+change is `(current logical MiB/s / baseline logical MiB/s) - 1`. A delta is repeated only when its
+absolute value exceeds both 5% and the quadrature-combined reported uncertainty. Each conclusion is
+classified as stable, noisy, or insufficiently reliable; multimodal or high-variance rows are not
+used to attribute instrumentation cost.
+
+The complete paired results are below. `Class` applies the requested 5% plus combined-error rule to
+the latency delta, then downgrades rows with BenchmarkDotNet multimodal warnings or very large
+relative error. The throughput delta is shown beside it and is evaluated with the same threshold
+when drawing the route-level conclusions.
+
+| Payload | Route | Baseline mean +/- error (stddev) | Current mean +/- error (stddev) | Baseline ratio | Current ratio | Baseline MiB/s | Current MiB/s | Baseline alloc | Current alloc | Latency delta | Throughput delta | Combined uncertainty | Class |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 64 | Direct | 32.00 us +/- 0.657 us (1.875 us) | 31.46 us +/- 0.669 us (1.940 us) | 1.00 | 1.00 | 3.81 | 3.88 | 521 B | 523 B | -1.7% | +1.8% | 3.0% | noisy |
+| 64 | RawPipeL4 | 64.15 us +/- 1.267 us (2.781 us) | 68.68 us +/- 2.261 us (6.414 us) | 2.01 | 2.19 | 1.90 | 1.78 | 608 B | 608 B | +7.1% | -6.3% | 3.8% | stable |
+| 64 | ViaEmptyProcessorPipeline | 65.02 us +/- 1.270 us (2.322 us) | 66.99 us +/- 1.482 us (4.276 us) | 2.04 | 2.14 | 1.88 | 1.82 | 879 B | 976 B | +3.0% | -3.2% | 3.0% | noisy |
+| 64 | InternalProcessorPipeline | 75.33 us +/- 2.663 us (7.468 us) | 77.73 us +/- 2.807 us (7.870 us) | 2.36 | 2.48 | 1.62 | 1.57 | 1,741 B | 2,431 B | +3.2% | -3.1% | 5.1% | noisy |
+| 64 | InternalFourStagePipeline | 71.95 us +/- 1.432 us (4.084 us) | 90.25 us +/- 3.367 us (9.661 us) | 2.26 | 2.88 | 1.70 | 1.35 | 3,520 B | 5,936 B | +25.4% | -20.6% | 4.2% | stable |
+| 64 | InternalEightStagePipeline | 74.85 us +/- 1.921 us (5.386 us) | 84.93 us +/- 2.878 us (8.211 us) | 2.35 | 2.71 | 1.63 | 1.44 | 5,888 B | 10,608 B | +13.5% | -11.7% | 4.3% | insufficiently reliable |
+| 64 | FsxProcessorPipeline | 67.65 us +/- 1.344 us (3.221 us) | 75.45 us +/- 2.447 us (7.137 us) | 2.12 | 2.41 | 1.80 | 1.62 | 1,792 B | 2,480 B | +11.5% | -10.0% | 3.8% | stable |
+| 64 | FsxFourStagePipeline | 74.80 us +/- 1.693 us (4.693 us) | 79.31 us +/- 1.580 us (3.298 us) | 2.35 | 2.53 | 1.63 | 1.54 | 3,712 B | 6,128 B | +6.0% | -5.5% | 3.0% | stable |
+| 64 | FsxGeneratedOutputPipeline | 81.79 us +/- 3.911 us (11.408 us) | 76.33 us +/- 2.208 us (6.154 us) | 2.57 | 2.44 | 1.49 | 1.60 | 1,951 B | 2,736 B | -6.7% | +7.4% | 5.6% | insufficiently reliable |
+| 64 | FsxWithStateAccess | 68.48 us +/- 1.357 us (2.833 us) | 80.46 us +/- 2.042 us (5.792 us) | 2.15 | 2.57 | 1.78 | 1.52 | 1,840 B | 2,528 B | +17.5% | -14.6% | 3.2% | insufficiently reliable |
+| 64 | FsxWithCachedState | 67.18 us +/- 1.336 us (3.070 us) | 83.46 us +/- 4.476 us (13.056 us) | 2.11 | 2.66 | 1.82 | 1.46 | 1,792 B | 2,480 B | +24.2% | -19.8% | 5.7% | insufficiently reliable |
+| 4,096 | Direct | 34.05 us +/- 0.685 us (1.977 us) | 35.01 us +/- 0.809 us (2.321 us) | 1.00 | 1.00 | 229.43 | 223.17 | 520 B | 543 B | +2.8% | -2.7% | 3.1% | noisy |
+| 4,096 | RawPipeL4 | 68.00 us +/- 1.356 us (3.476 us) | 69.69 us +/- 1.394 us (2.816 us) | 2.00 | 2.00 | 114.89 | 112.10 | 608 B | 607 B | +2.5% | -2.4% | 2.8% | noisy |
+| 4,096 | ViaEmptyProcessorPipeline | 69.85 us +/- 1.396 us (3.750 us) | 73.36 us +/- 1.760 us (5.133 us) | 2.06 | 2.10 | 111.85 | 106.49 | 880 B | 976 B | +5.0% | -4.8% | 3.1% | stable |
+| 4,096 | InternalProcessorPipeline | 73.24 us +/- 1.453 us (3.425 us) | 75.85 us +/- 1.498 us (3.289 us) | 2.16 | 2.18 | 106.67 | 103.00 | 1,742 B | 2,432 B | +3.6% | -3.4% | 2.8% | noisy |
+| 4,096 | InternalFourStagePipeline | 74.51 us +/- 1.489 us (2.869 us) | 83.13 us +/- 1.841 us (5.282 us) | 2.20 | 2.39 | 104.85 | 93.98 | 3,520 B | 5,936 B | +11.6% | -10.4% | 3.0% | insufficiently reliable |
+| 4,096 | InternalEightStagePipeline | 79.98 us +/- 1.593 us (3.428 us) | 89.14 us +/- 1.777 us (4.586 us) | 2.36 | 2.56 | 97.69 | 87.64 | 5,888 B | 10,608 B | +11.5% | -10.3% | 2.8% | insufficiently reliable |
+| 4,096 | FsxProcessorPipeline | 73.43 us +/- 1.467 us (3.157 us) | 76.57 us +/- 1.522 us (4.294 us) | 2.16 | 2.20 | 106.40 | 102.03 | 1,792 B | 2,480 B | +4.3% | -4.1% | 2.8% | noisy |
+| 4,096 | FsxFourStagePipeline | 76.53 us +/- 1.526 us (2.903 us) | 81.90 us +/- 1.624 us (4.015 us) | 2.26 | 2.35 | 102.08 | 95.39 | 3,712 B | 6,128 B | +7.0% | -6.6% | 2.8% | insufficiently reliable |
+| 4,096 | FsxGeneratedOutputPipeline | 73.31 us +/- 1.465 us (2.959 us) | 78.32 us +/- 1.553 us (3.065 us) | 2.16 | 2.25 | 106.56 | 99.75 | 1,952 B | 2,736 B | +6.8% | -6.4% | 2.8% | insufficiently reliable |
+| 4,096 | FsxWithStateAccess | 70.69 us +/- 1.122 us (0.876 us) | 80.37 us +/- 1.607 us (3.912 us) | 2.08 | 2.31 | 110.51 | 97.21 | 1,840 B | 2,528 B | +13.7% | -12.0% | 2.6% | stable |
+| 4,096 | FsxWithCachedState | 73.13 us +/- 1.462 us (3.929 us) | 85.40 us +/- 3.231 us (9.166 us) | 2.16 | 2.45 | 106.82 | 91.48 | 1,792 B | 2,480 B | +16.8% | -14.4% | 4.3% | stable |
+| 1,048,576 | Direct | 617.88 us +/- 12.253 us (25.305 us) | 765.13 us +/- 35.744 us (104.832 us) | 1.00 | 1.02 | 3,236.86 | 2,613.94 | 559 B | 558 B | +23.8% | -19.2% | 5.1% | insufficiently reliable |
+| 1,048,576 | RawPipeL4 | 1,807.34 us +/- 117.334 us (344.121 us) | 2,813.83 us +/- 201.769 us (591.754 us) | 2.93 | 3.74 | 1,106.60 | 710.78 | 1,373 B | 1,346 B | +55.7% | -35.8% | 9.7% | insufficiently reliable |
+| 1,048,576 | ViaEmptyProcessorPipeline | 1,686.41 us +/- 89.476 us (258.159 us) | 2,509.26 us +/- 276.234 us (814.481 us) | 2.73 | 3.34 | 1,185.95 | 797.05 | 5,973 B | 7,598 B | +48.8% | -32.8% | 12.2% | insufficiently reliable |
+| 1,048,576 | InternalProcessorPipeline | 1,593.07 us +/- 75.814 us (219.950 us) | 1,615.45 us +/- 74.732 us (210.782 us) | 2.58 | 2.15 | 1,255.44 | 1,238.04 | 20,614 B | 32,240 B | +1.4% | -1.4% | 6.6% | insufficiently reliable |
+| 1,048,576 | InternalFourStagePipeline | 1,607.07 us +/- 76.341 us (216.566 us) | 1,561.70 us +/- 42.112 us (121.503 us) | 2.61 | 2.08 | 1,244.50 | 1,280.65 | 50,646 B | 91,569 B | -2.8% | +2.9% | 5.5% | insufficiently reliable |
+| 1,048,576 | InternalEightStagePipeline | 1,683.33 us +/- 66.183 us (189.891 us) | 3,122.19 us +/- 357.960 us (1,055.452 us) | 2.73 | 4.15 | 1,188.12 | 640.58 | 90,876 B | 169,884 B | +85.5% | -46.1% | 12.1% | insufficiently reliable |
+| 1,048,576 | FsxProcessorPipeline | 1,550.22 us +/- 75.267 us (212.293 us) | 1,559.62 us +/- 75.965 us (217.957 us) | 2.51 | 2.08 | 1,290.14 | 1,282.36 | 21,444 B | 33,069 B | +0.6% | -0.6% | 6.9% | insufficiently reliable |
+| 1,048,576 | FsxFourStagePipeline | 1,458.97 us +/- 35.589 us (101.537 us) | 1,552.32 us +/- 75.695 us (215.963 us) | 2.37 | 2.07 | 1,370.83 | 1,288.40 | 53,941 B | 94,738 B | +6.4% | -6.0% | 5.5% | insufficiently reliable |
+| 1,048,576 | FsxGeneratedOutputPipeline | 1,499.53 us +/- 37.336 us (108.317 us) | 1,583.05 us +/- 42.568 us (122.818 us) | 2.43 | 2.11 | 1,333.76 | 1,263.38 | 24,137 B | 37,350 B | +5.6% | -5.3% | 3.7% | insufficiently reliable |
+| 1,048,576 | FsxWithStateAccess | 1,496.58 us +/- 52.397 us (149.492 us) | 1,691.05 us +/- 362.604 us (1,022.731 us) | 2.43 | 2.25 | 1,336.38 | 1,182.69 | 22,238 B | 33,893 B | +13.0% | -11.5% | 21.7% | insufficiently reliable |
+| 1,048,576 | FsxWithCachedState | 1,501.44 us +/- 118.626 us (342.264 us) | 1,719.98 us +/- 471.676 us (1,307.013 us) | 2.43 | 2.29 | 1,332.05 | 1,162.81 | 21,422 B | 32,960 B | +14.6% | -12.7% | 28.5% | insufficiently reliable |
+
+The default runs emitted 15 multimodal-distribution warnings each, plus the usual outlier removal.
+The current run additionally reported minimum-iteration-time hints for the 1 MiB internal-eight-stage
+and state rows. Every 1 MiB row is therefore **insufficiently reliable** for causal attribution, as
+are the small-payload rows marked that way in the table. Only un-warned small-payload rows that pass
+the threshold are **stable by the requested rule**; rows below the threshold are **noisy**. A repeat
+is warranted only for a stable delta that would change the merge decision; the controls and the
+4 KiB one-stage internal row do not show such a repeat-triggering observability-only regression.
+
+Within-run route costs remain distinct from branch deltas. Direct -> RawPipeL4 is the TCP proxy cost;
+RawPipeL4 -> ViaEmptyProcessorPipeline is the empty runtime boundary; empty -> internal 1/4/8 stages
+is processor-runtime work; internal -> `.fsx` is the script adapter cost; and baseline -> current is
+the incremental branch cost. The observed 64 B/4 KiB stage-depth and script deltas are implementation
+deltas across accounting/metrics and cleanup behavior, while the 1 MiB multimodal rows do not isolate
+instrumentation. In particular, the 64 B RawPipeL4 +7.1% row is a total branch delta,
+not evidence of a per-operation metric regression: raw-path accounting is acquired outside the
+measured persistent exchange, and the sequential comparison remains confounded. No result indicates
+global or cross-direction serialization.
+
+The complete current-run log (`BenchmarkDotNet.Artifacts/PipeL4.Benchmarks.RawTcpForwardingBenchmarks-20261020-235120.log`)
+and detached-baseline report/CSV are retained as ignored artifacts; they are the authoritative source
+for the table above. The final dry/snapshot verification commands may overwrite the default current
+report filenames, so the dated full-run log is the durable current-run record.
+
+### Runtime and branch-exit review
+
+The successful invocation hot path is: admit input once; record invocation start with monotonic
+`Stopwatch.GetTimestamp`; run the processor; count output provenance (`AppendInput` ranges and
+generated output lengths, without scanning byte values); validate the result; release the
+unretained prefix and commit the retained suffix; then publish success counters, duration, and
+retained/output gauges. Inter-stage forwarding enumerates the output range list once to sum logical
+bytes for the next stage; this is range-list enumeration, not byte scanning. Each metrics boundary
+uses the existing per-pipeline lock, so synchronization is at input admission, invocation start,
+successful validation/commit, and failure/cancellation commit. `GetSnapshot` takes the same lock,
+copies stage values, and aggregates them; it does not inspect network buffers.
+
+Physical accounting was reviewed at the actual lease boundaries. A new tracked input owner or
+generated owner allocates one wrapper and performs the corresponding atomic connection-gauge update
+on acquisition; disposal is guarded once and releases the gauge only after the underlying owner is
+disposed successfully. Shared storage is counted once at its physical owner, while logical
+`SegmentOwner` ranges retain/release references independently. Raw forwarding pays one pooled-array
+lease per direction for the lifetime of the measured connection. There are no per-range owner
+lookups and no observability-only reference counting.
+
+Allocation classes are separated as follows: connection (listeners, sockets, runtime state),
+direction (direction metrics and pipeline), stage (stage metric storage and processor), lease
+(tracked-owner wrapper and capacity lease), invocation (existing task/state and output-range
+objects), snapshot (the stage array plus list, doubled for a connection snapshot), and teardown
+(cleanup-hardening exception collection and disposal state). Observability metadata is distinct from
+existing network buffers, output ranges, task state, and cleanup allocations. Current-branch
+forwarding differences therefore cannot all be attributed to metrics: the branch also contains
+unrelated cleanup hardening.
+
+The focused allocation benchmark confirms that the tracked-owner wrapper is present in the empty
+pipeline baseline and is required to preserve physical-capacity ownership and exactly-once release;
+it was not removed. The remaining per-stage slope is the existing invocation/task/output-range
+state plus metric work. The timing-closure probe showed no measurable managed-allocation change,
+and the range-sum probes regressed allocations, so neither is treated as an avoidable source. The
+connection-state disposal collector remains teardown-only and was not changed as a successful-path
+optimization.
+
+Duration starts before `ProcessAsync` and stops after its awaited completion, so asynchronous
+suspension is included. Success, processor failure, cancellation, and teardown paths publish one
+duration consistently, and no timing history is retained.
+
+The processor-pipeline and integration tests map to every requested exit invariant. Processor-pipeline tests cover
+single/multi-stage ordering, output provenance, retained-suffix ownership, generated output,
+physical accounting, failure/cancellation duration, EOF, teardown, detached snapshots, and bounded
+concurrent snapshots. TCP integration tests cover bidirectional traffic, half-close/EOF, concurrent
+connections, one slow connection not blocking another, processor/socket failure cleanup, and
+application cancellation. Compiled-script integration tests cover `.fsx` observability, concurrent
+connection snapshots, snapshot lifetime after teardown, and script failures. The bounded concurrent
+scenarios were reused as correctness/performance sanity checks, not throughput benchmarks.
+
+`docs/architecture.md` remains accurate: snapshots are detached aggregates, accounting is tied to
+physical ownership, directions remain concurrent, and the runtime does not add global serialization,
+exporters, limits, or backpressure. The follow-up changes only successful-path cleanup collection;
+the range-sum probe was measured and deliberately retained, and no architectural or backpressure
+change was introduced.
+
+### Commands, limitations, and verdict
+
+The verification commands were:
+
+```sh
+git clone --no-local /home/mike/work/PipeL4 /tmp/PipeL4-observability-b6fc7bf
+git -C /tmp/PipeL4-observability-b6fc7bf checkout --detach b6fc7bf
+dotnet restore PipeL4.sln /p:PaketDisableGlobalRestore=true
+dotnet build PipeL4.sln -c Release --no-restore
+dotnet test --solution PipeL4.sln -c Release --no-restore
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- --filter '*' --job Dry
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
+  --filter '*ProcessorPipelineAllocationBenchmarks*' --job short
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- --filter '*SnapshotBenchmarks*'
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- --filter '*RawTcpForwardingBenchmarks*'
+git diff --check
+```
+
+The dry job discovered and completed all 49 cases (40 forwarding/state cases plus 9 snapshot cases).
+The forwarding command completed all 33 cases in each revision. The snapshot command completed all
+9 stage/direction/connection cases. BenchmarkDotNet could not raise process priority on this host;
+loopback scheduling noise and the 1 MiB multimodal rows limit causal precision. The benchmark does
+not expose copied-byte ratio, logical buffered bytes, or physical reserved memory, so those values
+are not inferred from throughput or managed allocation.
+
+Merge readiness is **ready**. The review found no correctness or ownership defect, global or
+cross-direction serialization, deadlock, lifetime leak, or accidental observability work that
+contradicts the documented design. The avoidable successful-path cleanup allocations were removed;
+the remaining instrumentation cost is measured and explained. Noisy/insufficiently reliable rows
+are not merge blockers.
+No squash, merge, or `runtime/backpressure` work was started.
+
+## Logical-retention teardown accounting results: 2026-10-20
+
+Environment: Ubuntu 24.04.5 LTS; Intel Core i5-8365U, 4 physical/8 logical cores; .NET SDK
+10.0.112; .NET 10.0.12 x64 RyuJIT; BenchmarkDotNet 0.15.8; concurrent workstation GC. The host
+could not raise benchmark-process priority. The baseline is commit `b6fc7bf`; the corrected result
+is the `f5b8e7f` working tree with the logical-retention teardown fix. Both measurements used the
+same host, Release build, benchmark filters, and sequential execution. A dry run also completed all
+40 benchmark cases before the measured runs.
+
+Each latency cell is mean plus/minus BenchmarkDotNet's reported error. `Logical MiB/s` is derived
+from application request and response payload, and allocation is managed memory per round trip.
+
+| Payload | Route | Baseline latency | Baseline MiB/s | Baseline alloc | Corrected latency | Corrected MiB/s | Corrected alloc |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 64 B | Direct | 21.64 +/- 0.406 us | 5.64 | 524 B | 24.43 +/- 1.042 us | 5.00 | 521 B |
+| 64 B | RawPipeL4 | 47.62 +/- 0.943 us | 2.56 | 608 B | 49.49 +/- 0.952 us | 2.47 | 608 B |
+| 64 B | ViaEmptyProcessorPipeline | 49.62 +/- 0.870 us | 2.46 | 880 B | 51.87 +/- 1.024 us | 2.35 | 880 B |
+| 64 B | InternalProcessorPipeline | 53.62 +/- 1.059 us | 2.28 | 1,744 B | 52.08 +/- 1.020 us | 2.34 | 1,744 B |
+| 64 B | InternalFourStagePipeline | 56.46 +/- 1.107 us | 2.16 | 3,520 B | 59.27 +/- 1.656 us | 2.06 | 3,520 B |
+| 64 B | InternalEightStagePipeline | 58.80 +/- 1.173 us | 2.08 | 5,888 B | 59.46 +/- 1.185 us | 2.05 | 5,888 B |
+| 4 KiB | Direct | 29.09 +/- 0.568 us | 268.59 | 536 B | 27.01 +/- 0.865 us | 289.26 | 534 B |
+| 4 KiB | RawPipeL4 | 54.94 +/- 1.038 us | 142.21 | 608 B | 53.15 +/- 1.042 us | 146.99 | 608 B |
+| 4 KiB | ViaEmptyProcessorPipeline | 57.90 +/- 0.862 us | 134.94 | 880 B | 54.36 +/- 1.063 us | 143.71 | 880 B |
+| 4 KiB | InternalProcessorPipeline | 61.15 +/- 1.096 us | 127.76 | 1,744 B | 57.09 +/- 1.131 us | 136.84 | 1,744 B |
+| 4 KiB | InternalFourStagePipeline | 62.38 +/- 0.936 us | 125.23 | 3,520 B | 57.66 +/- 0.978 us | 135.49 | 3,520 B |
+| 4 KiB | InternalEightStagePipeline | 64.96 +/- 0.472 us | 120.26 | 5,888 B | 60.55 +/- 1.184 us | 129.03 | 5,888 B |
+| 1 MiB | Direct | 569.86 +/- 10.865 us | 3,509.65 | 559 B | 518.05 +/- 10.210 us | 3,860.65 | 560 B |
+| 1 MiB | RawPipeL4 | 2,737.61 +/- 395.457 us | 730.56 | 1,372 B | 1,506.24 +/- 199.974 us | 1,327.81 | 1,372 B |
+| 1 MiB | ViaEmptyProcessorPipeline | 2,266.57 +/- 278.450 us | 882.39 | 5,978 B | 1,301.64 +/- 227.245 us | 1,536.52 | 5,990 B |
+| 1 MiB | InternalProcessorPipeline | 1,973.43 +/- 221.750 us | 1,013.46 | 20,510 B | 1,897.36 +/- 372.540 us | 1,054.10 | 20,614 B |
+| 1 MiB | InternalFourStagePipeline | 1,706.30 +/- 175.890 us | 1,172.13 | 50,608 B | 1,129.96 +/- 69.525 us | 1,769.98 | 50,718 B |
+| 1 MiB | InternalEightStagePipeline | 1,755.23 +/- 145.584 us | 1,139.45 | 90,241 B | 1,273.93 +/- 164.257 us | 1,569.94 | 90,428 B |
+
+The regression check compares each internal route with `ViaEmptyProcessorPipeline` inside the same
+run, then compares that ratio across runs. The uncertainty column combines the four reported
+relative errors in quadrature.
+
+| Payload | Stages | Baseline internal/empty | Corrected internal/empty | Ratio change | Combined error |
+|---:|---:|---:|---:|---:|---:|
+| 64 B | 1 | 1.081 | 1.004 | -7.1% | 3.8% |
+| 64 B | 4 | 1.138 | 1.143 | +0.4% | 4.3% |
+| 64 B | 8 | 1.185 | 1.146 | -3.3% | 3.9% |
+| 4 KiB | 1 | 1.056 | 1.050 | -0.6% | 3.6% |
+| 4 KiB | 4 | 1.077 | 1.061 | -1.5% | 3.3% |
+| 4 KiB | 8 | 1.122 | 1.114 | -0.7% | 3.2% |
+
+No 64 B or 4 KiB internal/control ratio worsened by both more than 5% and the observed uncertainty,
+so the repeat threshold was not reached. The results do not show a stage-depth-correlated regression,
+and small-payload allocations for the empty and internal routes are unchanged. The 1 MiB proxy rows
+were strongly multimodal and reached extended sampling; their ordering and small allocation changes
+are not used for a performance conclusion. The benchmark does not expose copied bytes, copy ratio,
+logical buffered bytes, or physical reserved memory, so none are inferred here.
 
 ## Branch-exit results: 2026-10-19
 

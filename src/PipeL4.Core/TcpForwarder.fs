@@ -4,11 +4,12 @@ open System
 open System.Buffers
 open System.Collections.Concurrent
 open System.Net.Sockets
+open System.Runtime.ExceptionServices
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 
-type private ForwardingDirection =
+type internal ForwardingDirection =
     | ClientToBackend
     | BackendToClient
 
@@ -28,6 +29,68 @@ type internal DirectionalProcessorPipelines =
     { ClientToBackend: IByteStreamProcessor array
       BackendToClient: IByteStreamProcessor array }
 
+[<Struct; NoEquality; NoComparison>]
+type internal DirectionMetricsSnapshot =
+    { Direction: ForwardingDirection
+      Stages: ProcessorStageMetricsSnapshot list
+      InputBytes: int64
+      InputBackedOutputBytes: int64
+      GeneratedOutputBytes: int64
+      InvocationCount: int64
+      SuccessfulInvocationCount: int64
+      FailedInvocationCount: int64
+      CancelledInvocationCount: int64
+      ProcessingDuration: TimeSpan
+      CurrentRetainedBytes: int64 }
+
+[<Struct; NoEquality; NoComparison>]
+type internal ConnectionMetricsSnapshot =
+    { ClientToBackend: DirectionMetricsSnapshot
+      BackendToClient: DirectionMetricsSnapshot
+      CurrentPhysicalBufferCapacityBytes: int64 }
+
+type internal ConnectionRuntimeMetrics(memoryAccounting: ConnectionMemoryAccounting) =
+    let emptyMetrics = ProcessorPipelineMetrics(0)
+    let mutable clientToBackendMetrics = emptyMetrics
+    let mutable backendToClientMetrics = emptyMetrics
+
+    let toDirectionSnapshot direction (snapshot: ProcessorPipelineMetricsSnapshot) =
+        { Direction = direction
+          Stages = snapshot.Stages
+          InputBytes = snapshot.InputBytes
+          InputBackedOutputBytes = snapshot.InputBackedOutputBytes
+          GeneratedOutputBytes = snapshot.GeneratedOutputBytes
+          InvocationCount = snapshot.InvocationCount
+          SuccessfulInvocationCount = snapshot.SuccessfulInvocationCount
+          FailedInvocationCount = snapshot.FailedInvocationCount
+          CancelledInvocationCount = snapshot.CancelledInvocationCount
+          ProcessingDuration = snapshot.ProcessingDuration
+          CurrentRetainedBytes = snapshot.CurrentRetainedBytes }
+
+    member internal _.Publish(direction, metrics: ProcessorPipelineMetrics) =
+        if obj.ReferenceEquals(metrics, null) then
+            nullArg (nameof metrics)
+
+        match direction with
+        | ClientToBackend -> Interlocked.Exchange(&clientToBackendMetrics, metrics) |> ignore
+        | BackendToClient -> Interlocked.Exchange(&backendToClientMetrics, metrics) |> ignore
+
+    member _.GetSnapshot() =
+        let clientToBackend =
+            Volatile.Read(&clientToBackendMetrics).GetSnapshot()
+            |> toDirectionSnapshot ClientToBackend
+
+        let backendToClient =
+            Volatile.Read(&backendToClientMetrics).GetSnapshot()
+            |> toDirectionSnapshot BackendToClient
+
+        { ClientToBackend = clientToBackend
+          BackendToClient = backendToClient
+          CurrentPhysicalBufferCapacityBytes =
+              memoryAccounting.GetSnapshot().CurrentPhysicalBufferCapacityBytes }
+
+type internal ConnectionMemoryObserver = ConnectionRuntimeMetrics -> unit
+
 [<NoEquality; NoComparison>]
 type private DirectionalPipelineSelection =
     { ClientToBackend: IByteStreamProcessor array option
@@ -35,6 +98,10 @@ type private DirectionalPipelineSelection =
 
 [<RequireQualifiedAccess>]
 module TcpForwarder =
+    let private raisePreserving<'value> (error: exn) : 'value =
+        ExceptionDispatchInfo.Capture(error).Throw()
+        Unchecked.defaultof<'value>
+
     [<Literal>]
     let private BufferSize = 64 * 1024
 
@@ -78,66 +145,110 @@ module TcpForwarder =
 
     let private forward
         direction
+        (memoryAccounting: ConnectionMemoryAccounting)
         (source: Socket)
         (destination: Socket)
         (cancellationToken: CancellationToken)
         =
         task {
             let buffer = ArrayPool<byte>.Shared.Rent BufferSize
+            let mutable lease: IDisposable option = None
+            let mutable primaryError: exn option = None
+            let mutable outcome: ForwardingOutcome option = None
 
             try
-                try
-                    let mutable reachedEndOfStream = false
+                lease <- Some(memoryAccounting.TrackArrayCapacity(int64 buffer.LongLength))
 
-                    while not reachedEndOfStream do
-                        let! received =
-                            source.ReceiveAsync(
-                                buffer.AsMemory(0, BufferSize),
-                                SocketFlags.None,
-                                cancellationToken
-                            )
+                let! forwardingOutcome =
+                    task {
+                        try
+                            let mutable reachedEndOfStream = false
 
-                        if received = 0 then
-                            reachedEndOfStream <- true
-                        else
-                            let mutable sent = 0
-
-                            while sent < received do
-                                let! sentNow =
-                                    destination.SendAsync(
-                                        buffer.AsMemory(sent, received - sent),
+                            while not reachedEndOfStream do
+                                let! received =
+                                    source.ReceiveAsync(
+                                        buffer.AsMemory(0, BufferSize),
                                         SocketFlags.None,
                                         cancellationToken
                                     )
 
-                                if sentNow = 0 then
-                                    raise (SocketException(int SocketError.ConnectionReset))
+                                if received = 0 then
+                                    reachedEndOfStream <- true
+                                else
+                                    let mutable sent = 0
 
-                                sent <- sent + sentNow
+                                    while sent < received do
+                                        let! sentNow =
+                                            destination.SendAsync(
+                                                buffer.AsMemory(sent, received - sent),
+                                                SocketFlags.None,
+                                                cancellationToken
+                                            )
 
-                    tryShutdownSend destination
-                    return EndOfStream direction
-                with
-                | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
-                    return Cancelled direction
-                | :? ObjectDisposedException when cancellationToken.IsCancellationRequested ->
-                    return Cancelled direction
-                | error ->
-                    return Failed(direction, error)
-            finally
+                                        if sentNow = 0 then
+                                            raise (SocketException(int SocketError.ConnectionReset))
+
+                                        sent <- sent + sentNow
+
+                            tryShutdownSend destination
+                            return EndOfStream direction
+                        with
+                        | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                            return Cancelled direction
+                        | :? ObjectDisposedException when cancellationToken.IsCancellationRequested ->
+                            return Cancelled direction
+                        | error ->
+                            return Failed(direction, error)
+                    }
+
+                outcome <- Some forwardingOutcome
+            with error ->
+                primaryError <- Some error
+
+            let mutable cleanupError: exn option = None
+
+            try
                 ArrayPool<byte>.Shared.Return(buffer, clearArray = false)
+            with error ->
+                cleanupError <- Some error
+
+            match lease with
+            | Some trackedLease ->
+                try
+                    trackedLease.Dispose()
+                with error ->
+                    if cleanupError.IsNone then
+                        cleanupError <- Some error
+            | None -> ()
+
+            match primaryError with
+            | Some error -> return raisePreserving error
+            | None ->
+                match cleanupError, outcome with
+                | Some error, _ -> return raisePreserving error
+                | None, Some value -> return value
+                | None, None -> return raise (InvalidOperationException("Forwarding completed without an outcome."))
         }
 
     let private forwardWithProcessorPipeline
         direction
         (processors: IByteStreamProcessor array)
+        (metrics: ProcessorPipelineMetrics)
+        (memoryAccounting: ConnectionMemoryAccounting)
         (source: Socket)
         (destination: Socket)
         (cancellationToken: CancellationToken)
         =
         task {
             let sink = SocketPipelineSink destination
-            let pipeline = new ProcessorPipeline(processors, sink, MemoryPool<byte>.Shared)
+            let pipeline =
+                new ProcessorPipeline(
+                    processors,
+                    sink,
+                    MemoryPool<byte>.Shared,
+                    memoryAccounting,
+                    metrics
+                )
 
             let! outcome =
                 task {
@@ -145,7 +256,14 @@ module TcpForwarder =
                         let mutable reachedEndOfStream = false
 
                         while not reachedEndOfStream do
-                            let owner = MemoryPool<byte>.Shared.Rent BufferSize
+                            let rentedOwner = MemoryPool<byte>.Shared.Rent BufferSize
+                            let owner =
+                                try
+                                    memoryAccounting.Track rentedOwner
+                                with error ->
+                                    // Track disposes an owner when registration fails.
+                                    raisePreserving error
+
                             let mutable transferred = false
 
                             try
@@ -220,12 +338,15 @@ module TcpForwarder =
         connectionId
         (configuration: ForwardingConfiguration)
         (processorPipelineFactory: (ConnectionState -> ValueTask<DirectionalPipelineSelection>) option)
+        (memoryObserver: ConnectionMemoryObserver option)
         (logger: ILogger)
         (client: TcpClient)
         (cancellationToken: CancellationToken)
         =
         task {
             let connectionState = ConnectionState()
+            let memoryAccounting = ConnectionMemoryAccounting()
+            let connectionMetrics = ConnectionRuntimeMetrics(memoryAccounting)
             let clientEndpoint = client.Client.RemoteEndPoint
 
             let runConnection () : Task =
@@ -260,29 +381,47 @@ module TcpForwarder =
                     let clientToBackend, backendToClient =
                         match processorPipelines with
                         | None ->
+                            connectionMetrics.Publish(ClientToBackend, ProcessorPipelineMetrics(0))
+                            connectionMetrics.Publish(BackendToClient, ProcessorPipelineMetrics(0))
+
                             forward
                                 ClientToBackend
+                                memoryAccounting
                                 client.Client
                                 backend.Client
                                 connectionCancellation.Token,
                             forward
                                 BackendToClient
+                                memoryAccounting
                                 backend.Client
                                 client.Client
                                 connectionCancellation.Token
                         | Some processorPipelines ->
-                            let forwardDirection direction processors source destination =
+                            let forwardDirection
+                                direction
+                                (processors: IByteStreamProcessor array option)
+                                source
+                                destination
+                                =
                                 match processors with
                                 | Some values ->
+                                    let metrics = ProcessorPipelineMetrics(values.Length)
+                                    connectionMetrics.Publish(direction, metrics)
+
                                     forwardWithProcessorPipeline
                                         direction
                                         values
+                                        metrics
+                                        memoryAccounting
                                         source
                                         destination
                                         connectionCancellation.Token
                                 | None ->
+                                    connectionMetrics.Publish(direction, ProcessorPipelineMetrics(0))
+
                                     forward
                                         direction
+                                        memoryAccounting
                                         source
                                         destination
                                         connectionCancellation.Token
@@ -353,6 +492,23 @@ module TcpForwarder =
             let! (connectionFailure: exn option) =
                 task {
                     try
+                        match memoryObserver with
+                        | Some observe ->
+                            try
+                                observe connectionMetrics
+                            with error ->
+                                // The accepted client is not yet owned by
+                                // runConnection when the observer runs.
+                                // Dispose it here while preserving the callback
+                                // exception and allowing connection-state cleanup.
+                                try
+                                    client.Dispose()
+                                with _ ->
+                                    ()
+
+                                raisePreserving error
+                        | None -> ()
+
                         do! runConnection ()
                         return None
                     with error ->
@@ -455,6 +611,7 @@ module TcpForwarder =
     let private run
         (configuration: ForwardingConfiguration)
         (processorPipelineFactory: (ConnectionState -> ValueTask<DirectionalPipelineSelection>) option)
+        (memoryObserver: ConnectionMemoryObserver option)
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
@@ -488,6 +645,7 @@ module TcpForwarder =
                                 connectionId
                                 configuration
                                 processorPipelineFactory
+                                memoryObserver
                                 logger
                                 client
                                 runtimeCancellation.Token
@@ -524,7 +682,7 @@ module TcpForwarder =
         (logger: ILogger)
         (cancellationToken: CancellationToken)
         =
-        run configuration None logger cancellationToken
+        run configuration None None logger cancellationToken
 
     let internal runWithProcessorPipelinesAsync
         (configuration: ForwardingConfiguration)
@@ -540,7 +698,7 @@ module TcpForwarder =
                   BackendToClient = Some pipelines.BackendToClient }
             )
 
-        run configuration (Some createSelection) logger cancellationToken
+        run configuration (Some createSelection) None logger cancellationToken
 
     let internal runWithOptionalProcessorPipelinesAsync
         (configuration: ForwardingConfiguration)
@@ -559,7 +717,7 @@ module TcpForwarder =
                   BackendToClient = optional pipelines.BackendToClient }
             )
 
-        run configuration (Some createSelection) logger cancellationToken
+        run configuration (Some createSelection) None logger cancellationToken
 
     let internal runWithOptionalProcessorPipelineFactoryAsync
         (configuration: ForwardingConfiguration)
@@ -583,4 +741,49 @@ module TcpForwarder =
                 }
             )
 
-        run configuration (Some createSelection) logger cancellationToken
+        run configuration (Some createSelection) None logger cancellationToken
+
+    let internal runWithMemoryObserverAsync
+        (configuration: ForwardingConfiguration)
+        (memoryObserver: ConnectionMemoryObserver)
+        (logger: ILogger)
+        (cancellationToken: CancellationToken)
+        =
+        run configuration None (Some memoryObserver) logger cancellationToken
+
+    let internal runWithProcessorPipelinesAndMemoryObserverAsync
+        (configuration: ForwardingConfiguration)
+        (processorPipelineFactory: ConnectionState -> DirectionalProcessorPipelines)
+        (memoryObserver: ConnectionMemoryObserver)
+        (logger: ILogger)
+        (cancellationToken: CancellationToken)
+        =
+        let createSelection connectionState =
+            let pipelines = processorPipelineFactory connectionState
+
+            ValueTask<DirectionalPipelineSelection>(
+                { ClientToBackend = Some pipelines.ClientToBackend
+                  BackendToClient = Some pipelines.BackendToClient }
+            )
+
+        run configuration (Some createSelection) (Some memoryObserver) logger cancellationToken
+
+    let internal runWithOptionalProcessorPipelinesAndMemoryObserverAsync
+        (configuration: ForwardingConfiguration)
+        (processorPipelineFactory: ConnectionState -> DirectionalProcessorPipelines)
+        (memoryObserver: ConnectionMemoryObserver)
+        (logger: ILogger)
+        (cancellationToken: CancellationToken)
+        =
+        let optional processors =
+            if Array.isEmpty processors then None else Some processors
+
+        let createSelection connectionState =
+            let pipelines = processorPipelineFactory connectionState
+
+            ValueTask<DirectionalPipelineSelection>(
+                { ClientToBackend = optional pipelines.ClientToBackend
+                  BackendToClient = optional pipelines.BackendToClient }
+            )
+
+        run configuration (Some createSelection) (Some memoryObserver) logger cancellationToken

@@ -8,6 +8,7 @@
     <Compile Include="AssemblyInfo.fs" />
     <Compile Include="ForwardingConfiguration.fs" />
     <Compile Include="ConnectionState.fs" />
+    <Compile Include="ConnectionMemory.fs" />
     <Compile Include="ProcessorContract.fs" />
     <Compile Include="ProcessorPipeline.fs" />
     <Compile Include="TcpForwarder.fs" />

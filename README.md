@@ -124,6 +124,12 @@ Run the focused connection-state access and lifecycle benchmarks:
 dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- --filter '*ConnectionState*'
 ```
 
+Run the focused stage, direction, and connection snapshot benchmarks:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- --filter '*SnapshotBenchmarks*'
+```
+
 Use BenchmarkDotNet's dry job for a smoke run of every benchmark case:
 
 ```sh
