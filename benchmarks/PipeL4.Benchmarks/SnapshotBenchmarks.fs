@@ -35,8 +35,8 @@ type SnapshotBenchmarks() =
 
     [<GlobalSetup>]
     member this.Setup() =
-        let accounting = ConnectionMemoryAccounting()
-        let stageMetrics = ProcessorPipelineMetrics(this.StageCount)
+        let accounting = new ConnectionMemoryAccounting()
+        let stageMetrics = new ProcessorPipelineMetrics(this.StageCount)
         let processors = Array.init this.StageCount (fun _ -> SnapshotProcessor() :> IByteStreamProcessor)
 
         pipeline <-

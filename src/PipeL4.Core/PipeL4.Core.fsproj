@@ -6,8 +6,10 @@
 
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="Diagnostics.fs" />
     <Compile Include="ForwardingConfiguration.fs" />
     <Compile Include="ConnectionState.fs" />
+    <Compile Include="CapacityAccounting.fs" />
     <Compile Include="ConnectionMemory.fs" />
     <Compile Include="ProcessorContract.fs" />
     <Compile Include="ProcessorPipeline.fs" />

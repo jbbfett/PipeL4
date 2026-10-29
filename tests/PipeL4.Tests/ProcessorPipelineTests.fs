@@ -118,6 +118,29 @@ module ProcessorPipelineTests =
 
         override _.Dispose(_disposing) = ()
 
+    type private BlockingPool(?minimumCapacity: int) =
+        inherit MemoryPool<byte>()
+
+        let owners = ResizeArray<BlockingDisposeOwner>()
+        let rented = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let minimumCapacity = defaultArg minimumCapacity 0
+
+        member _.Owners = owners
+        member _.Rented = rented.Task
+        override _.MaxBufferSize = Int32.MaxValue
+
+        override _.Rent(sizeHint) =
+            let owner =
+                new BlockingDisposeOwner(
+                    Array.zeroCreate<byte> (max minimumCapacity (max sizeHint 1))
+                )
+
+            owners.Add(owner)
+            rented.TrySetResult(()) |> ignore
+            owner :> IMemoryOwner<byte>
+
+        override _.Dispose(_disposing) = ()
+
     type private RecordingSink() =
         let writes = ResizeArray<byte array>()
         let mutable completions = 0
@@ -175,6 +198,31 @@ module ProcessorPipelineTests =
                 | Some error -> ValueTask(Task.FromException(error))
                 | None -> ValueTask()
 
+    type private ControlledDisposalProcessor
+        (
+            name: string,
+            events: ResizeArray<string>,
+            disposalStarted: TaskCompletionSource<unit>,
+            releaseDisposal: TaskCompletionSource<unit>,
+            disposalFailure: exn option
+        ) =
+        interface IByteStreamProcessor with
+            member _.ProcessAsync(input, _, _) = completed input.Bytes.Length
+
+        interface IAsyncDisposable with
+            member _.DisposeAsync() =
+                ValueTask(
+                    task {
+                        events.Add($"dispose:{name}")
+                        disposalStarted.TrySetResult(()) |> ignore
+                        do! releaseDisposal.Task
+
+                        match disposalFailure with
+                        | Some error -> return raise error
+                        | None -> return ()
+                    }
+                )
+
     type private SyncDisposableProcessor(name: string, events: ResizeArray<string>) =
         interface IByteStreamProcessor with
             member _.ProcessAsync(input, output, _) =
@@ -194,6 +242,8 @@ module ProcessorPipelineTests =
 
     let private physicalBytes (accounting: ConnectionMemoryAccounting) =
         accounting.GetSnapshot().CurrentPhysicalBufferCapacityBytes
+
+    let private logicalSnapshot (budget: CapacityBudget) = budget.GetSnapshot()
 
     type private BlockingSink() =
         let started =
@@ -216,6 +266,31 @@ module ProcessorPipelineTests =
 
             member _.CompleteAsync(_) = ValueTask()
 
+    type private BlockingRecordingSink() =
+        let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable bytes = Array.empty<byte>
+        let mutable completions = 0
+
+        member _.Started = started.Task
+        member _.Release() = release.TrySetResult(()) |> ignore
+        member _.Bytes = bytes
+        member _.Completions = Volatile.Read(&completions)
+
+        interface IProcessorPipelineSink with
+            member _.WriteAsync(value, _) =
+                ValueTask(
+                    task {
+                        bytes <- sequenceBytes value
+                        started.TrySetResult(()) |> ignore
+                        do! release.Task
+                    }
+                )
+
+            member _.CompleteAsync(_) =
+                Interlocked.Increment(&completions) |> ignore
+                ValueTask()
+
     [<NoEquality; NoComparison>]
     type private DetachedSnapshotProbe =
         { Snapshot: ConnectionMetricsSnapshot
@@ -226,7 +301,7 @@ module ProcessorPipelineTests =
 
     let private captureDetachedSnapshot () =
         task {
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
             let connection = ConnectionRuntimeMetrics(accounting)
             let metrics = ProcessorPipelineMetrics(1)
             connection.Publish(ClientToBackend, metrics)
@@ -278,7 +353,7 @@ module ProcessorPipelineTests =
 
     [<Fact>]
     let ``physical capacity starts at zero and tracks actual lease capacity once`` () =
-        let accounting = ConnectionMemoryAccounting()
+        let accounting = new ConnectionMemoryAccounting()
         let owner = new TrackingOwner(Array.zeroCreate<byte> 32)
         let tracked = accounting.Track(owner)
 
@@ -294,25 +369,27 @@ module ProcessorPipelineTests =
 
     [<Fact>]
     let ``failed owner tracking disposes the rented owner once and preserves overflow`` () =
-        let accounting = ConnectionMemoryAccounting()
+        let accounting = new ConnectionMemoryAccounting()
         accounting.Acquire Int64.MaxValue
 
         let owner = new ThrowingDisposeOwner(Array.zeroCreate<byte> 1)
 
         let error =
-            Assert.Throws<InvalidOperationException>(fun () ->
+            Assert.Throws<AggregateException>(fun () ->
                 accounting.Track(owner) |> ignore)
 
-        error.Message |> should equal "Physical buffer capacity accounting overflowed."
+        error.InnerExceptions.Count |> should equal 2
+        error.InnerExceptions[0].Message |> should equal "Physical buffer capacity accounting overflowed."
+        error.InnerExceptions[1].Message |> should equal "owner disposal failed"
         owner.DisposeCount |> should equal 1
         physicalBytes accounting |> should equal Int64.MaxValue
 
         accounting.Release Int64.MaxValue
-        physicalBytes accounting |> should equal 0L
+        physicalBytes accounting |> should equal Int64.MaxValue
 
     [<Fact>]
     let ``failed raw capacity registration does not create a lease`` () =
-        let accounting = ConnectionMemoryAccounting()
+        let accounting = new ConnectionMemoryAccounting()
         accounting.Acquire Int64.MaxValue
         let buffer = ArrayPool<byte>.Shared.Rent 1
 
@@ -330,7 +407,7 @@ module ProcessorPipelineTests =
 
     [<Fact>]
     let ``owner disposal failure preserves conservative capacity accounting`` () =
-        let accounting = ConnectionMemoryAccounting()
+        let accounting = new ConnectionMemoryAccounting()
         let owner = new ThrowingDisposeOwner(Array.zeroCreate<byte> 7)
         let tracked = accounting.Track(owner)
 
@@ -348,7 +425,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``pipeline cleanup attempts every pending owner after the first release fails`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
             let sink = RecordingSink()
             let first = new ThrowingDisposeOwner(Array.zeroCreate<byte> 2)
             let middle = owner "middle"
@@ -381,9 +458,150 @@ module ProcessorPipelineTests =
         }
 
     [<Fact>]
+    let ``runtime cleanup publishes before external processor disposal`` () =
+        task {
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = RecordingSink()
+            let input = new ThrowingDisposeOwner(Array.zeroCreate<byte> 4)
+            let disposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseDisposal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releasePublication = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let published = TaskCompletionSource<exn>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let siblingCancelled = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            use siblingCancellation = new CancellationTokenSource()
+            let events = ResizeArray<string>()
+
+            let processor =
+                ControlledDisposalProcessor(
+                    "external",
+                    events,
+                    disposalStarted,
+                    releaseDisposal,
+                    None
+                )
+
+            let pipeline =
+                new ProcessorPipeline(
+                    [| processor :> IByteStreamProcessor |],
+                    sink,
+                    MemoryPool<byte>.Shared,
+                    accounting
+                )
+
+            let sibling =
+                task {
+                    try
+                        do! Task.Delay(Timeout.Infinite, siblingCancellation.Token)
+                    with :? OperationCanceledException ->
+                        siblingCancelled.TrySetResult(()) |> ignore
+                }
+
+            do! pipeline.PushAsync(input, input.Buffer.Length, CancellationToken.None)
+
+            let disposal =
+                Task.Run(
+                    Func<Task>(fun () ->
+                        pipeline
+                            .DisposeAsync(
+                                ignore,
+                                fun error ->
+                                    published.TrySetResult(error) |> ignore
+                                    siblingCancellation.Cancel()
+                                    releasePublication.Task.GetAwaiter().GetResult()
+                            )
+                            .AsTask())
+                )
+
+            let! publishedError = published.Task
+            do! siblingCancelled.Task
+            disposalStarted.Task.IsCompleted |> should equal false
+            publishedError.Message |> should equal "owner disposal failed"
+
+            releasePublication.TrySetResult(()) |> ignore
+            releaseDisposal.TrySetResult(()) |> ignore
+            let! observed = Assert.ThrowsAsync<InvalidOperationException>(fun () -> disposal)
+            observed.Message |> should equal "owner disposal failed"
+            events |> Seq.toList |> should equal [ "dispose:external" ]
+            input.DisposeCount |> should equal 1
+            physicalBytes accounting |> should equal 4L
+            do! sibling
+        }
+
+    [<Fact>]
+    let ``processor disposal publishes each failure before later disposal`` () =
+        task {
+            let sink = RecordingSink()
+            let events = ResizeArray<string>()
+            let firstStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseFirst = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releasePublication = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let laterStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseLater = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let firstFailure = InvalidOperationException("first processor disposal failed")
+            let notifications = ResizeArray<exn>()
+            let firstPublished = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let later =
+                ControlledDisposalProcessor(
+                    "later",
+                    events,
+                    laterStarted,
+                    releaseLater,
+                    None
+                )
+
+            let first =
+                ControlledDisposalProcessor(
+                    "first",
+                    events,
+                    firstStarted,
+                    releaseFirst,
+                    Some firstFailure
+                )
+
+            let pipeline =
+                new ProcessorPipeline(
+                    [| later :> IByteStreamProcessor; first :> IByteStreamProcessor |],
+                    sink,
+                    MemoryPool<byte>.Shared
+                )
+
+            releaseFirst.TrySetResult(()) |> ignore
+
+            let disposal =
+                Task.Run(
+                    Func<Task>(fun () ->
+                        pipeline
+                            .DisposeAsync(
+                                ignore,
+                                fun error ->
+                                    notifications.Add(error)
+                                    firstPublished.TrySetResult(()) |> ignore
+                                    releasePublication.Task.GetAwaiter().GetResult()
+                            )
+                            .AsTask())
+                )
+
+            do! firstPublished.Task
+            laterStarted.Task.IsCompleted |> should equal false
+            notifications |> Seq.map _.Message |> Seq.toList |> should equal [ firstFailure.Message ]
+
+            releasePublication.TrySetResult(()) |> ignore
+            releaseLater.TrySetResult(()) |> ignore
+            let! observed = Assert.ThrowsAsync<InvalidOperationException>(fun () -> disposal)
+            Object.ReferenceEquals(observed, firstFailure) |> should equal true
+            events |> Seq.toList |> should equal [ "dispose:first"; "dispose:later" ]
+            notifications.Count |> should equal 1
+
+            do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+            events |> Seq.toList |> should equal [ "dispose:first"; "dispose:later" ]
+        }
+
+    [<Fact>]
     let ``pipeline aggregates every pending cleanup failure`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
+            let budget = new CapacityBudget 16L
             let sink = RecordingSink()
             let first = new ThrowingDisposeOwner(Array.zeroCreate<byte> 2)
             let second = new ThrowingDisposeOwner(Array.zeroCreate<byte> 3)
@@ -393,7 +611,7 @@ module ProcessorPipelineTests =
                 processor (fun input _ _ -> completed input.Bytes.Length)
 
             let pipeline =
-                new ProcessorPipeline([| retaining |], sink, MemoryPool<byte>.Shared, accounting)
+                new ProcessorPipeline([| retaining |], sink, MemoryPool<byte>.Shared, accounting, budget)
 
             do! pipeline.PushAsync(first, first.Buffer.Length, CancellationToken.None)
             do! pipeline.PushAsync(second, second.Buffer.Length, CancellationToken.None)
@@ -410,18 +628,22 @@ module ProcessorPipelineTests =
             first.DisposeCount |> should equal 1
             second.DisposeCount |> should equal 1
             third.DisposeCount |> should equal 1
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
             physicalBytes accounting |> should equal 10L
 
             do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
             first.DisposeCount |> should equal 1
             second.DisposeCount |> should equal 1
             third.DisposeCount |> should equal 1
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 10L
         }
 
     [<Fact>]
     let ``processor failure preserves its error when intermediate cleanup also fails`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
+            let budget = new CapacityBudget 16L
             let sink = RecordingSink()
             let first = owner "first"
             let failingOwner = new ThrowingDisposeOwner(Array.zeroCreate<byte> 3)
@@ -440,7 +662,7 @@ module ProcessorPipelineTests =
                         raise expected)
 
             let pipeline =
-                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting)
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
 
             do! push pipeline first
             do! pipeline.PushAsync(failingOwner, failingOwner.Buffer.Length, CancellationToken.None)
@@ -460,12 +682,20 @@ module ProcessorPipelineTests =
             first.DisposeCount |> should equal 1
             failingOwner.DisposeCount |> should equal 1
             last.DisposeCount |> should equal 1
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 3L
+
+            do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+            first.DisposeCount |> should equal 1
+            failingOwner.DisposeCount |> should equal 1
+            last.DisposeCount |> should equal 1
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
             physicalBytes accounting |> should equal 3L
         }
 
     [<Fact>]
     let ``array-pool capacity returns to zero across repeated rental cycles`` () =
-        let accounting = ConnectionMemoryAccounting()
+        let accounting = new ConnectionMemoryAccounting()
 
         for _ in 1 .. 5 do
             let buffer = ArrayPool<byte>.Shared.Rent 1024
@@ -479,7 +709,7 @@ module ProcessorPipelineTests =
 
     [<Fact>]
     let ``physical capacity sums independent leases and array-pool leases`` () =
-        let accounting = ConnectionMemoryAccounting()
+        let accounting = new ConnectionMemoryAccounting()
         let first = accounting.Track(new TrackingOwner(Array.zeroCreate<byte> 17))
         let second = accounting.Track(new TrackingOwner(Array.zeroCreate<byte> 29))
         let pooledBuffer = ArrayPool<byte>.Shared.Rent 4096
@@ -507,8 +737,8 @@ module ProcessorPipelineTests =
 
     [<Fact>]
     let ``a tracked lease cannot move between connection accounting instances`` () =
-        let firstAccounting = ConnectionMemoryAccounting()
-        let secondAccounting = ConnectionMemoryAccounting()
+        let firstAccounting = new ConnectionMemoryAccounting()
+        let secondAccounting = new ConnectionMemoryAccounting()
         let owner = new TrackingOwner(Array.zeroCreate<byte> 13)
         let tracked = firstAccounting.Track(owner)
 
@@ -525,8 +755,8 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``pipeline physical snapshot keeps full retained backing capacity`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
-            let sink = RecordingSink()
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
             let stage =
                 processor (fun input output _ ->
                     if input.IsCompleted then
@@ -550,8 +780,8 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``mixed borrowed and generated output counts distinct active leases`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
-            let sink = BlockingSink()
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new BlockingSink()
             let input = new TrackingOwner(Array.zeroCreate<byte> 32)
             let pool = new TrackingPool(minimumCapacity = 16)
 
@@ -582,10 +812,322 @@ module ProcessorPipelineTests =
         }
 
     [<Fact>]
+    let ``logical occupancy charges transactional output and releases after sink consumption`` () =
+        task {
+            let budget = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new BlockingSink()
+            let stage =
+                processor (fun input output _ ->
+                    output.AppendInput(0L, input.Bytes.Length)
+                    completed 0L)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            let operation = push pipeline (owner "ABC")
+            do! sink.Started
+
+            let pending = logicalSnapshot budget
+            pending.CurrentBytes |> should equal 3L
+            pending.PeakBytes |> should equal 6L
+
+            sink.Release()
+            do! operation
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+        }
+
+    [<Fact>]
+    let ``logical ownership transfers between stages without duplicate current charge`` () =
+        task {
+            let budget = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
+            let started = new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let release = new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let first =
+                processor (fun input output _ ->
+                    output.AppendInput(0L, input.Bytes.Length)
+                    completed 0L)
+
+            let second =
+                processor (fun input output _ ->
+                    ValueTask<ProcessorResult>(
+                        task {
+                            started.SetResult(())
+                            do! release.Task
+                            output.AppendInput(0L, input.Bytes.Length)
+                            return { RetainedLength = 0L }
+                        }
+                    ))
+
+            use pipeline =
+                new ProcessorPipeline([| first; second |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            let operation = push pipeline (owner "ABC")
+            do! started.Task
+
+            (logicalSnapshot budget).CurrentBytes |> should equal 3L
+            (logicalSnapshot budget).PeakBytes |> should equal 6L
+
+            release.SetResult(())
+            do! operation
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            sink.Bytes |> text |> should equal "ABC"
+        }
+
+    [<Fact>]
+    let ``partial retained input releases only the consumed logical prefix`` () =
+        task {
+            let budget = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
+            let mutable calls = 0
+
+            let stage =
+                processor (fun input output _ ->
+                    calls <- calls + 1
+
+                    if calls = 1 then
+                        completed 2L
+                    else
+                        output.AppendInput(0L, input.Bytes.Length)
+                        completed 0L)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            do! pipeline.PushAsync(owner "ABCD", 4, CancellationToken.None)
+            (logicalSnapshot budget).CurrentBytes |> should equal 2L
+
+            do! pipeline.PushAsync(owner "EF", 2, CancellationToken.None)
+            let final = logicalSnapshot budget
+            final.CurrentBytes |> should equal 0L
+            final.PeakBytes |> should equal 8L
+            sink.Bytes |> text |> should equal "CDEF"
+        }
+
+    [<Fact>]
+    let ``logical expansion remains charged independently of physical storage`` () =
+        task {
+            let budget = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new BlockingSink()
+            let pool = new TrackingPool()
+            let invocationStarted = new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let invocationRelease = new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let mutable duringAdmission = 0L
+
+            let stage =
+                processor (fun _ output _ ->
+                    duringAdmission <- (logicalSnapshot budget).CurrentBytes
+                    emit output (bytes "XYZ")
+                    duringAdmission <- (logicalSnapshot budget).CurrentBytes
+                    ValueTask<ProcessorResult>(
+                        task {
+                            invocationStarted.SetResult(())
+                            do! invocationRelease.Task
+                            return { RetainedLength = 0L }
+                        }
+                    ))
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, pool, accounting, budget)
+
+            let operation = push pipeline (owner "AB")
+            do! invocationStarted.Task
+
+            duringAdmission |> should equal 5L
+            let pending = logicalSnapshot budget
+            pending.CurrentBytes |> should equal 5L
+            pending.PeakBytes |> should equal 5L
+
+            invocationRelease.SetResult(())
+            do! sink.Started
+            (logicalSnapshot budget).CurrentBytes |> should equal 3L
+            physicalBytes accounting |> should equal (int64 pool.Owners[0].Buffer.Length)
+
+            sink.Release()
+            do! operation
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+        }
+
+    [<Fact>]
+    let ``logical contraction charges only generated output while the sink is pending`` () =
+        task {
+            let budget = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new BlockingSink()
+            let started = new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let release = new TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let stage =
+                processor (fun _ output _ ->
+                    emit output (bytes "X")
+
+                    ValueTask<ProcessorResult>(
+                        task {
+                            started.SetResult(())
+                            do! release.Task
+                            return { RetainedLength = 0L }
+                        }
+                    ))
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            let operation = push pipeline (owner "ABCD")
+            do! started.Task
+            (logicalSnapshot budget).CurrentBytes |> should equal 5L
+            (logicalSnapshot budget).PeakBytes |> should equal 5L
+
+            release.SetResult(())
+            do! sink.Started
+            (logicalSnapshot budget).CurrentBytes |> should equal 1L
+            sink.Release()
+            do! operation
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+        }
+
+    [<Fact>]
+    let ``repeated borrowed ranges charge each logical occurrence but share physical storage`` () =
+        task {
+            let budget = new CapacityBudget 32L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = BlockingSink()
+            let input = owner "ABC"
+
+            let stage =
+                processor (fun currentInput output _ ->
+                    for _ in 1 .. 3 do
+                        output.AppendInput(0L, currentInput.Bytes.Length)
+
+                    completed 0L)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            let operation = push pipeline input
+            do! sink.Started
+
+            (logicalSnapshot budget).CurrentBytes |> should equal 9L
+            physicalBytes accounting |> should equal 3L
+
+            sink.Release()
+            do! operation
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            input.DisposeCount |> should equal 1
+        }
+
+    [<Fact>]
+    let ``logical input admission waits for viable capacity and resumes`` () =
+        task {
+            let budget = new CapacityBudget 8L
+            let held = budget.ReserveAsync(6L, CancellationToken.None).AsTask()
+            let! heldReservation = held
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
+            let stage =
+                processor (fun input output _ ->
+                    output.AppendInput(0L, input.Bytes.Length)
+                    completed 0L)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            let operation = push pipeline (owner "ABC")
+            operation.IsCompleted |> should equal false
+
+            heldReservation.Release()
+            do! operation
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            sink.Bytes |> text |> should equal "ABC"
+        }
+
+    [<Fact>]
+    let ``cancellation during logical input admission cleans the owner`` () =
+        task {
+            let budget = new CapacityBudget 8L
+            let! held = budget.ReserveAsync(6L, CancellationToken.None).AsTask()
+            use cancellation = new CancellationTokenSource()
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
+            let stage = processor (fun input output _ -> output.AppendInput(0L, input.Bytes.Length); completed 0L)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            let input = owner "ABC"
+            let operation = pipeline.PushAsync(input, input.Buffer.Length, cancellation.Token)
+            operation.IsCompleted |> should equal false
+            cancellation.Cancel()
+
+            let! observed = Assert.ThrowsAsync<TaskCanceledException>(fun () -> operation)
+            observed |> should not' (be null)
+            input.DisposeCount |> should equal 1
+            (logicalSnapshot budget).CurrentBytes |> should equal 6L
+
+            held.Release()
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+        }
+
+    [<Fact>]
+    let ``retained input that cannot admit another occurrence faults instead of waiting`` () =
+        task {
+            let budget = new CapacityBudget 5L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
+            let stage = processor (fun _ _ _ -> completed 3L)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            do! pipeline.PushAsync(owner "ABC", 3, CancellationToken.None)
+            (logicalSnapshot budget).CurrentBytes |> should equal 3L
+
+            let second = owner "DEF"
+            let! observed =
+                Assert.ThrowsAsync<InvalidOperationException>(fun () ->
+                    pipeline.PushAsync(second, second.Buffer.Length, CancellationToken.None))
+
+            observed.Message |> should haveSubstring "prevents progress"
+            second.DisposeCount |> should equal 1
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+        }
+
+    [<Fact>]
+    let ``synchronous generated output exhaustion is atomic`` () =
+        task {
+            let budget = new CapacityBudget 4L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
+            let pool = new TrackingPool()
+            let stage =
+                processor (fun _ output _ ->
+                    emit output (bytes "WXYZ")
+                    completed 0L)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, pool, accounting, budget)
+
+            let input = owner "AB"
+            let! observed =
+                Assert.ThrowsAsync<InvalidOperationException>(fun () ->
+                    pipeline.PushAsync(input, input.Buffer.Length, CancellationToken.None))
+
+            observed.Message |> should haveSubstring "generated output occurrence"
+            input.DisposeCount |> should equal 1
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 0L
+            sink.Bytes |> should be Empty
+        }
+
+    [<Fact>]
     let ``shared physical input remains counted once across repeated ranges and stages`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
-            let sink = RecordingSink()
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
             let input = new TrackingOwner(Array.zeroCreate<byte> 48)
 
             let first =
@@ -620,14 +1162,14 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``physical capacity remains while asynchronous invocation owns input`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
             let started =
                 TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
             let release =
                 TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let input = new TrackingOwner(Array.zeroCreate<byte> 40)
 
             let stage =
@@ -657,9 +1199,9 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``shared connection accounting survives one direction completing`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
-            let firstSink = RecordingSink()
-            let secondSink = BlockingSink()
+            let accounting = new ConnectionMemoryAccounting()
+            let firstSink = new RecordingSink()
+            let secondSink = new BlockingSink()
             let firstInput = new TrackingOwner(Array.zeroCreate<byte> 19)
             let secondInput = new TrackingOwner(Array.zeroCreate<byte> 23)
 
@@ -692,7 +1234,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``concurrent accounting updates and snapshots remain non-negative`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
 
             let leases =
                 [| for index in 1 .. 32 do
@@ -723,9 +1265,9 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``physical capacity is cleared after processor failure`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let input = new TrackingOwner(Array.zeroCreate<byte> 27)
             let expected = InvalidOperationException("processor failed")
 
@@ -750,9 +1292,9 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``unadvanced generated output is released from physical capacity`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let input = new TrackingOwner(Array.zeroCreate<byte> 25)
 
             let stage =
@@ -772,14 +1314,191 @@ module ProcessorPipelineTests =
         }
 
     [<Fact>]
+    let ``processor failure releases logical output and input before generated owner disposal`` () =
+        task {
+            let expected = InvalidOperationException("processor failed")
+            let budget = new CapacityBudget 32L
+            let accounting = new ConnectionMemoryAccounting()
+            let pool = new BlockingPool()
+            let sink = new RecordingSink()
+
+            let stage =
+                processor (fun input output _ ->
+                    output.AppendInput(0L, input.Bytes.Length)
+                    emit output (bytes "XYZ")
+                    raise expected)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, pool, accounting, budget)
+
+            let input = owner "AB"
+            let operation =
+                Task.Run(
+                    Func<Task>(fun () ->
+                        pipeline.PushAsync(input, input.Buffer.Length, CancellationToken.None))
+                )
+
+            do! pool.Rented
+            do! pool.Owners[0].DisposeStarted
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 5L
+            input.DisposeCount |> should equal 0
+
+            pool.Owners[0].ReleaseDispose()
+            let! observed = Assert.ThrowsAsync<InvalidOperationException>(fun () -> operation)
+            Object.ReferenceEquals(expected, observed) |> should equal true
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 0L
+            input.DisposeCount |> should equal 1
+            pool.Owners[0].DisposeCount |> should equal 1
+        }
+
+    [<Fact>]
+    let ``multi-stage disposal releases every logical range before an earlier owner unblocks`` () =
+        task {
+            let budget = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+            let pool = new TrackingPool()
+            let sink = new RecordingSink()
+            let input = new BlockingDisposeOwner(bytes "A")
+
+            let first =
+                processor (fun currentInput output _ ->
+                    emit output (bytes "X")
+                    completed currentInput.Bytes.Length)
+
+            let second = processor (fun currentInput _ _ -> completed currentInput.Bytes.Length)
+
+            let pipeline =
+                new ProcessorPipeline([| first; second |], sink, pool, accounting, budget)
+
+            do! pipeline.PushAsync(input, input.Buffer.Length, CancellationToken.None)
+            (logicalSnapshot budget).CurrentBytes |> should equal 2L
+
+            let disposal =
+                Task.Run(
+                    Func<Task>(fun () ->
+                        (pipeline :> IAsyncDisposable).DisposeAsync().AsTask())
+                )
+
+            do! input.DisposeStarted
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 2L
+            pool.Owners[0].DisposeCount |> should equal 0
+
+            input.ReleaseDispose()
+            do! disposal
+            physicalBytes accounting |> should equal 0L
+            input.DisposeCount |> should equal 1
+            pool.Owners[0].DisposeCount |> should equal 1
+
+            do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+            input.DisposeCount |> should equal 1
+            pool.Owners[0].DisposeCount |> should equal 1
+        }
+
+    [<Fact>]
+    let ``cancellation releases logical state before generated owner disposal`` () =
+        task {
+            use cancellation = new CancellationTokenSource()
+            use timeout = new CancellationTokenSource(5000: int)
+            let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let budget = new CapacityBudget 32L
+            let accounting = new ConnectionMemoryAccounting()
+            let pool = new BlockingPool()
+            let sink = new RecordingSink()
+
+            let stage =
+                processor (fun _ output cancellationToken ->
+                    emit output (bytes "XYZ")
+
+                    ValueTask<ProcessorResult>(
+                        task {
+                            started.SetResult(())
+                            do! Task.Delay(Timeout.Infinite, cancellationToken)
+                            return { RetainedLength = 0L }
+                        }
+                    ))
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, pool, accounting, budget)
+
+            let input = owner "AB"
+            let operation = pipeline.PushAsync(input, input.Buffer.Length, cancellation.Token)
+            do! started.Task.WaitAsync(timeout.Token)
+            cancellation.Cancel()
+            do! pool.Rented.WaitAsync(timeout.Token)
+            do! pool.Owners[0].DisposeStarted.WaitAsync(timeout.Token)
+
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 5L
+
+            pool.Owners[0].ReleaseDispose()
+            let! _ = Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> operation)
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 0L
+            input.DisposeCount |> should equal 1
+            pool.Owners[0].DisposeCount |> should equal 1
+        }
+
+    [<Fact>]
+    let ``segmented partial consumption releases logical prefix before first owner disposal`` () =
+        task {
+            let budget = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
+            let first = new BlockingDisposeOwner(bytes "A")
+            let second = owner "BC"
+            let mutable invocation = 0
+
+            let stage =
+                processor (fun input output _ ->
+                    invocation <- invocation + 1
+
+                    match invocation with
+                    | 1 -> completed input.Bytes.Length
+                    | 2 -> completed 1L
+                    | 3 ->
+                        output.AppendInput(0L, input.Bytes.Length)
+                        completed 0L
+                    | _ -> failwith "Unexpected processor invocation.")
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared, accounting, budget)
+
+            do! pipeline.PushAsync(first, first.Buffer.Length, CancellationToken.None)
+            let operation =
+                Task.Run(
+                    Func<Task>(fun () ->
+                        pipeline.PushAsync(second, second.Buffer.Length, CancellationToken.None))
+                )
+
+            do! first.DisposeStarted
+            (logicalSnapshot budget).CurrentBytes |> should equal 1L
+            physicalBytes accounting |> should equal 3L
+
+            first.ReleaseDispose()
+            do! operation
+            let fourth = owner "D"
+            do! pipeline.PushAsync(fourth, fourth.Buffer.Length, CancellationToken.None)
+
+            sink.Bytes |> text |> should equal "CD"
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 0L
+            first.DisposeCount |> should equal 1
+            second.DisposeCount |> should equal 1
+            fourth.DisposeCount |> should equal 1
+        }
+
+    [<Fact>]
     let ``physical capacity is cleared after cancellation`` () =
         task {
             use cancellation = new CancellationTokenSource()
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
             let started =
                 TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
 
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let input = new TrackingOwner(Array.zeroCreate<byte> 31)
 
             let stage =
@@ -808,7 +1527,7 @@ module ProcessorPipelineTests =
     let ``empty pipeline passes through the owned input and completes`` () =
         task {
             let input = owner "ABC"
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable sameBuffer = false
 
             sink.OnWrite <- fun sequence ->
@@ -830,7 +1549,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``stage metrics start at zero and remain zero for a pass-through stage`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let stage =
                 processor (fun input output _ ->
@@ -876,13 +1595,13 @@ module ProcessorPipelineTests =
 
     [<Fact>]
     let ``empty pipeline returns an empty stage metrics snapshot`` () =
-        let sink = RecordingSink()
+        let sink = new RecordingSink()
         use pipeline = new ProcessorPipeline([||], sink, MemoryPool<byte>.Shared)
         pipeline.GetStageMetricsSnapshot() |> should be Empty
 
     [<Fact>]
     let ``empty connection directions produce valid zero snapshots`` () =
-        let connection = ConnectionRuntimeMetrics(ConnectionMemoryAccounting())
+        let connection = new ConnectionRuntimeMetrics(new ConnectionMemoryAccounting())
         let snapshot = connection.GetSnapshot()
 
         snapshot.ClientToBackend.Stages |> should be Empty
@@ -894,9 +1613,35 @@ module ProcessorPipelineTests =
         snapshot.CurrentPhysicalBufferCapacityBytes |> should equal 0L
 
     [<Fact>]
+    let ``connection snapshots expose independent directional logical occupancy`` () =
+        use accounting = new ConnectionCapacityAccounting(ConnectionCapacityLimits(8L, 12L, 32L))
+        let connection = new ConnectionRuntimeMetrics(accounting)
+        let clientReservation =
+            match accounting.ClientToBackendLogical.TryReserve 3L with
+            | ValueSome reservation -> reservation
+            | ValueNone -> failwith "Could not reserve client-to-backend logical credit."
+
+        let backendReservation =
+            match accounting.BackendToClientLogical.TryReserve 5L with
+            | ValueSome reservation -> reservation
+            | ValueNone -> failwith "Could not reserve backend-to-client logical credit."
+
+        let snapshot = connection.GetSnapshot()
+        snapshot.ClientToBackend.CurrentLogicalBufferedBytes |> should equal 3L
+        snapshot.ClientToBackend.PeakLogicalBufferedBytes |> should equal 3L
+        snapshot.BackendToClient.CurrentLogicalBufferedBytes |> should equal 5L
+        snapshot.BackendToClient.PeakLogicalBufferedBytes |> should equal 5L
+
+        clientReservation.Release()
+        backendReservation.Release()
+        let final = connection.GetSnapshot()
+        final.ClientToBackend.CurrentLogicalBufferedBytes |> should equal 0L
+        final.BackendToClient.CurrentLogicalBufferedBytes |> should equal 0L
+
+    [<Fact>]
     let ``stage metrics replace the committed retained suffix instead of accumulating`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable invocation = 0
 
             let stage =
@@ -928,7 +1673,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``input metrics count newly admitted bytes once across retained re-presentation`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable invocation = 0
 
             let stage =
@@ -957,7 +1702,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``segmented retained input has admission accounting independent of physical segments`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable invocation = 0
             let mutable sawMultipleSegments = false
 
@@ -986,9 +1731,9 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``mixed and repeated output records logical provenance after commit`` () =
         task {
-            let sink = BlockingSink()
+            let sink = new BlockingSink()
             let pool = new TrackingPool(minimumCapacity = 64)
-            let accounting = ConnectionMemoryAccounting()
+            let accounting = new ConnectionMemoryAccounting()
 
             let stage =
                 processor (fun input output _ ->
@@ -1020,7 +1765,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``failed invocation does not publish tentative output metrics`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let expected = InvalidOperationException("processor failed")
 
             let stage =
@@ -1049,7 +1794,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``emitted input and retained input are accounted independently`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let first =
                 processor (fun input output _ ->
@@ -1077,8 +1822,8 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``stage metrics keep independent values and indexes across pipelines`` () =
         task {
-            let firstSink = RecordingSink()
-            let secondSink = RecordingSink()
+            let firstSink = new RecordingSink()
+            let secondSink = new RecordingSink()
 
             let retainingStage retainedLength =
                 processor (fun input output _ ->
@@ -1113,15 +1858,15 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``connection snapshots aggregate independent directions and retain no runtime owners`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
-            let connection = ConnectionRuntimeMetrics(accounting)
-            let clientMetrics = ProcessorPipelineMetrics(2)
-            let backendMetrics = ProcessorPipelineMetrics(1)
+            let accounting = new ConnectionMemoryAccounting()
+            let connection = new ConnectionRuntimeMetrics(accounting)
+            let clientMetrics = new ProcessorPipelineMetrics(2)
+            let backendMetrics = new ProcessorPipelineMetrics(1)
             connection.Publish(ClientToBackend, clientMetrics)
             connection.Publish(BackendToClient, backendMetrics)
 
-            let clientSink = RecordingSink()
-            let backendSink = RecordingSink()
+            let clientSink = new RecordingSink()
+            let backendSink = new RecordingSink()
             let passThrough () =
                 processor (fun input output _ ->
                     output.AppendInput(0L, input.Bytes.Length)
@@ -1202,15 +1947,15 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``concurrent direction snapshots stay non-negative while sink writes are pending`` () =
         task {
-            let accounting = ConnectionMemoryAccounting()
-            let connection = ConnectionRuntimeMetrics(accounting)
-            let clientMetrics = ProcessorPipelineMetrics(1)
-            let backendMetrics = ProcessorPipelineMetrics(1)
+            let accounting = new ConnectionMemoryAccounting()
+            let connection = new ConnectionRuntimeMetrics(accounting)
+            let clientMetrics = new ProcessorPipelineMetrics(1)
+            let backendMetrics = new ProcessorPipelineMetrics(1)
             connection.Publish(ClientToBackend, clientMetrics)
             connection.Publish(BackendToClient, backendMetrics)
 
-            let clientSink = BlockingSink()
-            let backendSink = BlockingSink()
+            let clientSink = new BlockingSink()
+            let backendSink = new BlockingSink()
             let passThrough () =
                 processor (fun input output _ ->
                     output.AppendInput(0L, input.Bytes.Length)
@@ -1261,7 +2006,7 @@ module ProcessorPipelineTests =
             use timeout = new CancellationTokenSource(5000: int)
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable invocation = 0
 
             let stage =
@@ -1311,8 +2056,8 @@ module ProcessorPipelineTests =
     let ``successful retention disposal does not hold the metrics monitor`` () =
         task {
             use timeout = new CancellationTokenSource(5000: int)
-            let accounting = ConnectionMemoryAccounting()
-            let sink = RecordingSink()
+            let accounting = new ConnectionMemoryAccounting()
+            let sink = new RecordingSink()
             let firstInput = new BlockingDisposeOwner(Array.zeroCreate<byte> 2)
             let secondInput = owner "CD"
             let mutable invocation = 0
@@ -1366,7 +2111,7 @@ module ProcessorPipelineTests =
             use timeout = new CancellationTokenSource(5000: int)
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable invocation = 0
 
             let stage =
@@ -1414,7 +2159,7 @@ module ProcessorPipelineTests =
             use timeout = new CancellationTokenSource(5000: int)
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let expected = InvalidOperationException("asynchronous processor failed")
 
             let stage =
@@ -1453,7 +2198,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``processor exception clears committed stage retention`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable invocation = 0
 
             let stage =
@@ -1482,7 +2227,7 @@ module ProcessorPipelineTests =
         task {
             let input = new BlockingDisposeOwner(bytes "ABC")
             let nextInput = owner "D"
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let expected = InvalidOperationException("processor failed")
             let mutable invocation = 0
 
@@ -1495,7 +2240,17 @@ module ProcessorPipelineTests =
                     else
                         raise expected)
 
-            use pipeline = new ProcessorPipeline([| stage |], sink, MemoryPool<byte>.Shared)
+            let logicalCapacity = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+
+            use pipeline =
+                new ProcessorPipeline(
+                    [| stage |],
+                    sink,
+                    MemoryPool<byte>.Shared,
+                    accounting,
+                    logicalCapacity
+                )
 
             do!
                 pipeline.PushAsync(
@@ -1521,6 +2276,7 @@ module ProcessorPipelineTests =
             try
                 operation.IsCompleted |> should equal false
                 retainedBytes pipeline |> should equal [| 0L |]
+                (logicalSnapshot logicalCapacity).CurrentBytes |> should equal 0L
             finally
                 input.ReleaseDispose()
 
@@ -1539,7 +2295,7 @@ module ProcessorPipelineTests =
             use timeout = new CancellationTokenSource(5000: int)
             use cancellation = new CancellationTokenSource()
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable invocation = 0
 
             let stage =
@@ -1581,7 +2337,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``disposal leaves stable stage indexes with zero retention`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let stage () =
                 processor (fun input output _ ->
                     output.AppendInput(0L, input.Bytes.Length)
@@ -1602,7 +2358,7 @@ module ProcessorPipelineTests =
     let ``disposal clears stage retention before pending owner disposal finishes`` () =
         task {
             let input = new BlockingDisposeOwner(bytes "ABC")
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let stage =
                 processor (fun currentInput _ _ -> completed currentInput.Bytes.Length)
@@ -1642,7 +2398,7 @@ module ProcessorPipelineTests =
         task {
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let stage =
                 processor (fun input _ _ ->
@@ -1674,7 +2430,7 @@ module ProcessorPipelineTests =
     let ``one stage borrows its input without copying`` () =
         task {
             let input = owner "ABCDEF"
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable sameBuffer = false
 
             sink.OnWrite <- fun sequence ->
@@ -1701,7 +2457,7 @@ module ProcessorPipelineTests =
         task {
             let input = owner "ABCDEF"
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable sameBuffer = false
 
             sink.OnWrite <- fun sequence ->
@@ -1729,7 +2485,7 @@ module ProcessorPipelineTests =
     let ``multiple stages run in order on one logical output stream`` () =
         task {
             let calls = ResizeArray<string>()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let first =
                 processor (fun input output _ ->
@@ -1764,7 +2520,7 @@ module ProcessorPipelineTests =
         task {
             let secondStageInputs = ResizeArray<string>()
             let thirdStageInputs = ResizeArray<string>()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let first =
                 processor (fun input output _ ->
@@ -1804,7 +2560,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``generated output can be shorter or longer and mixed with borrowed ranges`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let pool = new TrackingPool()
 
             let stage =
@@ -1898,7 +2654,7 @@ module ProcessorPipelineTests =
     [<Fact>]
     let ``zero output does not invoke downstream until its upstream changes`` () =
         task {
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable downstreamCalls = 0
 
             let first = processor (fun _ _ _ -> completed 0L)
@@ -1922,7 +2678,7 @@ module ProcessorPipelineTests =
     let ``partial retained suffix combines with later input`` () =
         task {
             let seen = ResizeArray<string>()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let stage =
                 processor (fun input output _ ->
@@ -1960,7 +2716,7 @@ module ProcessorPipelineTests =
             let firstOwner = owner "ABC"
             let secondOwner = owner "DEF"
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let a =
                 processor (fun input output _ ->
@@ -1999,7 +2755,7 @@ module ProcessorPipelineTests =
     let ``generated output remains owned while a downstream stage retains it`` () =
         task {
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let seen = ResizeArray<string>()
 
             let a =
@@ -2039,7 +2795,7 @@ module ProcessorPipelineTests =
             let firstOwner = owner "ABC"
             let secondOwner = owner "D"
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let downstreamInputs = ResizeArray<string * bool>()
 
             let a =
@@ -2392,6 +3148,51 @@ module ProcessorPipelineTests =
         }
 
     [<Fact>]
+    let ``EOF output remains owned until its pending sink write completes`` () =
+        task {
+            let accounting = new ConnectionMemoryAccounting()
+            let logical = new CapacityBudget(16L)
+            let pool = new TrackingPool()
+            let sink = BlockingRecordingSink()
+            let inputOwner = owner "ABC"
+
+            let stage =
+                processor (fun input output _ ->
+                    if input.IsCompleted then
+                        output.AppendInput(0L, input.Bytes.Length)
+                        emit output (bytes "!")
+                        completed 0L
+                    else
+                        completed input.Bytes.Length)
+
+            let pipeline =
+                new ProcessorPipeline([| stage |], sink, pool, accounting, logical)
+
+            do! push pipeline inputOwner
+            let completion = pipeline.CompleteAsync(CancellationToken.None)
+            do! sink.Started
+
+            completion.IsCompleted |> should equal false
+            sink.Bytes |> text |> should equal "ABC!"
+            sink.Completions |> should equal 0
+            (logicalSnapshot logical).CurrentBytes |> should equal 4L
+            physicalBytes accounting |> should equal 4L
+            inputOwner.DisposeCount |> should equal 0
+
+            sink.Release()
+            do! completion
+
+            sink.Completions |> should equal 1
+            (logicalSnapshot logical).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 0L
+            inputOwner.DisposeCount |> should equal 1
+            pool.Owners |> Seq.forall (fun outputOwner -> outputOwner.DisposeCount = 1)
+            |> should equal true
+
+            do! (pipeline :> IAsyncDisposable).DisposeAsync().AsTask()
+        }
+
+    [<Fact>]
     let ``EOF with unresolved retained input is terminal and releases it`` () =
         task {
             let sink = RecordingSink()
@@ -2569,12 +3370,55 @@ module ProcessorPipelineTests =
         }
 
     [<Fact>]
+    let ``sink failure releases retained logical state before generated owner disposal`` () =
+        task {
+            let expected = IOException("sink failed")
+            let budget = new CapacityBudget 16L
+            let accounting = new ConnectionMemoryAccounting()
+            let pool = new BlockingPool()
+            let input = owner "AB"
+
+            let sink =
+                { new IProcessorPipelineSink with
+                    member _.WriteAsync(_, _) = ValueTask(Task.FromException(expected))
+                    member _.CompleteAsync(_) = ValueTask() }
+
+            let stage =
+                processor (fun currentInput output _ ->
+                    output.AppendInput(0L, currentInput.Bytes.Length)
+                    emit output (bytes "XYZ")
+                    completed currentInput.Bytes.Length)
+
+            use pipeline =
+                new ProcessorPipeline([| stage |], sink, pool, accounting, budget)
+
+            let operation =
+                Task.Run(
+                    Func<Task>(fun () ->
+                        pipeline.PushAsync(input, input.Buffer.Length, CancellationToken.None))
+                )
+
+            do! pool.Rented
+            do! pool.Owners[0].DisposeStarted
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 5L
+
+            pool.Owners[0].ReleaseDispose()
+            let! observed = Assert.ThrowsAsync<IOException>(fun () -> operation)
+            Object.ReferenceEquals(expected, observed) |> should equal true
+            (logicalSnapshot budget).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 0L
+            input.DisposeCount |> should equal 1
+            pool.Owners[0].DisposeCount |> should equal 1
+        }
+
+    [<Fact>]
     let ``pre-cancelled push releases its valid input owner`` () =
         task {
             use cancellation = new CancellationTokenSource()
             cancellation.Cancel()
             let inputOwner = owner "ABC"
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             use pipeline = new ProcessorPipeline([||], sink, MemoryPool<byte>.Shared)
 
             let! _ =
@@ -2589,7 +3433,7 @@ module ProcessorPipelineTests =
     let ``invalid retained length and ambiguous writer order are terminal`` () =
         task {
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let invalidRetention =
                 processor (fun input _ _ -> completed (input.Bytes.Length + 1L))
@@ -2630,7 +3474,7 @@ module ProcessorPipelineTests =
             use cancellation = new CancellationTokenSource()
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let firstOwner = owner "ABC"
             let secondOwner = owner "D"
 
@@ -2673,7 +3517,7 @@ module ProcessorPipelineTests =
 
     [<Fact>]
     let ``null input owner reports the ownership contract error`` () =
-        let sink = RecordingSink()
+        let sink = new RecordingSink()
         use pipeline = new ProcessorPipeline([||], sink, MemoryPool<byte>.Shared)
         let missingOwner = Unchecked.defaultof<IMemoryOwner<byte>>
 
@@ -2696,7 +3540,7 @@ module ProcessorPipelineTests =
                    0L, "" |]
 
             for retainedLength, retainedText in cases do
-                let sink = RecordingSink()
+                let sink = new RecordingSink()
                 let first = owner "ABC"
                 let second = owner "DE"
                 let third = owner "FGHI"
@@ -2754,7 +3598,7 @@ module ProcessorPipelineTests =
             let first = owner "AB"
             let second = owner "CD"
             let third = owner "E"
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let mutable invocation = 0
             let mutable suspendedInput = ""
             let mutable releasedInput = ""
@@ -2814,7 +3658,7 @@ module ProcessorPipelineTests =
         task {
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let first = owner "ABC"
             let second = owner "DE"
             let third = owner "FGHI"
@@ -2885,7 +3729,7 @@ module ProcessorPipelineTests =
         task {
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let first = owner "A"
             let rejected = owner "B"
             let third = owner "C"
@@ -2970,7 +3814,7 @@ module ProcessorPipelineTests =
             let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let inputOwner = owner "AB"
             let pool = new TrackingPool()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let a =
                 processor (fun input output _ ->
@@ -3041,7 +3885,7 @@ module ProcessorPipelineTests =
                    [| "A"; "B"; "C"; "D"; "E"; "F" |] |]
 
             for chunks in patterns do
-                let sink = RecordingSink()
+                let sink = new RecordingSink()
                 let pool = new TrackingPool()
                 let inputs = ResizeArray<TrackingOwner>()
 
@@ -3134,7 +3978,7 @@ module ProcessorPipelineTests =
                 let random = Random(seed)
                 let payload = Array.init 257 (fun _ -> byte (random.Next(0, 251)))
                 let expected = payload |> transform 5 2 241uy |> transform 7 1 242uy
-                let sink = RecordingSink()
+                let sink = new RecordingSink()
                 let pool = new TrackingPool()
                 let inputs = ResizeArray<TrackingOwner>()
 
@@ -3177,7 +4021,7 @@ module ProcessorPipelineTests =
         task {
             use cancellation = new CancellationTokenSource()
             let started = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let pool = new TrackingPool()
             let inputs = ResizeArray<TrackingOwner>()
             let mutable calls = 0
@@ -3238,10 +4082,143 @@ module ProcessorPipelineTests =
         }
 
     [<Fact>]
+    let ``runtime memory release callback precedes processor disposal and runs once`` () =
+        task {
+            let accounting = new ConnectionMemoryAccounting()
+            let logical = new CapacityBudget(16L)
+            let disposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseDisposal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let disposalCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let memoryReleased = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let mutable callbackCount = 0
+
+            let retaining =
+                { new IByteStreamProcessor with
+                    member _.ProcessAsync(input, _, _) =
+                        completed input.Bytes.Length
+
+                  interface IAsyncDisposable with
+                      member _.DisposeAsync() =
+                          ValueTask(
+                              task {
+                                  disposalStarted.TrySetResult(()) |> ignore
+                                  do! releaseDisposal.Task
+                                  disposalCompleted.TrySetResult(()) |> ignore
+                              }
+                          ) }
+
+            let pipeline =
+                new ProcessorPipeline(
+                    [| retaining |],
+                    RecordingSink(),
+                    MemoryPool<byte>.Shared,
+                    accounting,
+                    logical
+                )
+
+            let input = owner "retained"
+            do! push pipeline input
+            (logicalSnapshot logical).CurrentBytes |> should equal 8L
+            physicalBytes accounting |> should equal 8L
+
+            let disposing =
+                pipeline.DisposeAsync(fun () ->
+                    Interlocked.Increment(&callbackCount) |> ignore
+                    (logicalSnapshot logical).CurrentBytes |> should equal 0L
+                    physicalBytes accounting |> should equal 0L
+                    input.DisposeCount |> should equal 1
+                    memoryReleased.TrySetResult(()) |> ignore)
+                |> _.AsTask()
+
+            do! memoryReleased.Task
+            do! disposalStarted.Task
+            disposing.IsCompleted |> should equal false
+            disposalCompleted.Task.IsCompleted |> should equal false
+
+            releaseDisposal.TrySetResult(()) |> ignore
+            do! disposing
+            do! disposalCompleted.Task
+
+            do!
+                pipeline.DisposeAsync(fun () -> Interlocked.Increment(&callbackCount) |> ignore).AsTask()
+
+            Volatile.Read(&callbackCount) |> should equal 1
+        }
+
+    [<Fact>]
+    let ``runtime memory callback observes conservative physical cleanup failure`` () =
+        task {
+            let accounting = new ConnectionMemoryAccounting()
+            let logical = new CapacityBudget(8L)
+            let input = new ThrowingDisposeOwner(bytes "ABC")
+            let mutable callbackCount = 0
+
+            let retaining =
+                processor (fun processorInput _ _ -> completed processorInput.Bytes.Length)
+
+            let pipeline =
+                new ProcessorPipeline(
+                    [| retaining |],
+                    RecordingSink(),
+                    MemoryPool<byte>.Shared,
+                    accounting,
+                    logical
+                )
+
+            do!
+                pipeline.PushAsync(
+                    input :> IMemoryOwner<byte>,
+                    input.Buffer.Length,
+                    CancellationToken.None
+                )
+
+            let! observed =
+                Assert.ThrowsAsync<InvalidOperationException>(fun () ->
+                    let operation =
+                        pipeline.DisposeAsync(fun () ->
+                            Interlocked.Increment(&callbackCount) |> ignore
+                            (logicalSnapshot logical).CurrentBytes |> should equal 0L
+                            physicalBytes accounting |> should equal 3L)
+
+                    operation.AsTask())
+
+            observed.Message |> should equal "owner disposal failed"
+            Volatile.Read(&callbackCount) |> should equal 1
+            input.DisposeCount |> should equal 1
+            (logicalSnapshot logical).CurrentBytes |> should equal 0L
+            physicalBytes accounting |> should equal 3L
+        }
+
+    [<Fact>]
+    let ``runtime memory callback failure does not skip processor disposal`` () =
+        task {
+            let events = ResizeArray<string>()
+            let processorFailure = InvalidOperationException("processor disposal failed")
+            let processor = new BothDisposableProcessor("processor", events, Some processorFailure)
+            let pipeline =
+                new ProcessorPipeline(
+                    [| processor :> IByteStreamProcessor |],
+                    RecordingSink(),
+                    MemoryPool<byte>.Shared
+                )
+
+            let! observed =
+                Assert.ThrowsAsync<AggregateException>(fun () ->
+                    pipeline.DisposeAsync(fun () -> invalidOp "physical share handoff failed").AsTask())
+
+            observed.InnerExceptions
+            |> Seq.map _.Message
+            |> Seq.toArray
+            |> should equal [| "physical share handoff failed"; "processor disposal failed" |]
+
+            events |> Seq.toArray |> should equal [| "async:processor" |]
+        }
+
+    [<Fact>]
     let ``pipeline disposes processors once in reverse order and prefers async disposal`` () =
         task {
             let events = ResizeArray<string>()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
 
             let first =
                 new BothDisposableProcessor("first", events, None)
@@ -3275,7 +4252,7 @@ module ProcessorPipelineTests =
     let ``pipeline continues reverse disposal after a processor cleanup failure`` () =
         task {
             let events = ResizeArray<string>()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let expected = InvalidOperationException("dispose failed")
 
             let processors =
@@ -3305,7 +4282,7 @@ module ProcessorPipelineTests =
     let ``pipeline aggregates multiple processor cleanup failures`` () =
         task {
             let events = ResizeArray<string>()
-            let sink = RecordingSink()
+            let sink = new RecordingSink()
             let firstError = InvalidOperationException("first dispose failed")
             let secondError = InvalidOperationException("second dispose failed")
 

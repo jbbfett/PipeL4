@@ -37,22 +37,39 @@ type private ForwardingRoute =
     | Direct
     | RawPipeL4
     | InternalProcessorPipeline of depth: int
+    | BoundedInternalProcessorPipeline of depth: int
     | FsxProcessorPipeline of fixture: ScriptFixture * depth: int
 
 type LogicalThroughputColumn() =
     let calculateValue (summary: Summary) (benchmarkCase: BenchmarkCase) =
+        let isExternallyGatedPressure =
+            benchmarkCase.Descriptor.Type.Name = "BackpressurePressureBenchmarks"
+
         let payloadSize =
             benchmarkCase.Parameters.Items
             |> Seq.tryFind (fun parameter -> parameter.Name = "PayloadSize")
+
+        let connectionCount =
+            benchmarkCase.Parameters.Items
+            |> Seq.tryFind (fun parameter -> parameter.Name = "ConnectionCount")
 
         let statistics =
             summary[benchmarkCase]
             |> Option.ofObj
             |> Option.bind (fun report -> report.ResultStatistics |> Option.ofObj)
 
-        match payloadSize, statistics with
-        | Some parameter, Some result when result.Mean > 0.0 ->
-            let logicalBytes = 2.0 * Convert.ToDouble(parameter.Value, CultureInfo.InvariantCulture)
+        match payloadSize, connectionCount, statistics with
+        | _, _, _ when isExternallyGatedPressure -> "?"
+        | Some parameter, connectionCount, Some result when result.Mean > 0.0 ->
+            let connections =
+                connectionCount
+                |> Option.map (fun value -> Convert.ToDouble(value.Value, CultureInfo.InvariantCulture))
+                |> Option.defaultValue 1.0
+
+            let logicalBytes =
+                2.0
+                * connections
+                * Convert.ToDouble(parameter.Value, CultureInfo.InvariantCulture)
             let mebibytesPerSecond = logicalBytes * 1_000_000_000.0 / result.Mean / (1024.0 * 1024.0)
             mebibytesPerSecond.ToString("N2", CultureInfo.InvariantCulture)
         | _ -> "?"
@@ -60,7 +77,7 @@ type LogicalThroughputColumn() =
     interface IColumn with
         member _.Id = "LogicalThroughput"
         member _.ColumnName = "Logical MiB/s"
-        member _.AlwaysShow = true
+        member _.AlwaysShow = false
         member _.Category = ColumnCategory.Metric
         member _.PriorityInCategory = 0
         member _.IsNumeric = true
@@ -91,6 +108,7 @@ type RawTcpForwardingBenchmarks() =
     let mutable payload = Array.empty<byte>
     let mutable response = Array.empty<byte>
     let mutable scriptWorkspace: string option = None
+    let mutable observedMetrics: ConnectionRuntimeMetrics option = None
 
     let endpointPort (listener: TcpListener) =
         (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -100,7 +118,7 @@ type RawTcpForwardingBenchmarks() =
         listener.Start()
         endpointPort listener
 
-    let createConfiguration listenPort backendPort clientPaths serverPaths =
+    let createConfiguration listenPort backendPort clientPaths serverPaths extraArguments =
         let pluginArguments optionName paths =
             paths |> Array.collect (fun path -> [| optionName; path |])
 
@@ -115,7 +133,8 @@ type RawTcpForwardingBenchmarks() =
                       "--backend-port"
                       string backendPort |]
                    pluginArguments "--client-to-server-plugin" clientPaths
-                   pluginArguments "--server-to-client-plugin" serverPaths |]
+                   pluginArguments "--server-to-client-plugin" serverPaths
+                   extraArguments |]
 
         match ForwardingConfiguration.tryParseArguments arguments with
         | Ok configuration -> configuration
@@ -310,7 +329,7 @@ type RawTcpForwardingBenchmarks() =
                 | ForwardingRoute.RawPipeL4 ->
                     let proxyPort = reservePort ()
                     let configuration =
-                        createConfiguration proxyPort backendPort Array.empty Array.empty
+                        createConfiguration proxyPort backendPort Array.empty Array.empty [||]
 
                     proxyCompletion <-
                         TcpForwarder.runAsync configuration NullLogger.Instance cancellation.Token
@@ -320,12 +339,37 @@ type RawTcpForwardingBenchmarks() =
                 | ForwardingRoute.InternalProcessorPipeline depth ->
                     let proxyPort = reservePort ()
                     let configuration =
-                        createConfiguration proxyPort backendPort Array.empty Array.empty
+                        createConfiguration proxyPort backendPort Array.empty Array.empty [||]
 
                     proxyCompletion <-
                         TcpForwarder.runWithProcessorPipelinesAsync
                             configuration
                             (createProcessorPipelines depth)
+                            NullLogger.Instance
+                            cancellation.Token
+                        :> Task
+
+                    connect proxyPort setupTimeout.Token
+                | ForwardingRoute.BoundedInternalProcessorPipeline depth ->
+                    let proxyPort = reservePort ()
+                    let configuration =
+                        createConfiguration
+                            proxyPort
+                            backendPort
+                            Array.empty
+                            Array.empty
+                            [| "--client-to-server-logical-capacity-bytes"
+                               "262144"
+                               "--server-to-client-logical-capacity-bytes"
+                               "262144"
+                               "--connection-physical-capacity-bytes"
+                               "262144" |]
+
+                    proxyCompletion <-
+                        TcpForwarder.runWithOptionalProcessorPipelinesAndMemoryObserverAsync
+                            configuration
+                            (createProcessorPipelines depth)
+                            (fun metrics -> observedMetrics <- Some metrics)
                             NullLogger.Instance
                             cancellation.Token
                         :> Task
@@ -340,7 +384,7 @@ type RawTcpForwardingBenchmarks() =
                         let paths = definition.ClientToServerPaths
 
                         let configuration =
-                            createConfiguration proxyPort backendPort paths paths
+                            createConfiguration proxyPort backendPort paths paths [||]
 
                         proxyCompletion <-
                             TcpForwarder.runWithOptionalProcessorPipelineFactoryAsync
@@ -371,6 +415,43 @@ type RawTcpForwardingBenchmarks() =
 
             if not (payload.AsSpan().SequenceEqual(response.AsSpan())) then
                 invalidOp "The benchmark preflight response did not match the request payload."
+
+            match observedMetrics with
+            | Some metrics ->
+                let snapshot = metrics.GetSnapshot()
+                let clientGeneratedOutputBytes =
+                    snapshot.ClientToBackend.Stages
+                    |> List.sumBy (fun stage -> stage.GeneratedOutputBytes)
+
+                let backendGeneratedOutputBytes =
+                    snapshot.BackendToClient.Stages
+                    |> List.sumBy (fun stage -> stage.GeneratedOutputBytes)
+
+                if clientGeneratedOutputBytes <> snapshot.ClientToBackend.GeneratedOutputBytes
+                   || backendGeneratedOutputBytes <> snapshot.BackendToClient.GeneratedOutputBytes then
+                    invalidOp "The bounded transport generated-output totals did not match stage metrics."
+
+                Console.WriteLine(
+                    "Bounded transport observation: payload={0}; logical-limits={1}/{2}; physical-limit={3}; physical-share-limits={4}/{5}; peak-logical-c2b={6}; peak-logical-b2c={7}; peak-physical={8}; processor-generated-output-bytes={9}/{10}; rental-attempts={11}/{12}; returned-owner-capacity={13}/{14}; over-rent-retries={15}/{16}",
+                    this.PayloadSize,
+                    snapshot.ClientToBackend.LogicalCapacityLimitBytes,
+                    snapshot.BackendToClient.LogicalCapacityLimitBytes,
+                    snapshot.ConnectionPhysicalCapacity.LimitBytes,
+                    snapshot.ClientToBackend.PhysicalShare.LimitBytes,
+                    snapshot.BackendToClient.PhysicalShare.LimitBytes,
+                    snapshot.ClientToBackend.PeakLogicalBufferedBytes,
+                    snapshot.BackendToClient.PeakLogicalBufferedBytes,
+                    snapshot.PeakPhysicalBufferCapacityBytes,
+                    snapshot.ClientToBackend.GeneratedOutputBytes,
+                    snapshot.BackendToClient.GeneratedOutputBytes,
+                    snapshot.ClientToBackend.ReceiveRentalAttempts,
+                    snapshot.BackendToClient.ReceiveRentalAttempts,
+                    snapshot.ClientToBackend.ReceiveReturnedOwnerCapacityBytes,
+                    snapshot.BackendToClient.ReceiveReturnedOwnerCapacityBytes,
+                    snapshot.ClientToBackend.ReceiveOverRentRetries,
+                    snapshot.BackendToClient.ReceiveOverRentRetries
+                )
+            | None -> ()
         }
 
     [<Params(64, 4096, 1048576)>]
@@ -389,6 +470,10 @@ type RawTcpForwardingBenchmarks() =
     [<GlobalSetup(Target = "InternalProcessorPipeline")>]
     member this.SetupInternalProcessorPipeline() =
         this.Setup(ForwardingRoute.InternalProcessorPipeline 1)
+
+    [<GlobalSetup(Target = "BoundedInternalProcessorPipeline")>]
+    member this.SetupBoundedInternalProcessorPipeline() =
+        this.Setup(ForwardingRoute.BoundedInternalProcessorPipeline 1)
 
     [<GlobalSetup(Target = "InternalFourStagePipeline")>]
     member this.SetupInternalFourStagePipeline() =
@@ -455,6 +540,7 @@ type RawTcpForwardingBenchmarks() =
             proxyCompletion <- Task.CompletedTask
             echoCompletion <- Task.CompletedTask
             scriptWorkspace <- None
+            observedMetrics <- None
         }
 
     [<Benchmark(Baseline = true)>]
@@ -468,6 +554,9 @@ type RawTcpForwardingBenchmarks() =
 
     [<Benchmark>]
     member this.InternalProcessorPipeline() = this.RoundTrip()
+
+    [<Benchmark>]
+    member this.BoundedInternalProcessorPipeline() = this.RoundTrip()
 
     [<Benchmark>]
     member this.InternalFourStagePipeline() = this.RoundTrip()

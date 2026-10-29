@@ -7,7 +7,7 @@ open PipeL4.Core
 open PipeL4.Plugins
 
 let private usage =
-    "Usage: PipeL4 --listen-address <ip> --listen-port <port> --backend-host <ip> --backend-port <port> [--client-to-server-plugin <path>]... [--server-to-client-plugin <path>]..."
+    "Usage: PipeL4 --listen-address <ip> --listen-port <port> --backend-host <ip> --backend-port <port> [--client-to-server-plugin <path>]... [--server-to-client-plugin <path>]... [--client-to-server-logical-capacity-bytes <bytes>] [--server-to-client-logical-capacity-bytes <bytes>] [--connection-physical-capacity-bytes <bytes>] [--disable-runtime-diagnostics]"
 
 [<EntryPoint>]
 let main arguments =

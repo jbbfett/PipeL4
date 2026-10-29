@@ -9,6 +9,8 @@
 
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="CapacityAccountingTests.fs" />
+    <Compile Include="DiagnosticsTests.fs" />
     <Compile Include="ForwardingConfigurationTests.fs" />
     <Compile Include="ConnectionStateTests.fs" />
     <Compile Include="TcpForwarderIntegrationTests.fs" />

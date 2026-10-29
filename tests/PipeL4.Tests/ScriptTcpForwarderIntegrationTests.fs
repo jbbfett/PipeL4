@@ -2,6 +2,7 @@ namespace PipeL4.Tests
 
 open System
 open System.Collections.Concurrent
+open System.Collections.Generic
 open System.Diagnostics
 open System.IO
 open System.Net
@@ -51,13 +52,21 @@ module ScriptTcpForwarderIntegrationTests =
         interface IDisposable with
             member _.Dispose() = ()
 
+    [<NoEquality; NoComparison>]
+    type private StructuredLogRecord =
+        { Level: LogLevel
+          Message: string
+          Properties: (string * obj) array }
+
     type private RecordingLogger() =
         let failures = ConcurrentQueue<exn>()
         let firstFailure = TaskCompletionSource<exn>(TaskCreationOptions.RunContinuationsAsynchronously)
         let failureRecorded = new SemaphoreSlim(0)
+        let structuredRecords = ConcurrentQueue<StructuredLogRecord>()
 
         member _.Failures = failures.ToArray()
         member _.FirstFailure = firstFailure.Task
+        member _.StructuredRecords = structuredRecords.ToArray()
 
         member _.WaitForFailureCountAsync(expectedCount, cancellationToken: CancellationToken) =
             task {
@@ -75,16 +84,49 @@ module ScriptTcpForwarderIntegrationTests =
                 (
                     _logLevel: LogLevel,
                     _eventId: EventId,
-                    _state: 'TState,
+                    state: 'TState,
                     error: exn | null,
-                    _formatter: Func<'TState, exn | null, string>
+                    formatter: Func<'TState, exn | null, string>
                 ) =
+                let message = formatter.Invoke(state, error)
+
+                let properties =
+                    match box state with
+                    | :? IEnumerable<KeyValuePair<string, obj>> as values ->
+                        values |> Seq.map (fun value -> value.Key, value.Value) |> Seq.toArray
+                    | _ -> Array.empty
+
+                structuredRecords.Enqueue(
+                    { Level = _logLevel
+                      Message = message
+                      Properties = properties }
+                )
+
                 match Option.ofObj error with
                 | Some error ->
                     failures.Enqueue error
                     firstFailure.TrySetResult(error) |> ignore
                     failureRecorded.Release() |> ignore
                 | None -> ()
+
+    let private runtimeDiagnosticRecords (logger: RecordingLogger) =
+        logger.StructuredRecords
+        |> Array.filter (fun record -> record.Message.Contains("runtime diagnostics"))
+
+    let private property name (record: StructuredLogRecord) =
+        record.Properties
+        |> Array.tryFind (fun (key, _) -> key = name)
+        |> Option.map snd
+
+    let private int64Property name (record: StructuredLogRecord) =
+        property name record
+        |> Option.defaultWith (fun () -> failwithf "Structured property '%s' was missing." name)
+        |> unbox<int64>
+
+    let private stringProperty name (record: StructuredLogRecord) =
+        property name record
+        |> Option.defaultWith (fun () -> failwithf "Structured property '%s' was missing." name)
+        |> unbox<string>
 
     let private endpointPort (listener: TcpListener) =
         (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -97,7 +139,13 @@ module ScriptTcpForwarderIntegrationTests =
     let private pluginArguments optionName paths =
         paths |> Array.collect (fun path -> [| optionName; path |])
 
-    let private createConfiguration listenPort backendPort clientPaths serverPaths =
+    let private createConfigurationWithArguments
+        listenPort
+        backendPort
+        clientPaths
+        serverPaths
+        extraArguments
+        =
         let arguments =
             Array.concat
                 [| [| "--listen-address"
@@ -109,11 +157,20 @@ module ScriptTcpForwarderIntegrationTests =
                       "--backend-port"
                       string backendPort |]
                    pluginArguments "--client-to-server-plugin" clientPaths
-                   pluginArguments "--server-to-client-plugin" serverPaths |]
+                   pluginArguments "--server-to-client-plugin" serverPaths
+                   extraArguments |]
 
         match ForwardingConfiguration.tryParseArguments arguments with
         | Ok configuration -> configuration
         | Error error -> failwithf "Test configuration was invalid: %s" error
+
+    let private createConfiguration listenPort backendPort clientPaths serverPaths =
+        createConfigurationWithArguments
+            listenPort
+            backendPort
+            clientPaths
+            serverPaths
+            Array.empty
 
     let private connect port (cancellationToken: CancellationToken) =
         task {
@@ -264,9 +321,11 @@ module ScriptTcpForwarderIntegrationTests =
             | None -> return ()
         }
 
-    let private runWithScriptProxy
+    let private runWithScriptProxyWithArgumentsAndLogger
         clientPaths
         serverPaths
+        extraArguments
+        (logger: ILogger)
         backendPort
         (testCancellationToken: CancellationToken)
         body
@@ -274,15 +333,52 @@ module ScriptTcpForwarderIntegrationTests =
         let listenPort = reservePort ()
 
         let configuration =
-            createConfiguration listenPort backendPort clientPaths serverPaths
+            createConfigurationWithArguments
+                listenPort
+                backendPort
+                clientPaths
+                serverPaths
+                extraArguments
 
         runWithForwarder
             (fun cancellationToken ->
                 ScriptTcpForwarder.runAsync
                     configuration
-                    NullLogger.Instance
+                    logger
                     cancellationToken)
             listenPort
+            testCancellationToken
+            body
+
+    let private runWithScriptProxyWithArguments
+        clientPaths
+        serverPaths
+        extraArguments
+        backendPort
+        (testCancellationToken: CancellationToken)
+        body
+        =
+        runWithScriptProxyWithArgumentsAndLogger
+            clientPaths
+            serverPaths
+            extraArguments
+            NullLogger.Instance
+            backendPort
+            testCancellationToken
+            body
+
+    let private runWithScriptProxy
+        clientPaths
+        serverPaths
+        backendPort
+        (testCancellationToken: CancellationToken)
+        body
+        =
+        runWithScriptProxyWithArguments
+            clientPaths
+            serverPaths
+            Array.empty
+            backendPort
             testCancellationToken
             body
 
@@ -406,6 +502,8 @@ module ScriptTcpForwarderIntegrationTests =
         snapshot.CancelledInvocationCount |> should be (greaterThanOrEqualTo 0L)
         snapshot.ProcessingDuration |> should be (greaterThanOrEqualTo TimeSpan.Zero)
         snapshot.CurrentRetainedBytes |> should be (greaterThanOrEqualTo 0L)
+        snapshot.CurrentLogicalBufferedBytes |> should be (greaterThanOrEqualTo 0L)
+        snapshot.PeakLogicalBufferedBytes |> should be (greaterThanOrEqualTo 0L)
 
     let private assertConnectionSnapshotNonNegative (snapshot: ConnectionMetricsSnapshot) =
         assertDirectionCountersNonNegative snapshot.ClientToBackend
@@ -537,6 +635,320 @@ module ScriptTcpForwarderIntegrationTests =
                             let! received = receive
                             received |> should equal payload
                         })
+        }
+
+    [<Fact>]
+    let ``FSX forwarding enforces configured capacity and keeps the listener healthy`` () =
+        task {
+            use timeout = new CancellationTokenSource(20_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let logger = RecordingLogger()
+
+            let clientPath =
+                workspace.WriteSource(
+                    "ConfiguredCapacityGuard.fsx",
+                    """module ConfiguredCapacityGuard
+
+open System
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Processor() =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if input.IsCompleted then
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+            elif input.Bytes.FirstSpan[0] = 255uy then
+                let generated = Array.create 16 255uy
+                generated.AsSpan().CopyTo(output.GetSpan(generated.Length))
+                output.Advance(generated.Length)
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+            else
+                for segment in input.Bytes do
+                    segment.Span.CopyTo(output.GetSpan(segment.Length))
+                    output.Advance(segment.Length)
+
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+                )
+
+            let capacityArguments =
+                [| "--client-to-server-logical-capacity-bytes"
+                   "8"
+                   "--server-to-client-logical-capacity-bytes"
+                   "32"
+                   "--connection-physical-capacity-bytes"
+                   "131072" |]
+
+            do!
+                runWithScriptProxyWithArgumentsAndLogger
+                    [| clientPath |]
+                    [| clientPath |]
+                    capacityArguments
+                    (logger :> ILogger)
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptFailedBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! failedClient = connectEventually proxy timeout.Token
+                            use! failedBackend = acceptFailedBackend
+                            do! failedClient.GetStream().WriteAsync([| 255uy |], timeout.Token)
+                            do! expectClientDisconnect failedClient timeout.Token
+                            do! expectDisconnect (failedBackend.GetStream()) timeout.Token
+
+                            let! failure = logger.FirstFailure.WaitAsync(timeout.Token)
+                            let failureMessages =
+                                exceptionTree failure |> Seq.map _.Message |> Seq.toArray
+
+                            failureMessages
+                            |> Array.exists (fun message ->
+                                message.Contains("logical generated output occurrence"))
+                            |> should equal true
+
+                            let acceptHealthyBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! healthyClient = connectEventually proxy timeout.Token
+                            use! healthyBackend = acceptHealthyBackend
+                            let healthyClientStream = healthyClient.GetStream()
+                            let healthyBackendStream = healthyBackend.GetStream()
+                            let fromClient = bytes "safe"
+                            let fromBackend = bytes "back"
+                            let receiveAtBackend =
+                                readExactly
+                                    healthyBackendStream
+                                    fromClient.Length
+                                    timeout.Token
+
+                            let receiveAtClient =
+                                readExactly
+                                    healthyClientStream
+                                    fromBackend.Length
+                                    timeout.Token
+
+                            do!
+                                Task.WhenAll(
+                                    healthyClientStream.WriteAsync(fromClient, timeout.Token).AsTask(),
+                                    healthyBackendStream.WriteAsync(fromBackend, timeout.Token).AsTask()
+                                )
+
+                            let! receivedAtBackend = receiveAtBackend
+                            let! receivedAtClient = receiveAtClient
+                            receivedAtBackend |> should equal fromClient
+                            receivedAtClient |> should equal fromBackend
+
+                            healthyClient.Client.Shutdown(SocketShutdown.Send)
+                            healthyBackend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream healthyClientStream timeout.Token
+                            do! expectEndOfStream healthyBackendStream timeout.Token
+                        })
+        }
+
+    [<Fact>]
+    let ``normal FSX forwarding applies finite capacities to generated output`` () =
+        task {
+            use timeout = new CancellationTokenSource(20_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let clientPath =
+                workspace.WriteSource(
+                    "FiniteClientTransform.fsx",
+                    generatedTransformSource "FiniteClientTransform" 1
+                )
+
+            let serverPath =
+                workspace.WriteSource(
+                    "FiniteServerTransform.fsx",
+                    generatedTransformSource "FiniteServerTransform" 2
+                )
+
+            let capacityArguments =
+                [| "--client-to-server-logical-capacity-bytes"
+                   "8"
+                   "--server-to-client-logical-capacity-bytes"
+                   "8"
+                   "--connection-physical-capacity-bytes"
+                   "131072" |]
+
+            do!
+                runWithScriptProxyWithArguments
+                    [| clientPath |]
+                    [| serverPath |]
+                    capacityArguments
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+                            let clientPayload = [| 1uy; 2uy; 3uy; 4uy |]
+                            let backendPayload = [| 10uy; 20uy; 30uy; 40uy |]
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+                            let receiveAtBackend =
+                                readExactly backendStream clientPayload.Length timeout.Token
+
+                            let receiveAtClient =
+                                readExactly clientStream backendPayload.Length timeout.Token
+
+                            do!
+                                Task.WhenAll(
+                                    clientStream.WriteAsync(clientPayload, timeout.Token).AsTask(),
+                                    backendStream.WriteAsync(backendPayload, timeout.Token).AsTask()
+                                )
+
+                            let! receivedAtBackend = receiveAtBackend
+                            let! receivedAtClient = receiveAtClient
+                            receivedAtBackend |> should equal [| 2uy; 3uy; 4uy; 5uy |]
+                            receivedAtClient |> should equal [| 12uy; 22uy; 32uy; 42uy |]
+
+                            client.Client.Shutdown(SocketShutdown.Send)
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream clientStream timeout.Token
+                            do! expectEndOfStream backendStream timeout.Token
+                        })
+        }
+
+    [<Fact>]
+    let ``FSX generated output enforces the configured physical capacity`` () =
+        task {
+            use timeout = new CancellationTokenSource(20_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let logger = RecordingLogger()
+
+            let scriptPath =
+                workspace.WriteSource(
+                    "PhysicalCapacityGuard.fsx",
+                    """module PhysicalCapacityGuard
+
+open System
+open System.Threading
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+let mutable calls = 0
+
+type Processor() =
+    interface IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if input.IsCompleted then
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+            elif Interlocked.Increment(&calls) = 1 then
+                let generated = Array.zeroCreate<byte> 33
+                generated.AsSpan().CopyTo(output.GetSpan(generated.Length))
+                output.Advance(generated.Length)
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+            else
+                output.AppendInput(0L, input.Bytes.Length)
+                ValueTask<ProcessorResult>({ RetainedLength = 0L })
+"""
+                )
+
+            let capacityArguments =
+                [| "--client-to-server-logical-capacity-bytes"
+                   "4096"
+                   "--server-to-client-logical-capacity-bytes"
+                   "4096"
+                   "--connection-physical-capacity-bytes"
+                   "64" |]
+
+            do!
+                runWithScriptProxyWithArgumentsAndLogger
+                    [| scriptPath |]
+                    Array.empty
+                    capacityArguments
+                    (logger :> ILogger)
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let failedBackendAccept = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                            use! failedClient = connectEventually proxy timeout.Token
+                            use! failedBackend = failedBackendAccept
+                            let failedClientStream = failedClient.GetStream()
+                            let failedBackendStream = failedBackend.GetStream()
+
+                            do! failedClientStream.WriteAsync([| 1uy |], timeout.Token)
+                            let! failure = logger.FirstFailure.WaitAsync(timeout.Token)
+                            failure
+                            |> exceptionTree
+                            |> Seq.map _.Message
+                            |> Seq.exists (fun message ->
+                                message.Contains("Physical buffer capacity budget was exceeded"))
+                            |> should equal true
+                            do! expectClientDisconnect failedClient timeout.Token
+                            do! expectDisconnect failedBackendStream timeout.Token
+
+                            let healthyBackendAccept = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                            use! healthyClient = connectEventually proxy timeout.Token
+                            use! healthyBackend = healthyBackendAccept
+                            let healthyClientStream = healthyClient.GetStream()
+                            let healthyBackendStream = healthyBackend.GetStream()
+                            let payload = [| 41uy |]
+                            let receive = readExactly healthyBackendStream payload.Length timeout.Token
+
+                            do! healthyClientStream.WriteAsync(payload, timeout.Token)
+                            let! received = receive
+                            received |> should equal payload
+
+                            healthyClient.Client.Shutdown(SocketShutdown.Send)
+                            healthyBackend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream healthyClientStream timeout.Token
+                            do! expectEndOfStream healthyBackendStream timeout.Token
+                        })
+
+            let diagnostics = runtimeDiagnosticRecords logger
+            let firstConnection =
+                diagnostics
+                |> Array.filter (fun record -> int64Property "ConnectionId" record = 1L)
+
+            let connection =
+                firstConnection
+                |> Array.find (fun record -> record.Message.StartsWith("Connection "))
+
+            int64Property "ConnectionPhysicalLimitBytes" connection |> should equal 64L
+            int64Property "CurrentPhysicalBufferCapacityBytes" connection |> should equal 0L
+            int64Property "PeakPhysicalBufferCapacityBytes" connection
+            |> should be (lessThanOrEqualTo 64L)
+
+            let clientDirection =
+                firstConnection
+                |> Array.find (fun record ->
+                    record.Message.StartsWith("Direction ")
+                    && not (record.Message.Contains(" stage "))
+                    && stringProperty "Direction" record = "client-to-backend")
+
+            int64Property "LogicalCapacityLimitBytes" clientDirection |> should equal 4096L
+            int64Property "PhysicalShareLimitBytes" clientDirection
+            |> should be (lessThanOrEqualTo 64L)
+            int64Property "SynchronousPhysicalOutputExhaustionCount" clientDirection
+            |> should be (greaterThan 0L)
+            int64Property "SynchronousLogicalOutputExhaustionCount" clientDirection
+            |> should equal 0L
+            int64Property "LogicalReceiveExhaustionCount" clientDirection |> should equal 0L
+            int64Property "CurrentLogicalBufferedBytes" clientDirection |> should equal 0L
+            property "TerminalOutcome" clientDirection |> should equal (Some(box "failed"))
+            property "CleanupFailurePresent" clientDirection |> should equal (Some(box false))
+
+            let healthyConnection =
+                diagnostics
+                |> Array.find (fun record ->
+                    record.Message.StartsWith("Connection ")
+                    && int64Property "ConnectionId" record = 2L)
+
+            int64Property "CurrentPhysicalBufferCapacityBytes" healthyConnection
+            |> should equal 0L
         }
 
     [<Fact>]

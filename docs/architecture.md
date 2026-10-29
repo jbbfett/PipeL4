@@ -1,6 +1,7 @@
 # Architecture
 
-PipeL4 is experimental. This document records current decisions, not a stable specification.
+PipeL4 is experimental. This document records current decisions and stable runtime invariants;
+changes to those invariants require an explicit architectural decision.
 
 ## Data flow
 
@@ -36,7 +37,55 @@ A normal EOF in one direction is propagated as a TCP send-side shutdown to the d
 
 A transport failure aborts both sides of that connection so the sibling forwarding operation cannot remain blocked. Connection failures are isolated from the listener and other connections. Application shutdown stops accepting, cancels active connections, and waits for their resources to be disposed.
 
+Directional failures are published to one idempotent connection-abort boundary before potentially
+slow terminal cleanup. Every supported direction path is normalized to an EOF, cancellation, or
+failure outcome, and the connection observes both directional outcomes so concurrent failures and
+cleanup errors are not left on unobserved tasks.
+
 The processor contract represents upstream completion explicitly and preserves directional completion and buffer ownership. At socket EOF, the executor performs final processing and flushes its output before the destination send side is shut down. Processor failure, transport failure, and cancellation release pipeline-owned memory and use the same per-connection failure isolation as raw forwarding.
+
+Pipeline teardown clears all live logical reservations and attempts all runtime-owned physical
+releases before closing the completed direction's physical share. The surviving direction may use
+the expanded share while the completed direction's external processor disposal is still pending.
+Processor cleanup remains part of direction completion and is awaited, but it does not retain an
+otherwise free runtime-memory share. A failed physical owner remains conservatively charged in the
+connection-wide budget, so early share closure does not permit physical overcommit.
+
+### Capacity, ownership, and progress boundary
+
+Production creates fresh capacity accounting for every accepted connection. Logical budgets are
+directional; the physical budget is connection-wide and is never shared with another connection.
+For a finite physical limit, while both directions are open, each receives
+`floor(connection physical limit / 2)` as its initial physical share. The unused odd byte is not
+assigned. The unbounded compatibility configuration is special-cased: with an `Int64.MaxValue`
+physical limit, both directional shares are also unbounded at `Int64.MaxValue`, while the
+connection-wide physical accounting remains shared. When one direction completes its runtime-memory
+cleanup, its share closes and the surviving direction can use the expanded connection-wide limit.
+Share handoff is published only after the expanded limit is usable.
+
+Physical accounting follows actual runtime-owned leases and charges the capacity returned by the
+pool, not the requested size, received byte count, or retained suffix. Logical reservations move
+with ranges and are released before physical owners are cleaned up. A failed owner disposal remains
+conservatively charged and is reported as cleanup failure because the runtime cannot know whether the
+storage was released. Input-backed output reuses its input lease; generated output acquires and
+accounts for a separate runtime-owned lease.
+
+Capacity exhaustion waits only when another in-flight operation can release credit. A retained input
+or synchronous generated output with no possible releasable progress fails deterministically; bytes
+are not silently dropped, reordered, or retried through a new policy. Directional failures cancel
+the sibling in that connection, while the listener and unrelated connections continue operating.
+Cancellation is non-flushing, and normal EOF flushes final output before only that direction's
+destination send side is shut down.
+
+Runtime diagnostics are enabled by default and can be disabled with
+`--disable-runtime-diagnostics`. Capacity enforcement and required lifecycle/failure logging remain
+active when optional diagnostics are disabled. Internal snapshots are detached values sampled at
+their own boundaries; they contain stage activity, logical occupancy, actual physical lease
+occupancy, and limits without retaining runtime objects or buffers. Enabled terminal summaries are
+emitted after runtime-owned cleanup, share handoff, processor disposal, and connection-state
+disposal, and identify the connection, direction, and stage. They are observational metrics rather
+than a globally synchronized instant, and optional snapshot or logger failures do not replace the
+forwarding outcome.
 
 ## Core
 
@@ -107,12 +156,15 @@ write time.
 
 Internal direction snapshots identify the `client-to-backend` or `backend-to-client` direction,
 preserve configured stage order, expose the stage snapshots, and provide sums of the stage activity
-and logical-retention fields. Those sums describe logical stage traffic and logical references;
-they must not be interpreted as unique network traffic. A connection snapshot contains both
-direction snapshots and `CurrentPhysicalBufferCapacityBytes` from the existing connection-level
-lease accounting. It does not infer TCP socket byte counts or derive physical capacity from stage
-metrics. A direction with no configured processors is represented by an empty, zero-valued stage
-snapshot.
+and logical-retention fields, plus the directional current and peak logical buffered-byte readings.
+Logical buffered bytes are exact live range occurrences: each range is charged by length, transfers
+move its reservation, partial consumption releases only the consumed prefix, and sink output stays
+charged until its awaited write completes. Those sums describe logical stage traffic and logical
+references; they must not be interpreted as unique network traffic. A connection snapshot contains
+both direction snapshots and current/peak physical capacity fields from the connection-level lease
+accounting. It does not infer TCP socket byte counts or derive physical capacity from stage metrics.
+A direction with no configured processors is represented by an empty, zero-valued stage snapshot;
+its logical budget is still independently sampled.
 
 Snapshots are detached read-only values. Their immutable stage lists and records contain counters
 and value data only, so retaining one does not retain processor instances, directional pipelines,
@@ -123,8 +175,9 @@ but individual counters are non-negative and free from torn reads or lost update
 collection does not traverse byte buffers or hold a connection-wide execution lock.
 
 Each accepted connection also owns a physical-capacity gauge,
-`CurrentPhysicalBufferCapacityBytes`. It is the sum of the actual capacities of all distinct
-runtime-owned buffer leases currently active for that connection. A lease is counted once when
+`CurrentPhysicalBufferCapacityBytes`, plus a lifetime peak. The current value is the sum of the
+actual capacities of all distinct runtime-owned buffer leases currently active for that connection.
+A lease is counted once when
 the runtime acquires it and remains counted until its underlying owner is released or its pooled
 array is returned. Logical ranges, retained suffixes, sequence segments, processor stages, and
 socket writes may all reference one lease without increasing this value. A one-byte retained
@@ -132,10 +185,11 @@ suffix therefore keeps the full capacity of its backing owner accounted. The two
 the connection gauge and update it independently; a half-close releases only the resources of the
 completed direction.
 
-Physical snapshots are read-only atomic observations of the capacity gauge. They do not retain
-owners, traverse stages, or establish a globally synchronized instant with logical-retention
-snapshots. A concurrent read may observe either side of an acquisition or release, but it is
-always a non-negative current-state value rather than a cumulative allocation total.
+Physical snapshots are read-only atomic observations of the capacity gauge and its lifetime peak.
+They do not retain owners, traverse stages, or establish a globally synchronized instant with
+logical-retention snapshots. A concurrent read may observe either side of an acquisition or
+release, but current usage is always non-negative and the peak never decreases; it is not a
+cumulative allocation total.
 
 Invocations return a value task, so asynchronous suspension needs no result state. Input and output memory remain valid until the invocation completes, including across suspension. Processors must not retain that memory or the output object afterward.
 
@@ -163,7 +217,7 @@ controlled reference set consisting of the running .NET runtime, FSharp.Core, an
 used to expand that set. `PipeL4.Core` and compiler-service APIs are not script references.
 Compiler outputs are isolated in a per-compilation temporary directory, loaded from memory into
 the default assembly load context, and then removed. Assemblies loaded this way remain present
-for the process lifetime; unload and reload semantics are not part of the initial implementation.
+for the process lifetime; unload and reload semantics are outside the current runtime scope.
 
 The script-facing API mirrors the established processor semantics without exposing the internal
 executor. An invocation receives a `ReadOnlySequence<byte>` and upstream-completion flag, emits
@@ -191,7 +245,7 @@ Processors may implement the standard `IAsyncDisposable` or `IDisposable` interf
 resources; asynchronous disposal is preferred when both are present. Runtime-owned input and output
 memory is released independently of whether plugin cleanup succeeds.
 
-Initial plugin environment:
+Plugin environment:
 
 - standard .NET/F# libraries;
 - PipeL4-provided APIs;
@@ -273,6 +327,23 @@ the owner is not retried, and the disposal exception is preserved. In that excep
 physical-capacity gauge is an upper-bound accounting value rather than an exact measurement of
 released storage.
 
+Capacity admission uses a short shared gate for the authoritative state, waiter-count, and capacity
+commit. A successful reservation linearizes at its capacity commit under that gate; waiter
+registration is likewise counted there. This gate arbitrates capacity only and does not serialize
+processor execution or the two directional pipelines. If both capacity inspection and owner
+disposal fail, the controller enters a terminal unknown-capacity saturation state. In that state,
+`Int64.MaxValue` current and peak physical values are sentinels for unknown retained capacity, not
+measured byte totals; releases and later cleanup cannot clear the saturation.
+
+For a connection with a finite physical limit, physical admission also keeps a directional share for
+each open traffic direction. Each share starts at `floor(connection physical limit / 2)`; the unused
+odd byte remains unassigned. Receive, retained-input, raw-forwarding, and generated-output leases
+all consume their direction's share as well as the connection-wide total, so one direction cannot
+occupy the other direction's progress reserve. When one direction has completed and cleaned up, its
+admission closes and the surviving direction's share expands to the connection limit. With the
+unbounded `Int64.MaxValue` physical limit, both directional shares are `Int64.MaxValue` from the
+start, while the connection-wide accounting remains shared.
+
 This enables:
 
 - centralized lifetime management;
@@ -290,6 +361,39 @@ Diagnostics should distinguish:
 
 Arbitrary allocations made by plugin code are outside exact pipeline-memory accounting.
 
+## Backpressure
+
+The runtime backpressure contract is documented separately in
+[docs/backpressure.md](backpressure.md). It defines the normative relationship
+between directional logical occupancy, connection-level physical lease
+capacity, downstream propagation, suspension/resumption, progress, EOF,
+half-close, cancellation, and fault cleanup.
+
+The current implementation propagates downstream waits through its single
+outstanding directional push and awaited sink write. Its internal capacity
+controller provides directional logical budgets, one shared connection-wide
+physical budget, actual-capacity lease accounting, asynchronous reservation,
+release-driven wakeups, cancellation, and disposal semantics. Successful admission
+and waiter registration use a short shared capacity gate for their authoritative
+commit; this does not serialize processor execution or the two directional
+pipelines. Runtime-owned
+forwarding and generated-output rentals reserve requested capacity before pool
+acquisition and reconcile a larger returned owner once, synchronously, before
+exposing it. Raw forwarding and receive admission use that physical boundary;
+production creates it from immutable forwarding configuration, whose omitted
+capacity options preserve the unbounded compatibility default. Bounded connections
+also enforce the directional physical shares described above. Processor input
+admission reserves directional logical credit asynchronously when viable credit
+can be released, while retained data that cannot make progress faults
+deterministically. Generated `IBufferWriter<byte>` output remains synchronous:
+output exhaustion is an immediate atomic fault. Supplied owners passed to
+`TrackAsync` are already acquired before the runtime can admit them, so that
+compatibility path cannot guarantee a strict pre-acquisition bound. The normal
+forwarding CLI independently accepts optional client-to-backend and
+backend-to-client logical capacities plus a connection-wide physical capacity;
+omitted options retain the unbounded compatibility default. The current
+processor and FSX APIs are unchanged.
+
 ## Framing
 
 TCP is a byte stream. Framing is plugin behavior, not a core protocol feature.
@@ -300,17 +404,17 @@ A processor may retain an unresolved input suffix until enough bytes arrive to i
 
 PipeL4 is implemented in F# and uses Paket for project dependency management.
 
-Paket manages dependencies of the application and development toolchain. It does not imply unrestricted runtime package loading for `.fsx` plugins; the plugin dependency boundary remains intentionally narrow for the initial implementation.
+Paket manages dependencies of the application and development toolchain. It does not imply unrestricted runtime package loading for `.fsx` plugins; the plugin dependency boundary remains intentionally narrow for the current runtime scope.
 
 ## Diagnostics
 
-PipeL4 does not rewrite or automatically optimize plugin code at this stage.
+PipeL4 does not rewrite or automatically optimize plugin code by design.
 
 Diagnostics may warn about blocking work, avoidable allocations, expensive sequence operations, excessive buffering, long processing times, and similar performance hazards.
 
 ## Open questions
 
+- [Runtime backpressure contract](backpressure.md#decisions-requiring-architectural-approval): synchronous output exhaustion, additional capacity diagnostics, and compaction/coalescing behavior;
 - coalescing and copy-on-write behavior for borrowed output ranges;
-- scheduling and fast paths between processors;
-- buffering limits and fairness;
+- scheduling and fast paths between processors; and
 - plugin reload/unload behavior.

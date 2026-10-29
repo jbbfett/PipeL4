@@ -1,5 +1,6 @@
 namespace PipeL4.Tests
 
+open System
 open System.Net
 open FsUnit.Xunit
 open PipeL4.Core
@@ -44,6 +45,10 @@ module ForwardingConfigurationTests =
 
         configuration.ClientToServerPluginPaths |> should be Empty
         configuration.ServerToClientPluginPaths |> should be Empty
+
+        configuration.ClientToServerLogicalCapacityBytes |> should equal Int64.MaxValue
+        configuration.ServerToClientLogicalCapacityBytes |> should equal Int64.MaxValue
+        configuration.ConnectionPhysicalCapacityBytes |> should equal Int64.MaxValue
 
     [<Fact>]
     let ``parses repeatable directional plugin paths in occurrence order`` () =
@@ -109,6 +114,105 @@ module ForwardingConfigurationTests =
 
         configuration.ListenEndpoint.Port |> should equal 1
         configuration.BackendEndpoint.Port |> should equal 65535
+
+    [<Fact>]
+    let ``accepts capacity boundaries and independent accounting dimensions`` () =
+        let arguments =
+            Array.append
+                validArguments
+                [| "--client-to-server-logical-capacity-bytes"
+                   "4096"
+                   "--server-to-client-logical-capacity-bytes"
+                   "9223372036854775807"
+                   "--connection-physical-capacity-bytes"
+                   "3" |]
+
+        let configuration = parse arguments
+
+        configuration.ClientToServerLogicalCapacityBytes |> should equal 4096L
+        configuration.ServerToClientLogicalCapacityBytes |> should equal Int64.MaxValue
+        configuration.ConnectionPhysicalCapacityBytes |> should equal 3L
+
+        let independentDimensions =
+            Array.append
+                validArguments
+                [| "--client-to-server-logical-capacity-bytes"
+                   "100"
+                   "--server-to-client-logical-capacity-bytes"
+                   "200"
+                   "--connection-physical-capacity-bytes"
+                   "2" |]
+
+        let independent = parse independentDimensions
+        independent.ClientToServerLogicalCapacityBytes |> should equal 100L
+        independent.ServerToClientLogicalCapacityBytes |> should equal 200L
+        independent.ConnectionPhysicalCapacityBytes |> should equal 2L
+
+    [<Fact>]
+    let ``accepts a logical capacity of exactly one byte`` () =
+        let arguments =
+            Array.append
+                validArguments
+                [| "--client-to-server-logical-capacity-bytes"
+                   "1" |]
+
+        let configuration = parse arguments
+
+        configuration.ClientToServerLogicalCapacityBytes |> should equal 1L
+
+    [<Fact>]
+    let ``accepts an explicit maximum physical capacity`` () =
+        let arguments =
+            Array.append
+                validArguments
+                [| "--connection-physical-capacity-bytes"
+                   "9223372036854775807" |]
+
+        let configuration = parse arguments
+
+        configuration.ConnectionPhysicalCapacityBytes |> should equal Int64.MaxValue
+
+    [<Fact>]
+    let ``rejects invalid capacity values`` () =
+        let capacityOptions =
+            [| "--client-to-server-logical-capacity-bytes"
+               "--server-to-client-logical-capacity-bytes" |]
+
+        let invalidLogicalValues =
+            [| "0"
+               "-1"
+               "not-a-byte"
+               "1.0"
+               "9223372036854775808" |]
+
+        for optionName in capacityOptions do
+            for value in invalidLogicalValues do
+                Array.append validArguments [| optionName; value |]
+                |> expectError $"logical capacity {value}"
+
+            Array.append validArguments [| optionName |]
+            |> expectError "a missing logical capacity"
+
+            Array.append validArguments [| optionName; "1"; optionName; "2" |]
+            |> expectError "a duplicate logical capacity"
+
+        let physicalOption = "--connection-physical-capacity-bytes"
+
+        [| "0"
+           "1"
+           "-1"
+           "not-a-byte"
+           "1.0"
+           "9223372036854775808" |]
+        |> Array.iter (fun value ->
+            Array.append validArguments [| physicalOption; value |]
+            |> expectError $"physical capacity {value}")
+
+        Array.append validArguments [| physicalOption |]
+        |> expectError "a missing physical capacity"
+
+        Array.append validArguments [| physicalOption; "2"; physicalOption; "3" |]
+        |> expectError "a duplicate physical capacity"
 
     [<Fact>]
     let ``rejects every missing required argument`` () =

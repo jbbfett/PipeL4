@@ -38,7 +38,10 @@ type internal IProcessorFailureContext =
 
 [<RequireQualifiedAccess>]
 module internal ProcessorLifetime =
-    let disposeAllAsync (processors: IByteStreamProcessor array) =
+    let disposeAllAsyncWithNotification
+        (processors: IByteStreamProcessor array)
+        (onFailure: exn -> unit)
+        =
         ValueTask<exn array>(
             task {
                 let mutable failures: ResizeArray<exn> option = None
@@ -52,6 +55,8 @@ module internal ProcessorLifetime =
                             disposable.Dispose()
                         | _ -> ()
                     with error ->
+                        onFailure error
+
                         match failures with
                         | Some values -> values.Add error
                         | None ->
@@ -65,6 +70,9 @@ module internal ProcessorLifetime =
                     | None -> Array.empty
             }
         )
+
+    let disposeAllAsync (processors: IByteStreamProcessor array) =
+        disposeAllAsyncWithNotification processors ignore
 
 [<RequireQualifiedAccess>]
 module internal ProcessorContract =

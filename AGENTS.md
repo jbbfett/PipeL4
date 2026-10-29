@@ -45,6 +45,32 @@ Do not resolve open architectural questions implicitly while implementing unrela
 - Preserve cancellation, cleanup, and backpressure.
 - Do not serialize both traffic directions merely to simplify shared state.
 - Add or change dependencies through Paket rather than introducing an independent dependency-management path.
+- Avoid referencing branch names, task IDs, or implementation milestones in architectural documentation. Describe current behavior, invariants, and limitations instead.
+- Keep changes scoped to the requested task.
+- Avoid unrelated refactoring.
+- Do not modify unrelated tests merely to make them pass.
+- Prefer existing project conventions over introducing new tooling or infrastructure.
+
+# Testing
+
+- Use the test runner configured in `global.json`.
+- For .NET 10 with Microsoft.Testing.Platform, specify test
+  targets explicitly:
+  - `dotnet test --project <test-project-path>`
+  - `dotnet test --solution <solution-path>`
+- Do not pass project or solution paths as positional
+  arguments to `dotnet test`.
+- Run relevant tests after changing implementation behavior.
+- Prefer targeted tests during development.
+- Run the broader test suite for cross-cutting changes
+  and before completing tasks when appropriate.
+- Add or update tests for changed observable behavior
+  and architectural invariants.
+- Treat CLI invocation errors, build failures, and test
+  failures as distinct outcomes.
+- Report the commands executed and their actual results.
+- Do not change test runner configuration merely to
+  work around an invalid command.
 
 # Performance
 

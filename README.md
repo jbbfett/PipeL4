@@ -16,11 +16,14 @@ It explores protocol-agnostic byte-stream processing for integration testing, pr
 - Plugins may inspect, transform, drop, delay, buffer, and frame data.
 - The runtime owns pipeline memory, buffering, backpressure, and execution.
 - Plugins are trusted code; PipeL4 does not provide a sandbox.
-- Plugin code may be analyzed for expensive patterns and reported through diagnostics/warnings. Automatic optimization is out of scope for now.
+- Plugin code may be analyzed for expensive patterns and reported through diagnostics/warnings. Automatic optimization is out of scope.
 
-## First implementation
+## Scope
 
-The first experiment should validate the architecture end to end with the smallest useful system: accept a TCP connection, proxy it to a configured backend through independent directional processor pipelines, load F# `.fsx` plugins, and verify that runtime-managed buffering, framing, memory accounting, and diagnostics work together without expanding the project scope.
+The current scope is the smallest useful end-to-end system: accept a TCP connection, proxy it to a
+configured backend through independent directional processor pipelines, load F# `.fsx` plugins, and
+verify that runtime-managed buffering, framing, memory accounting, and diagnostics work together
+without expanding the project scope.
 
 Validate:
 
@@ -34,7 +37,7 @@ Validate:
 
 ## Non-goals
 
-For now:
+Current non-goals:
 
 - HTTP-specific features;
 - plugin-controlled routing;
@@ -47,6 +50,7 @@ For now:
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Runtime backpressure contract](docs/backpressure.md)
 - [Agent instructions](AGENTS.md)
 
 ## Running with script plugins
@@ -60,13 +64,42 @@ dotnet run --project src/PipeL4 -- \
   --listen-port 5000 \
   --backend-host 127.0.0.1 \
   --backend-port 6000 \
-  --client-to-server-plugin ./plugins/example.fsx
+  --client-to-server-plugin ./benchmarks/PipeL4.Benchmarks/Scripts/PassThrough.fsx
 ```
 
 Use `--client-to-server-plugin <path>` for traffic sent to the configured backend and
 `--server-to-client-plugin <path>` for traffic returned to the client. Repeating an option adds
 another stage, so `--client-to-server-plugin a.fsx --client-to-server-plugin b.fsx` executes
 `a.fsx` before `b.fsx`. Configured scripts compile and validate before the listener starts.
+
+### Capacity and runtime diagnostics
+
+The forwarding CLI accepts three optional byte-capacity switches:
+
+```sh
+dotnet run --project src/PipeL4 -- \
+  --listen-address 127.0.0.1 --listen-port 5000 \
+  --backend-host 127.0.0.1 --backend-port 6000 \
+  --client-to-server-logical-capacity-bytes 65536 \
+  --server-to-client-logical-capacity-bytes 65536 \
+  --connection-physical-capacity-bytes 262144
+```
+
+The two logical limits apply independently to client-to-backend and backend-to-client buffered
+work. The physical limit is shared by both directions, per connection; connections do not share
+capacity. If these switches are omitted, all three limits are unbounded for compatibility.
+Runtime diagnostics are enabled by default. Add `--disable-runtime-diagnostics` to omit optional
+counters, timings, progress categories, and terminal runtime-diagnostics summaries. Required
+capacity accounting, cleanup, failure logging, and lifecycle behavior remain active.
+
+Physical accounting charges the actual capacity of each active runtime-owned pool owner, which may
+be larger than the requested byte count. A finite pool-owner budget can therefore reject a request
+that appears small, or retry a TCP receive with a smaller request when an unexposed owner is too
+large. Generated output is synchronous and fails deterministically if it cannot reserve capacity;
+the runtime does not silently drop or reorder bytes. Terminal structured diagnostics report the
+configured limits, current and peak occupancy, directional outcomes, handoff state, progress
+categories, and cleanup status. Interpret physical occupancy as active runtime-owned lease
+capacity, not process memory or arbitrary plugin allocations.
 
 ### Connection-scoped plugin state
 
@@ -137,7 +170,7 @@ dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- --filter '*' --j
 ```
 
 See the [benchmark README](benchmarks/PipeL4.Benchmarks/README.md) for route definitions,
-methodology, limitations, and the latest dated branch-exit results. Reports are written beneath
+methodology, limitations, and the latest dated benchmark results. Reports are written beneath
 `BenchmarkDotNet.Artifacts/`, which is intentionally excluded from source control.
 
 ## License

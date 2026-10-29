@@ -9,6 +9,11 @@
     <Compile Include="ConnectionStateBenchmarks.fs" />
     <Compile Include="SnapshotBenchmarks.fs" />
     <Compile Include="ProcessorPipelineAllocationBenchmarks.fs" />
+    <Compile Include="LogicalAdmissionBenchmarks.fs" />
+    <Compile Include="ProcessorPipelineDiagnosticsAllocationBenchmarks.fs" />
+    <Compile Include="BackpressurePressureBenchmarks.fs" />
+    <Compile Include="CapacityDiagnosticsBenchmarks.fs" />
+    <Compile Include="ConcurrentForwardingBenchmarks.fs" />
     <Compile Include="RawTcpForwardingBenchmarks.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
