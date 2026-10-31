@@ -41,6 +41,8 @@ let main arguments =
         | :? ScriptPluginConfigurationException as error ->
             eprintfn "Plugin configuration error: %s" error.Message
             2
+        | :? OperationCanceledException when shutdown.IsCancellationRequested ->
+            0
         | error ->
             eprintfn "Runtime error: %s" error.Message
             1

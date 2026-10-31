@@ -211,6 +211,16 @@ Within one application run, normalized script paths share one compiled plugin de
 the same path appears repeatedly or in both directions. This cache is in-memory and lasts only for
 that application run.
 
+Application cancellation is observed before compilation, between configured scripts, after a
+script finishes loading, and before listener startup. If cancellation is observed during startup,
+the remaining scripts are skipped and no processor pipeline reaches the listener. The executable
+reports graceful exit for an `OperationCanceledException` only when its own shutdown token is
+requested by the time the exception reaches the executable boundary; otherwise it remains a
+runtime failure. A completed plugin configuration or compilation error takes precedence over a
+concurrent shutdown request. If an `OperationCanceledException` and shutdown request race, the
+token state at that boundary determines the result. Once the listener has started, its established
+cancellation and connection-cleanup behavior applies.
+
 `PipeL4.Plugins` owns in-process script compilation and assembly loading. The host supplies a
 controlled reference set consisting of the running .NET runtime, FSharp.Core, and the public
 `PipeL4.Plugins` API; plugin-authored `#r`, `#I`, and `#load` directives are rejected rather than

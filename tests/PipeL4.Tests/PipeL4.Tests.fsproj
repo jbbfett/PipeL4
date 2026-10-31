@@ -20,12 +20,14 @@
     <Compile Include="ScriptCompilerTests.fs" />
     <Compile Include="ScriptPipelineTests.fs" />
     <Compile Include="ScriptTcpForwarderIntegrationTests.fs" />
+    <Compile Include="CliAcceptanceTests.fs" />
     <Compile Include="SmokeTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="../../src/PipeL4.Core/PipeL4.Core.fsproj" />
     <ProjectReference Include="../../src/PipeL4.Plugins/PipeL4.Plugins.fsproj" />
+    <ProjectReference Include="../../src/PipeL4/PipeL4.fsproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <Import Project="..\..\.paket\Paket.Restore.targets" />

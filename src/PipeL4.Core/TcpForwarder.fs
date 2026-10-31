@@ -1284,6 +1284,7 @@ module TcpForwarder =
 
             try
                 try
+                    cancellationToken.ThrowIfCancellationRequested()
                     listener.Start()
 
                     logger.LogInformation(

@@ -9,6 +9,7 @@ open System.Reflection
 open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
+open Microsoft.Extensions.Logging.Abstractions
 open PipeL4.Core
 open PipeL4.Plugins
 open Xunit
@@ -206,6 +207,129 @@ module ScriptPipelineTests =
                     secondConnection.ClientToBackend[index]
                 )
                 |> should equal false
+        }
+
+    [<Fact>]
+    let ``loader propagates cancellation during compilation and skips later scripts`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let firstPath = workspace.WriteSource("First.fsx", "")
+            let secondPath = workspace.WriteSource("Second.fsx", "")
+            let configuration = createConfiguration [| firstPath; secondPath |] Array.empty
+            use cancellation = new CancellationTokenSource()
+            let compilerEntered =
+                TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let calls = ResizeArray<string>()
+
+            let compiler path cancellationToken =
+                calls.Add path
+                compilerEntered.TrySetResult(()) |> ignore
+
+                task {
+                    do! Task.Delay(Timeout.Infinite, cancellationToken)
+                    return Failed Array.empty
+                }
+
+            let loading =
+                ScriptPipelineLoader.loadWithCompilerAsync
+                    compiler
+                    configuration.ClientToServerPluginPaths
+                    configuration.ServerToClientPluginPaths
+                    cancellation.Token
+
+            do! compilerEntered.Task
+            cancellation.Cancel()
+
+            let! _ =
+                Assert.ThrowsAnyAsync<OperationCanceledException>(fun () -> loading :> Task)
+
+            calls |> Seq.toArray |> should equal [| Path.GetFullPath firstPath |]
+        }
+
+    [<Fact>]
+    let ``cancellation after a completed script prevents later compilation and listener startup`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let firstPath =
+                workspace.WriteSource(
+                    "First.fsx",
+                    identitySource "FirstPlugin" "FirstProcessor"
+                )
+
+            let secondPath =
+                workspace.WriteSource(
+                    "Second.fsx",
+                    identitySource "SecondPlugin" "SecondProcessor"
+                )
+
+            use reservedListener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0)
+            reservedListener.Start()
+            let listenPort =
+                (reservedListener.LocalEndpoint :?> System.Net.IPEndPoint).Port
+
+            let arguments =
+                Array.concat
+                    [| [| "--listen-address"
+                          string IPAddress.Loopback
+                          "--listen-port"
+                          string listenPort
+                          "--backend-host"
+                          string IPAddress.Loopback
+                          "--backend-port"
+                          "6000" |]
+                       [| "--client-to-server-plugin"; firstPath
+                          "--client-to-server-plugin"; secondPath |] |]
+
+            let configuration =
+                match ForwardingConfiguration.tryParseArguments arguments with
+                | Ok value -> value
+                | Error error -> failwithf "Test configuration was invalid: %s" error
+
+            use cancellation = new CancellationTokenSource()
+            let calls = ResizeArray<string>()
+
+            let compiler path cancellationToken =
+                task {
+                    calls.Add path
+                    let! result =
+                        workspace.Compiler.CompileAndLoadAsync(path, cancellationToken)
+
+                    if path = Path.GetFullPath firstPath then
+                        cancellation.Cancel()
+
+                    return result
+                }
+
+            let! _ =
+                Assert.ThrowsAnyAsync<OperationCanceledException>(fun () ->
+                    ScriptTcpForwarder.runWithCompilerAsync
+                        compiler
+                        configuration
+                        NullLogger.Instance
+                        cancellation.Token
+                    :> Task)
+
+            calls |> Seq.toArray |> should equal [| Path.GetFullPath firstPath |]
+        }
+
+    [<Fact>]
+    let ``unrequested compiler cancellation remains an independent cancellation failure`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let scriptPath = workspace.WriteSource("Unrequested.fsx", "")
+            let configuration = createConfiguration [| scriptPath |] Array.empty
+            let unrelatedCancellation = OperationCanceledException("independent cancellation")
+
+            let! error =
+                Assert.ThrowsAnyAsync<OperationCanceledException>(fun () ->
+                    ScriptPipelineLoader.loadWithCompilerAsync
+                        (fun _ _ -> Task.FromException<ScriptCompilationResult>(unrelatedCancellation))
+                        configuration.ClientToServerPluginPaths
+                        configuration.ServerToClientPluginPaths
+                        CancellationToken.None
+                    :> Task)
+
+            error.Message |> should equal unrelatedCancellation.Message
         }
 
     [<Fact>]

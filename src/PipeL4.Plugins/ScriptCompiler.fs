@@ -7,6 +7,7 @@ open System.Threading
 open System.Threading.Tasks
 open FSharp.Compiler.CodeAnalysis
 open FSharp.Compiler.Diagnostics
+open FSharp.Compiler.Tokenization
 
 [<RequireQualifiedAccess>]
 type internal ScriptDiagnosticSeverity =
@@ -92,31 +93,133 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
         || line[index] = '"'
         || line[index] = '@'
 
+    let compilerBaseArguments outputPath =
+        [| "fsc.dll"
+           "--target:library"
+           "--targetprofile:netcore"
+           "--noframework"
+           "--deterministic+"
+           "--debug-"
+           "--warn:5"
+           "--fullpaths"
+           "--utf8output"
+           "--nologo"
+           $"--out:{outputPath}" |]
+
     let forbiddenDirectiveDiagnostics sourcePath (source: string) =
-        source.Split '\n'
-        |> Array.mapi (fun lineIndex line ->
-            let line = line.TrimEnd '\r'
+        let parsingOptions, _ =
+            Array.append
+                (compilerBaseArguments "PipeL4.DirectiveValidation.dll")
+                [| sourcePath |]
+            |> Array.toList
+            |> fun arguments ->
+                checker.GetParsingOptionsFromCommandLineArgs(
+                    arguments,
+                    isInteractive = false,
+                    isEditing = false
+                )
+
+        let tokenizer =
+            FSharpSourceTokenizer(
+                parsingOptions.ConditionalDefines,
+                Some sourcePath,
+                Some parsingOptions.LangVersionText,
+                parsingOptions.StrictIndentation
+            )
+        let lines = source.Split '\n'
+
+        let isConditionalControl (line: string) (firstNonWhitespace: int) =
+            if firstNonWhitespace >= line.Length || line[firstNonWhitespace] <> '#' then
+                false
+            else
+                let afterHash = line.Substring(firstNonWhitespace + 1).TrimStart(' ', '\t')
+
+                [| "if"; "elif"; "else"; "endif" |]
+                |> Array.exists (fun name ->
+                    afterHash.StartsWith(name, StringComparison.Ordinal)
+                    && isDirectiveBoundary afterHash name.Length)
+
+        // Use the tokenizer's real preprocessor state to find branch boundaries. In
+        // active code it distinguishes controls from literal text. In inactive code,
+        // FCS returns INACTIVECODE for the whole line (starting at column zero), even
+        // when the directive is indented. Recognize conditional spelling on those
+        // lines, where the compiler itself skips lexical constructs.
+        let mutable controlLexState = FSharpTokenizerLexState.Initial
+
+        let conditionalControlLines =
+            lines
+            |> Array.mapi (fun _ sourceLine ->
+                let line = sourceLine.TrimEnd '\r'
+                let firstNonWhitespace = line.Length - line.TrimStart(' ', '\t').Length
+                let lineTokenizer = tokenizer.CreateLineTokenizer line
+                let mutable scanning = true
+                let mutable isControl = false
+
+                while scanning do
+                    let token, nextState = lineTokenizer.ScanToken controlLexState
+                    controlLexState <- nextState
+
+                    match token with
+                    | Some info
+                        when info.TokenName = "INACTIVECODE"
+                             || (info.LeftColumn = firstNonWhitespace
+                                 && info.TokenName = "HASH_IF") ->
+                        isControl <-
+                            isConditionalControl line firstNonWhitespace
+                    | None -> scanning <- false
+                    | Some _ -> ()
+
+                isControl)
+
+        let mutable lexState = FSharpTokenizerLexState.Initial
+
+        lines
+        |> Array.mapi (fun lineIndex sourceLine ->
+            let line = sourceLine.TrimEnd '\r'
             let firstNonWhitespace = line.Length - line.TrimStart(' ', '\t').Length
 
-            if firstNonWhitespace >= line.Length || line[firstNonWhitespace] <> '#' then
+            if conditionalControlLines[lineIndex] then
+                // Each conditional arm is checked independently. This is essential
+                // because the compiler skips inactive text before lexing the next arm.
+                lexState <- FSharpTokenizerLexState.Initial
                 None
             else
-                let mutable directiveStart = firstNonWhitespace + 1
+                let candidate =
+                    if firstNonWhitespace >= line.Length || line[firstNonWhitespace] <> '#' then
+                        None
+                    else
+                        let mutable directiveStart = firstNonWhitespace + 1
 
-                while directiveStart < line.Length
-                      && (line[directiveStart] = ' ' || line[directiveStart] = '\t') do
-                    directiveStart <- directiveStart + 1
+                        while directiveStart < line.Length
+                              && (line[directiveStart] = ' ' || line[directiveStart] = '\t') do
+                            directiveStart <- directiveStart + 1
 
-                let remaining = line.Substring directiveStart
+                        let remaining = line.Substring directiveStart
 
-                let directiveName =
-                    [| "load"; "r"; "i" |]
-                    |> Array.tryFind (fun name ->
-                        remaining.StartsWith(name, StringComparison.OrdinalIgnoreCase)
-                        && isDirectiveBoundary remaining name.Length)
+                        [| "load"; "r"; "i" |]
+                        |> Array.tryFind (fun name ->
+                            remaining.StartsWith(name, StringComparison.OrdinalIgnoreCase)
+                            && isDirectiveBoundary remaining name.Length)
+                        |> Option.map (fun name -> name, directiveStart)
 
-                directiveName
-                |> Option.map (fun name ->
+                let lineTokenizer = tokenizer.CreateLineTokenizer line
+                let mutable scanning = true
+                let mutable dependencyHashIsCode = false
+
+                while scanning do
+                    let token, nextState = lineTokenizer.ScanToken lexState
+                    lexState <- nextState
+
+                    match token with
+                    | Some info
+                        when info.LeftColumn = firstNonWhitespace
+                             && info.TokenName = "HASH" ->
+                        dependencyHashIsCode <- true
+                    | None -> scanning <- false
+                    | Some _ -> ()
+
+                match candidate with
+                | Some(name, directiveStart) when dependencyHashIsCode ->
                     let range =
                         { Start =
                             { Line = lineIndex + 1
@@ -125,11 +228,14 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                             { Line = lineIndex + 1
                               Column = directiveStart + name.Length } }
 
-                    diagnostic
-                        ScriptDiagnosticSeverity.Error
-                        (Some sourcePath)
-                        (Some range)
-                        $"Script dependency directive '#{name}' is not supported; references are supplied by PipeL4.")
+                    Some(
+                        diagnostic
+                            ScriptDiagnosticSeverity.Error
+                            (Some sourcePath)
+                            (Some range)
+                            $"Script dependency directive '#{name}' is not supported; references are supplied by PipeL4."
+                    )
+                | _ -> None
         )
         |> Array.choose id
 
@@ -174,17 +280,7 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
 
     let compilerArguments scriptPath outputPath =
         Array.concat
-            [| [| "fsc.dll"
-                  "--target:library"
-                  "--targetprofile:netcore"
-                  "--noframework"
-                  "--deterministic+"
-                  "--debug-"
-                  "--warn:5"
-                  "--fullpaths"
-                  "--utf8output"
-                  "--nologo"
-                  $"--out:{outputPath}" |]
+            [| compilerBaseArguments outputPath
                controlledReferencePaths ()
                |> Array.map (fun referencePath -> $"-r:{referencePath}")
                [| scriptPath |] |]
@@ -208,7 +304,9 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                 else
                     let fullScriptPath = Path.GetFullPath scriptPath
                     let! source = File.ReadAllTextAsync(fullScriptPath, cancellationToken)
+                    cancellationToken.ThrowIfCancellationRequested()
                     let forbiddenDirectives = forbiddenDirectiveDiagnostics fullScriptPath source
+                    cancellationToken.ThrowIfCancellationRequested()
 
                     if forbiddenDirectives.Length > 0 then
                         return Failed forbiddenDirectives
@@ -221,6 +319,7 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                         try
                             try
                                 Directory.CreateDirectory workspacePath |> ignore
+                                cancellationToken.ThrowIfCancellationRequested()
 
                                 let! compilerDiagnostics, compilerFailure =
                                     checker.Compile(compilerArguments fullScriptPath outputPath)
@@ -241,6 +340,10 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                                         value.Severity = ScriptDiagnosticSeverity.Error)
 
                                 match compilerFailure with
+                                | Some(:? OperationCanceledException) when cancellationToken.IsCancellationRequested ->
+                                    return raise (OperationCanceledException cancellationToken)
+                                | Some(:? OperationCanceledException as cancellation) ->
+                                    return raise cancellation
                                 | Some failure ->
                                     let failureDiagnostic =
                                         error
@@ -261,6 +364,7 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                                     let! assemblyBytes =
                                         File.ReadAllBytesAsync(outputPath, cancellationToken)
 
+                                    cancellationToken.ThrowIfCancellationRequested()
                                     Directory.Delete(workspacePath, recursive = true)
                                     workspaceDeleted <- true
 
@@ -269,8 +373,12 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                                     let assembly =
                                         AssemblyLoadContext.Default.LoadFromStream assemblyStream
 
+                                    cancellationToken.ThrowIfCancellationRequested()
+
                                     match ScriptProcessorDiscovery.discover assembly with
-                                    | Ok plugin -> return Compiled(plugin, diagnostics)
+                                    | Ok plugin ->
+                                        cancellationToken.ThrowIfCancellationRequested()
+                                        return Compiled(plugin, diagnostics)
                                     | Error message ->
                                         let discoveryDiagnostic = error (Some fullScriptPath) message
                                         return Failed(Array.append diagnostics [| discoveryDiagnostic |])
@@ -283,6 +391,8 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                         with
                         | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
                             return raise (OperationCanceledException cancellationToken)
+                        | :? OperationCanceledException as cancellation ->
+                            return raise cancellation
                         | failure ->
                             return
                                 Failed
@@ -292,6 +402,8 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
             with
             | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
                 return raise (OperationCanceledException cancellationToken)
+            | :? OperationCanceledException as cancellation ->
+                return raise cancellation
             | failure ->
                 return
                     Failed

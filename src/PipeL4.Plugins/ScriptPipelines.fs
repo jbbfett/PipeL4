@@ -221,6 +221,18 @@ module internal ScriptPipelineLoader =
 
         $"{location}: {severityName diagnostic.Severity}{compilerCode}: {diagnostic.Message}"
 
+    let private reportCompilerWarning (logger: ILogger) scriptPath diagnostic =
+        if diagnostic.Severity = ScriptDiagnosticSeverity.Warning then
+            let formattedDiagnostic = formatDiagnostic diagnostic
+
+            try
+                logger.LogWarning(
+                    "F# script plugin {ScriptPath}: {Diagnostic}",
+                    [| box scriptPath; box formattedDiagnostic |]
+                )
+            with _ ->
+                ()
+
     let private compilationFailure scriptPath diagnostics =
         let details =
             diagnostics
@@ -249,10 +261,11 @@ module internal ScriptPipelineLoader =
                     )
                 )
 
-    let loadWithCompilerAsync
+    let private loadWithOptionalLoggerAsync
         (compiler: Compiler)
         (clientToServerPaths: IReadOnlyList<string>)
         (serverToClientPaths: IReadOnlyList<string>)
+        (logger: ILogger option)
         (cancellationToken: CancellationToken)
         =
         task {
@@ -274,13 +287,23 @@ module internal ScriptPipelineLoader =
                                     let! result = compiler scriptPath cancellationToken
 
                                     match result with
-                                    | Compiled(value, _) ->
+                                    | Compiled(value, diagnostics) ->
+                                        cancellationToken.ThrowIfCancellationRequested()
                                         compiled.Add(scriptPath, value)
+
+                                        match logger with
+                                        | Some logger ->
+                                            diagnostics
+                                            |> Array.iter (reportCompilerWarning logger scriptPath)
+                                        | None -> ()
+
+                                        cancellationToken.ThrowIfCancellationRequested()
                                         return value
                                     | Failed diagnostics ->
                                         return raise (compilationFailure scriptPath diagnostics)
                             }
 
+                        cancellationToken.ThrowIfCancellationRequested()
                         stages.Add(ConfiguredScriptStage(scriptPath, plugin))
 
                     return stages.ToArray()
@@ -288,6 +311,7 @@ module internal ScriptPipelineLoader =
 
             let! clientToServerStages = loadDirection clientToServerPaths
             let! serverToClientStages = loadDirection serverToClientPaths
+            cancellationToken.ThrowIfCancellationRequested()
 
             return
                 ScriptPipelineDefinition(
@@ -295,6 +319,33 @@ module internal ScriptPipelineLoader =
                     serverToClientStages
                 )
         }
+
+    let loadWithCompilerAsync
+        (compiler: Compiler)
+        (clientToServerPaths: IReadOnlyList<string>)
+        (serverToClientPaths: IReadOnlyList<string>)
+        (cancellationToken: CancellationToken)
+        =
+        loadWithOptionalLoggerAsync
+            compiler
+            clientToServerPaths
+            serverToClientPaths
+            None
+            cancellationToken
+
+    let loadWithCompilerAndLoggerAsync
+        (compiler: Compiler)
+        (clientToServerPaths: IReadOnlyList<string>)
+        (serverToClientPaths: IReadOnlyList<string>)
+        (logger: ILogger)
+        (cancellationToken: CancellationToken)
+        =
+        loadWithOptionalLoggerAsync
+            compiler
+            clientToServerPaths
+            serverToClientPaths
+            (Some logger)
+            cancellationToken
 
     let loadAsync
         (configuration: ForwardingConfiguration)
@@ -318,10 +369,11 @@ module internal ScriptTcpForwarder =
         =
         task {
             let! definition =
-                ScriptPipelineLoader.loadWithCompilerAsync
+                ScriptPipelineLoader.loadWithCompilerAndLoggerAsync
                     compiler
                     configuration.ClientToServerPluginPaths
                     configuration.ServerToClientPluginPaths
+                    logger
                     cancellationToken
 
             if definition.HasPlugins then

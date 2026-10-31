@@ -109,6 +109,47 @@ module ScriptTcpForwarderIntegrationTests =
                     failureRecorded.Release() |> ignore
                 | None -> ()
 
+    type private ThrowOnFirstCompilerWarningLogger() =
+        let compilerWarningAttempts = ConcurrentQueue<string * string>()
+        let mutable warningFailureThrown = 0
+
+        member _.CompilerWarningAttempts = compilerWarningAttempts.ToArray()
+        member _.WarningFailureThrown = Volatile.Read(&warningFailureThrown) = 1
+
+        interface ILogger with
+            member _.BeginScope<'TState when 'TState: not null>(_state: 'TState) =
+                new NoopScope() :> IDisposable
+
+            member _.IsEnabled(_logLevel) = true
+
+            member _.Log<'TState>
+                (
+                    _logLevel: LogLevel,
+                    _eventId: EventId,
+                    state: 'TState,
+                    error: exn | null,
+                    formatter: Func<'TState, exn | null, string>
+                ) =
+                let properties =
+                    match box state with
+                    | :? IEnumerable<KeyValuePair<string, obj>> as values ->
+                        values |> Seq.map (fun value -> value.Key, value.Value) |> Seq.toArray
+                    | _ -> Array.empty
+
+                let findProperty name =
+                    properties
+                    |> Array.tryFind (fun (key, _) -> key = name)
+                    |> Option.map snd
+
+                match findProperty "ScriptPath", findProperty "Diagnostic" with
+                | Some (:? string as scriptPath), Some (:? string as diagnostic) ->
+                    compilerWarningAttempts.Enqueue(scriptPath, diagnostic)
+
+                    if Interlocked.CompareExchange(&warningFailureThrown, 1, 0) = 0 then
+                        raise (InvalidOperationException("Controlled compiler-warning logger failure."))
+                | _ ->
+                    formatter.Invoke(state, error) |> ignore
+
     let private runtimeDiagnosticRecords (logger: RecordingLogger) =
         logger.StructuredRecords
         |> Array.filter (fun record -> record.Message.Contains("runtime diagnostics"))
@@ -127,6 +168,13 @@ module ScriptTcpForwarderIntegrationTests =
         property name record
         |> Option.defaultWith (fun () -> failwithf "Structured property '%s' was missing." name)
         |> unbox<string>
+
+    let private compilerWarningRecords (logger: RecordingLogger) =
+        logger.StructuredRecords
+        |> Array.filter (fun record ->
+            record.Level = LogLevel.Warning
+            && (property "ScriptPath" record |> Option.isSome)
+            && (property "Diagnostic" record |> Option.isSome))
 
     let private endpointPort (listener: TcpListener) =
         (listener.LocalEndpoint :?> IPEndPoint).Port
@@ -569,6 +617,41 @@ module ScriptTcpForwarderIntegrationTests =
               "                output.Advance(generated.Length)"
               "            ValueTask<ProcessorResult>({ RetainedLength = 0L })" ]
 
+    let private warningTransformSourceWithBindings moduleName delta (warningBindings: string array) =
+        let source = generatedTransformSource moduleName delta
+        let prefix = $"module {moduleName}{Environment.NewLine}{Environment.NewLine}"
+
+        if not (source.StartsWith(prefix, StringComparison.Ordinal)) then
+            failwith "The transform fixture did not start with its expected module declaration."
+
+        let processorSource = source.Substring(prefix.Length)
+
+        Array.concat
+            [| [| $"module {moduleName}"; "" |]
+               warningBindings
+               [| ""; processorSource |] |]
+        |> String.concat Environment.NewLine
+
+    let private warningTransformSource moduleName delta =
+        warningTransformSourceWithBindings
+            moduleName
+            delta
+            [| "let classify value ="
+               "    match value with"
+               "    | 0 -> \"zero\"" |]
+
+    let private multipleWarningTransformSource moduleName delta =
+        warningTransformSourceWithBindings
+            moduleName
+            delta
+            [| "let classify value ="
+               "    match value with"
+               "    | 0 -> \"zero\""
+               ""
+               "let classifyAgain value ="
+               "    match value with"
+               "    | 0 -> \"again\"" |]
+
     let rec private exceptionTree (error: exn) =
         seq {
             yield error
@@ -635,6 +718,259 @@ module ScriptTcpForwarderIntegrationTests =
                             let! received = receive
                             received |> should equal payload
                         })
+        }
+
+    [<Fact>]
+    let ``successful compiler warnings are logged once per script and do not block forwarding`` () =
+        task {
+            use timeout = new CancellationTokenSource(20_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let logger = RecordingLogger()
+
+            let firstWarningPath =
+                workspace.WriteSource(
+                    "FirstWarning.fsx",
+                    warningTransformSource "FirstWarning" 1
+                )
+
+            let secondWarningPath =
+                workspace.WriteSource(
+                    "SecondWarning.fsx",
+                    warningTransformSource "SecondWarning" 2
+                )
+
+            let cleanPath =
+                workspace.WriteSource(
+                    "Clean.fsx",
+                    generatedTransformSource "Clean" 0
+                )
+
+            let firstWarningAlias =
+                let directory =
+                    Path.GetDirectoryName firstWarningPath
+                    |> Option.ofObj
+                    |> Option.defaultWith (fun () -> failwith "The warning fixture has no directory.")
+
+                let fileName =
+                    Path.GetFileName firstWarningPath
+                    |> Option.ofObj
+                    |> Option.defaultWith (fun () -> failwith "The warning fixture has no file name.")
+
+                Path.Combine(directory, ".", fileName)
+
+            do!
+                runWithScriptProxyWithArgumentsAndLogger
+                    [| firstWarningAlias; firstWarningPath; cleanPath |]
+                    [| firstWarningPath; secondWarningPath; cleanPath |]
+                    [| "--disable-runtime-diagnostics" |]
+                    (logger :> ILogger)
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+                            let clientPayload = [| 1uy; 2uy; 3uy |]
+                            let receiveAtBackend =
+                                readExactly backendStream clientPayload.Length timeout.Token
+
+                            do! clientStream.WriteAsync(clientPayload, timeout.Token)
+                            let! receivedAtBackend = receiveAtBackend
+                            receivedAtBackend |> should equal [| 3uy; 4uy; 5uy |]
+
+                            let backendPayload = [| 10uy; 20uy; 30uy |]
+                            let receiveAtClient =
+                                readExactly clientStream backendPayload.Length timeout.Token
+
+                            do! backendStream.WriteAsync(backendPayload, timeout.Token)
+                            let! receivedAtClient = receiveAtClient
+                            receivedAtClient |> should equal [| 13uy; 23uy; 33uy |]
+
+                            client.Client.Shutdown(SocketShutdown.Send)
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream clientStream timeout.Token
+                            do! expectEndOfStream backendStream timeout.Token
+                        })
+
+            let warnings = compilerWarningRecords logger
+            warnings.Length |> should equal 2
+
+            let expectedScriptPaths =
+                [| Path.GetFullPath firstWarningPath
+                   Path.GetFullPath secondWarningPath |]
+                |> Array.sort
+
+            warnings
+            |> Array.map (stringProperty "ScriptPath")
+            |> Array.sort
+            |> should equal expectedScriptPaths
+
+            for record in warnings do
+                let scriptPath = stringProperty "ScriptPath" record
+                let diagnostic = stringProperty "Diagnostic" record
+
+                diagnostic.Contains("FS0025", StringComparison.Ordinal)
+                |> should equal true
+
+                diagnostic.Contains("Incomplete pattern matches", StringComparison.Ordinal)
+                |> should equal true
+
+                diagnostic.Contains($"{scriptPath}(", StringComparison.Ordinal)
+                |> should equal true
+
+                let locationStart =
+                    diagnostic.IndexOf($"{scriptPath}(", StringComparison.Ordinal)
+                    + scriptPath.Length
+                    + 1
+
+                let locationEnd =
+                    diagnostic.IndexOf("): warning", locationStart, StringComparison.Ordinal)
+
+                (locationEnd > locationStart) |> should equal true
+
+                let coordinates =
+                    diagnostic.Substring(locationStart, locationEnd - locationStart).Split(',')
+
+                coordinates.Length |> should equal 2
+
+                coordinates
+                |> Array.iter (fun coordinate ->
+                    match Int32.TryParse coordinate with
+                    | true, value -> value |> should be (greaterThan 0)
+                    | false, _ -> failwithf "Invalid compiler source coordinate '%s'." coordinate)
+
+            let cleanFullPath = Path.GetFullPath cleanPath
+
+            warnings
+            |> Array.exists (fun record ->
+                String.Equals(
+                    stringProperty "ScriptPath" record,
+                    cleanFullPath,
+                    StringComparison.Ordinal
+                ))
+            |> should equal false
+
+            runtimeDiagnosticRecords logger |> Array.isEmpty |> should equal true
+        }
+
+    [<Fact>]
+    let ``throwing compiler warning logger does not block startup or repeat work for cached scripts`` () =
+        task {
+            use timeout = new CancellationTokenSource(20_000)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let logger = ThrowOnFirstCompilerWarningLogger()
+            let scriptPath =
+                workspace.WriteSource(
+                    "ThrowingWarningLogger.fsx",
+                    multipleWarningTransformSource "ThrowingWarningLogger" 1
+                )
+
+            let scriptAlias =
+                let directory =
+                    Path.GetDirectoryName scriptPath
+                    |> Option.ofObj
+                    |> Option.defaultWith (fun () -> failwith "The warning fixture has no directory.")
+
+                let fileName =
+                    Path.GetFileName scriptPath
+                    |> Option.ofObj
+                    |> Option.defaultWith (fun () -> failwith "The warning fixture has no file name.")
+
+                Path.Combine(directory, ".", fileName)
+
+            let listenPort = reservePort ()
+
+            let configuration =
+                createConfiguration
+                    listenPort
+                    (endpointPort backendListener)
+                    [| scriptAlias; scriptPath |]
+                    [| scriptPath; scriptAlias |]
+
+            let compilationCounts = Dictionary<string, int>(StringComparer.Ordinal)
+
+            let compile path cancellationToken =
+                let normalizedPath = Path.GetFullPath path
+
+                let count =
+                    match compilationCounts.TryGetValue normalizedPath with
+                    | true, existing -> existing + 1
+                    | false, _ -> 1
+
+                compilationCounts[normalizedPath] <- count
+                workspace.Compiler.CompileAndLoadAsync(path, cancellationToken)
+
+            do!
+                runWithForwarder
+                    (fun cancellationToken ->
+                        ScriptTcpForwarder.runWithCompilerAsync
+                            compile
+                            configuration
+                            (logger :> ILogger)
+                            cancellationToken)
+                    listenPort
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend =
+                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = acceptBackend
+
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+                            let clientPayload = [| 1uy; 2uy |]
+                            let receiveAtBackend =
+                                readExactly backendStream clientPayload.Length timeout.Token
+
+                            do! clientStream.WriteAsync(clientPayload, timeout.Token)
+                            let! receivedAtBackend = receiveAtBackend
+                            receivedAtBackend |> should equal [| 3uy; 4uy |]
+
+                            let backendPayload = [| 10uy; 20uy |]
+                            let receiveAtClient =
+                                readExactly clientStream backendPayload.Length timeout.Token
+
+                            do! backendStream.WriteAsync(backendPayload, timeout.Token)
+                            let! receivedAtClient = receiveAtClient
+                            receivedAtClient |> should equal [| 12uy; 22uy |]
+
+                            client.Client.Shutdown(SocketShutdown.Send)
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream clientStream timeout.Token
+                            do! expectEndOfStream backendStream timeout.Token
+                        })
+
+            compilationCounts.Count |> should equal 1
+            compilationCounts[Path.GetFullPath scriptPath] |> should equal 1
+            logger.WarningFailureThrown |> should equal true
+
+            let warningAttempts = logger.CompilerWarningAttempts
+            warningAttempts.Length |> should equal 2
+
+            warningAttempts
+            |> Array.forall (fun (path, _) ->
+                String.Equals(path, Path.GetFullPath scriptPath, StringComparison.Ordinal))
+            |> should equal true
+
+            warningAttempts
+            |> Array.map snd
+            |> Array.distinct
+            |> Array.length
+            |> should equal 2
         }
 
     [<Fact>]
@@ -3610,14 +3946,17 @@ type Processor() =
                         [| invalidPath |]
                         Array.empty
 
+                let logger = ThrowOnFirstCompilerWarningLogger()
+
                 let! _ =
                     Assert.ThrowsAsync<ScriptPluginConfigurationException>(fun () ->
                         ScriptTcpForwarder.runAsync
                             configuration
-                            NullLogger.Instance
+                            (logger :> ILogger)
                             timeout.Token
                         :> Task)
 
+                logger.CompilerWarningAttempts |> Array.isEmpty |> should equal true
                 do! expectConnectionFailure listenPort timeout.Token
         }
 

@@ -308,6 +308,291 @@ module Forbidden{index}
         }
 
     [<Fact>]
+    let ``accepts directive-like text in FSharp strings and comments`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let source =
+                [| "module DirectiveTextFixtures"
+                   "let label = \"fixture\""
+                   "let documentation = \"\"\""
+                   "#r \"example-only.dll\""
+                   "   #load indented-string-text.fsx"
+                   "#if PH01_LITERAL_TEXT"
+                   "#else"
+                   "#endif"
+                   "\"\"\""
+                   "let verbatimDocumentation = @\""
+                   "#load \"\"example-only.fsx\"\""
+                   "\""
+                   "let interpolatedDocumentation = $\"\"\""
+                   "Documentation for {label}"
+                   "#I \"example-only-directory\""
+                   "\"\"\""
+                   "let interpolatedVerbatimDocumentation = $@\"{label}"
+                   "#r \"\"example-only.dll\"\""
+                   "\""
+                   "let ordinaryString = \"#r ordinary-string-text\""
+                   "let ordinaryMultilineString = \"ordinary\\"
+                   "#r ordinary-multiline-string-text"
+                   "continued\""
+                   "// #load line-comment-text.fsx"
+                   "(* outer comment"
+                   " \t#r indented-comment-text.dll"
+                   "#if PH01_COMMENT_TEXT"
+                   "#else"
+                   "#endif"
+                   "   (* nested comment"
+                   "#I comment-only-directory"
+                   "   *)"
+                   "*)" |]
+                |> String.concat Environment.NewLine
+                |> withIdentityProcessor
+
+            let scriptPath = workspace.WriteSource("DirectiveTextFixtures.fsx", source)
+            let! result = compile workspace.Compiler scriptPath
+            let plugin, _ = expectCompiledPlugin result
+
+            plugin.ProcessorType.Name |> should equal "Processor"
+        }
+
+    [<Fact>]
+    let ``uses compiler conditional defines when scanning active literals`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let source =
+                [| "module CompiledConditionalLiteral"
+                   "#if COMPILED"
+                   "let selected = \"compiled\""
+                   "let documentation = \"\"\""
+                   "#r \"compiled-branch-string.dll\""
+                   "#else"
+                   "#load \"compiled-branch-string.fsx\""
+                   "#endif"
+                   "\"\"\""
+                   "#else"
+                   "let selected = \"other\""
+                   "#endif" |]
+                |> String.concat Environment.NewLine
+                |> withIdentityProcessor
+
+            let scriptPath = workspace.WriteSource("CompiledConditionalLiteral.fsx", source)
+            let! result = compile workspace.Compiler scriptPath
+            let plugin, _ = expectCompiledPlugin result
+
+            let moduleType =
+                match plugin.Assembly.GetType("CompiledConditionalLiteral", throwOnError = true) with
+                | null -> failwith "The compiled conditional module was not present."
+                | value -> value
+
+            let selectedProperty =
+                match moduleType.GetProperty "selected" with
+                | null -> failwith "The compiled conditional value was not present."
+                | value -> value
+
+            let selected = selectedProperty.GetValue null
+
+            selected |> should equal (box "compiled")
+        }
+
+    [<Fact>]
+    let ``accepts directive-like text in inactive conditional strings and comments`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let source =
+                [| "module ConditionalDirectiveTextFixtures"
+                   "#if PH01_SYMBOL_NOT_DEFINED"
+                   "let documentation = \"\"\""
+                   "#r \"conditional-string-text.dll\""
+                   "\"\"\""
+                   "(* conditional block comment"
+                   "#load \"conditional-comment-text.fsx\""
+                   "*)"
+                   "#else"
+                   "let value = 1"
+                   "#endif" |]
+                |> String.concat Environment.NewLine
+                |> withIdentityProcessor
+
+            let scriptPath = workspace.WriteSource("ConditionalDirectiveTextFixtures.fsx", source)
+            let! result = compile workspace.Compiler scriptPath
+            let plugin, _ = expectCompiledPlugin result
+
+            plugin.ProcessorType.Name |> should equal "Processor"
+        }
+
+    [<Fact>]
+    let ``rejects dependency directives in inactive conditional branches`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let source =
+                "#if PH01_SYMBOL_NOT_DEFINED"
+                + Environment.NewLine
+                + "#r \"inactive-branch.dll\""
+                + Environment.NewLine
+                + "#endif"
+
+            let scriptPath = workspace.WriteSource("InactiveDirective.fsx", source)
+            let! result = compile workspace.Compiler scriptPath
+            let diagnostics = expectFailed result
+
+            let directiveDiagnostic =
+                diagnostics
+                |> Array.find (fun value -> value.Message.Contains("not supported", StringComparison.Ordinal))
+
+            directiveDiagnostic.Range.Value.Start.Line |> should equal 2
+            directiveDiagnostic.Range.Value.Start.Column |> should equal 0
+            directiveDiagnostic.Range.Value.End.Column |> should equal 2
+        }
+
+    [<Fact>]
+    let ``rejects directives in indented nested inactive conditionals`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let cases =
+                [| "ExactReproducer", "   ", ""
+                   "OneSpace", " ", " "
+                   "ThreeSpaces", "   ", "   "
+                   "Tab", "\t", "\t"
+                   "MixedIndent", " \t", " \t" |]
+
+            for name, nestedIndent, directiveIndent in cases do
+                let source =
+                    [| "#if OUTER_MISSING"
+                       nestedIndent + "#if INNER_MISSING"
+                       directiveIndent + "#r \"nested.dll\""
+                       nestedIndent + "#endif"
+                       "#endif" |]
+                    |> String.concat Environment.NewLine
+                    |> withIdentityProcessor
+
+                let scriptPath = workspace.WriteSource($"{name}.fsx", source)
+                let! result = compile workspace.Compiler scriptPath
+                let diagnostics = expectFailed result
+
+                let directiveDiagnostic =
+                    diagnostics
+                    |> Array.tryFind (fun value ->
+                        value.Message.Contains("not supported", StringComparison.Ordinal))
+                    |> Option.defaultWith (fun () ->
+                        failwithf "The nested #r directive in %s was not rejected." name)
+
+                directiveDiagnostic.Range.Value.Start.Line |> should equal 3
+                directiveDiagnostic.Range.Value.Start.Column |> should equal directiveIndent.Length
+                directiveDiagnostic.Range.Value.End.Column |> should equal (directiveIndent.Length + 2)
+        }
+
+    [<Fact>]
+    let ``rejects active directives after malformed inactive conditional text`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let cases =
+                [| "UnclosedString",
+                   [| "#if PH01_SYMBOL_NOT_DEFINED"
+                      "let text = \"\"\""
+                      "#else"
+                      "#r \"dependency.dll\""
+                      "#endif" |]
+                   "UnclosedComment",
+                   [| "#if PH01_SYMBOL_NOT_DEFINED"
+                      "(*"
+                      "#else"
+                      "#r \"dependency.dll\""
+                      "#endif" |] |]
+
+            for name, lines in cases do
+                let scriptPath =
+                    workspace.WriteSource(
+                        $"{name}.fsx",
+                        String.concat Environment.NewLine lines
+                        |> withIdentityProcessor
+                    )
+
+                let! result = compile workspace.Compiler scriptPath
+                let diagnostics = expectFailed result
+
+                let directiveDiagnostic =
+                    diagnostics
+                    |> Array.tryFind (fun value ->
+                        value.Message.Contains("not supported", StringComparison.Ordinal))
+                    |> Option.defaultWith (fun () ->
+                        failwithf
+                            "The active #r after %s was not rejected. Compiler diagnostics: %s"
+                            name
+                            (diagnosticText diagnostics))
+
+                directiveDiagnostic.Range.Value.Start.Line |> should equal 4
+                directiveDiagnostic.Range.Value.Start.Column |> should equal 0
+                directiveDiagnostic.Range.Value.End.Column |> should equal 2
+        }
+
+    [<Fact>]
+    let ``rejects directives across nested conditional elif and endif transitions`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let source =
+                [| "#if PH01_OUTER_SYMBOL_NOT_DEFINED"
+                   "let text = \"\"\""
+                   "   #if PH01_INNER_SYMBOL_NOT_DEFINED"
+                   "#r \"nested-inactive.dll\""
+                   "\t#elif PH01_INNER_ELIF_SYMBOL_NOT_DEFINED"
+                   "#r \"nested-elif.dll\""
+                   " #else"
+                   "#r \"nested-else.dll\""
+                   " \t#endif"
+                   "#else"
+                   "#r \"outer-else.dll\""
+                   "#endif" |]
+                |> String.concat Environment.NewLine
+                |> withIdentityProcessor
+
+            let scriptPath = workspace.WriteSource("NestedConditionals.fsx", source)
+            let! result = compile workspace.Compiler scriptPath
+            let diagnostics = expectFailed result
+
+            let directiveDiagnostics =
+                diagnostics
+                |> Array.filter (fun value ->
+                    value.Message.Contains("not supported", StringComparison.Ordinal))
+
+            directiveDiagnostics.Length |> should equal 4
+
+            directiveDiagnostics
+            |> Array.map (fun value -> value.Range.Value.Start.Line)
+            |> should equal [| 4; 6; 8; 11 |]
+        }
+
+    [<Fact>]
+    let ``preserves directive casing whitespace and source positions`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let scriptPath =
+                workspace.WriteSource(
+                    "DirectivePosition.fsx",
+                    "module DirectivePosition"
+                    + Environment.NewLine
+                    + " \t# R \"restricted.dll\""
+                )
+
+            let! result = compile workspace.Compiler scriptPath
+            let diagnostics = expectFailed result
+
+            let directiveDiagnostic =
+                diagnostics
+                |> Array.find (fun value -> value.Message.Contains("not supported", StringComparison.Ordinal))
+
+            directiveDiagnostic.SourcePath |> should equal (Some(Path.GetFullPath scriptPath))
+            directiveDiagnostic.CompilerCode |> should equal None
+            directiveDiagnostic.Range.Value.Start.Line |> should equal 2
+            directiveDiagnostic.Range.Value.Start.Column |> should equal 2
+            directiveDiagnostic.Range.Value.End.Line |> should equal 2
+            directiveDiagnostic.Range.Value.End.Column |> should equal 5
+            directiveDiagnostic.Message
+            |> should equal "Script dependency directive '#r' is not supported; references are supplied by PipeL4."
+        }
+
+    [<Fact>]
     let ``does not expose incidental PipeL4 or compiler assemblies`` () =
         task {
             use workspace = new TestWorkspace()
@@ -349,6 +634,26 @@ let configurationType = typeof<ForwardingConfiguration>
 
             let! invalidResult = compile workspace.Compiler invalidPath
             expectFailed invalidResult |> ignore
+            compilerArtifacts workspace |> should be Empty
+        }
+
+    [<Fact>]
+    let ``pre-cancelled compilation observes cancellation without creating compiler artifacts`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let scriptPath =
+                workspace.WriteSource(
+                    "PreCancelled.fsx",
+                    withIdentityProcessor "module PreCancelled"
+                )
+
+            use cancellation = new CancellationTokenSource()
+            cancellation.Cancel()
+
+            let! _ =
+                Assert.ThrowsAnyAsync<OperationCanceledException>(fun () ->
+                    workspace.Compiler.CompileAndLoadAsync(scriptPath, cancellation.Token))
+
             compilerArtifacts workspace |> should be Empty
         }
 
