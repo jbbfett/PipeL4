@@ -17,6 +17,17 @@ module ForwardingConfigurationTests =
            "--backend-port"
            "8081" |]
 
+    let private valueTakingOptions =
+        [ "--listen-address"
+          "--listen-port"
+          "--backend-host"
+          "--backend-port"
+          "--client-to-server-plugin"
+          "--server-to-client-plugin"
+          "--client-to-server-logical-capacity-bytes"
+          "--server-to-client-logical-capacity-bytes"
+          "--connection-physical-capacity-bytes" ]
+
     let private parse arguments =
         match ForwardingConfiguration.tryParseArguments arguments with
         | Ok configuration -> configuration
@@ -32,6 +43,12 @@ module ForwardingConfigurationTests =
         |> Array.chunkBySize 2
         |> Array.filter (fun pair -> pair[0] <> optionName)
         |> Array.collect id
+
+    let private withValue optionName value arguments =
+        let result = Array.copy arguments
+        let optionIndex = Array.findIndex ((=) optionName) result
+        result[optionIndex + 1] <- value
+        result
 
     [<Fact>]
     let ``parses an IPv4 forwarding configuration`` () =
@@ -97,6 +114,53 @@ module ForwardingConfigurationTests =
 
         configuration.BackendEndpoint
         |> should equal (IPEndPoint(IPAddress.Parse "2001:db8::1", 443))
+
+    [<Fact>]
+    let ``accepts bracketed IPv6 addresses and scope identifiers`` () =
+        let bracketedArguments =
+            validArguments
+            |> withValue "--listen-address" "[::1]"
+            |> withValue "--backend-host" "[2001:db8::1]"
+
+        let bracketed = parse bracketedArguments
+        bracketed.ListenEndpoint.Address |> should equal IPAddress.IPv6Loopback
+        bracketed.BackendEndpoint.Address |> should equal (IPAddress.Parse "2001:db8::1")
+
+        let scopedArguments =
+            validArguments
+            |> withValue "--listen-address" "fe80::1%3"
+            |> withValue "--backend-host" "[fe80::2%4]"
+
+        let scoped = parse scopedArguments
+        scoped.ListenEndpoint.Address |> should equal (IPAddress.Parse "fe80::1%3")
+        scoped.BackendEndpoint.Address |> should equal (IPAddress.Parse "fe80::2%4")
+
+    [<Fact>]
+    let ``preserves existing noncanonical IPv4 representations`` () =
+        for value in [ "127.1"; "0x7f000001" ] do
+            let arguments =
+                validArguments
+                |> withValue "--listen-address" value
+                |> withValue "--backend-host" value
+
+            let configuration = parse arguments
+            let expected = IPAddress.Parse value
+            configuration.ListenEndpoint.Address |> should equal expected
+            configuration.BackendEndpoint.Address |> should equal expected
+
+    [<Fact>]
+    let ``rejects embedded ports in both bracketed IPv6 address options`` () =
+        [ "--listen-address", "[::1]:1234", "--listen-port"
+          "--backend-host", "[::1]:1234", "--backend-port" ]
+        |> List.iter (fun (addressOption, value, portOption) ->
+            let arguments = withValue addressOption value validArguments
+
+            match ForwardingConfiguration.tryParseArguments arguments with
+            | Error error ->
+                error.Contains($"'{addressOption}'") |> should equal true
+                error.Contains("accepts an IP address only") |> should equal true
+                error.Contains($"'{portOption}'") |> should equal true
+            | Ok _ -> failwithf "Expected %s with an embedded port to be rejected." addressOption)
 
     [<Fact>]
     let ``accepts the TCP port boundaries`` () =
@@ -236,6 +300,35 @@ module ForwardingConfigurationTests =
             validArguments
             [| "--server-to-client-plugin"; "--client-to-server-plugin"; "plugin.fsx" |]
         |> expectError "a server-to-client plugin followed by another option"
+
+    [<Fact>]
+    let ``rejects unknown option-like tokens after every value-taking option`` () =
+        for optionName in valueTakingOptions do
+            match ForwardingConfiguration.tryParseArguments [| optionName; "--typo" |] with
+            | Error error ->
+                error.Contains(optionName) |> should equal true
+                error.Contains("--typo") |> should equal true
+                error.Contains("option-like") |> should equal true
+            | Ok _ -> failwithf "Expected an option-like token after %s to be rejected." optionName
+
+    [<Fact>]
+    let ``known option tokens remain missing values for every value-taking option`` () =
+        for optionName in valueTakingOptions do
+            match
+                ForwardingConfiguration.tryParseArguments
+                    [| optionName; "--disable-runtime-diagnostics" |]
+            with
+            | Error error ->
+                error |> should equal $"Missing value for argument '{optionName}'."
+            | Ok _ -> failwithf "Expected %s followed by an option to be missing its value." optionName
+
+    [<Fact>]
+    let ``accepts an explicitly qualified dash-prefixed plugin path`` () =
+        let arguments =
+            Array.append validArguments [| "--client-to-server-plugin"; "./--name.fsx" |]
+
+        let configuration = parse arguments
+        configuration.ClientToServerPluginPaths |> Seq.toArray |> should equal [| "./--name.fsx" |]
 
     [<Fact>]
     let ``rejects invalid listen and backend IP addresses`` () =

@@ -20,6 +20,7 @@
     <Compile Include="ScriptCompilerTests.fs" />
     <Compile Include="ScriptPipelineTests.fs" />
     <Compile Include="ScriptTcpForwarderIntegrationTests.fs" />
+    <Compile Include="ExampleProcessorTests.fs" />
     <Compile Include="CliAcceptanceTests.fs" />
     <Compile Include="SmokeTests.fs" />
   </ItemGroup>

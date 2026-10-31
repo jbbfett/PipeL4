@@ -107,6 +107,10 @@ module ForwardingConfiguration =
 
     let private valuelessOptions = Set.singleton DisableRuntimeDiagnosticsOption
 
+    let private isOptionLikeToken (value: string) =
+        not (String.IsNullOrEmpty value)
+        && value.StartsWith("--", StringComparison.Ordinal)
+
     [<NoEquality; NoComparison>]
     type private CollectedArguments =
         { Values: Dictionary<string, string>
@@ -137,6 +141,9 @@ module ForwardingConfiguration =
                         collect (index + 1)
                 elif index + 1 >= arguments.Length || knownOptions.Contains arguments[index + 1] then
                     Error $"Missing value for argument '{optionName}'."
+                elif isOptionLikeToken arguments[index + 1] then
+                    Error
+                        $"Unexpected option-like argument '{arguments[index + 1]}' after argument '{optionName}'; a value is required."
                 else
                     let value = arguments[index + 1]
 
@@ -158,13 +165,29 @@ module ForwardingConfiguration =
     let private findMissingOption (values: Dictionary<string, string>) =
         requiredOptionNames |> List.tryFind (values.ContainsKey >> not)
 
-    let private tryParseAddress optionName (value: string): Result<IPAddress, string> =
-        match IPAddress.TryParse value with
-        | true, address ->
-            match Option.ofObj address with
-            | Some address -> Ok address
-            | None -> Error ("Argument " + optionName + " must be an IPv4 or IPv6 address.")
-        | _ -> Error ("Argument " + optionName + " must be an IPv4 or IPv6 address.")
+    let private hasBracketedAddressPort (value: string) =
+        let candidate = value.Trim()
+
+        if candidate.StartsWith("[", StringComparison.Ordinal) then
+            let closingBracket = candidate.IndexOf(']')
+
+            closingBracket >= 0
+            && closingBracket + 1 < candidate.Length
+            && candidate[closingBracket + 1] = ':'
+        else
+            false
+
+    let private tryParseAddress optionName portOptionName (value: string): Result<IPAddress, string> =
+        if hasBracketedAddressPort value then
+            Error
+                $"Argument '{optionName}' accepts an IP address only; supply the port with '{portOptionName}'."
+        else
+            match IPAddress.TryParse value with
+            | true, address ->
+                match Option.ofObj address with
+                | Some address -> Ok address
+                | None -> Error ("Argument " + optionName + " must be an IPv4 or IPv6 address.")
+            | _ -> Error ("Argument " + optionName + " must be an IPv4 or IPv6 address.")
 
     let private tryParsePort optionName (value: string) =
         match Int32.TryParse value with
@@ -200,13 +223,23 @@ module ForwardingConfiguration =
             | None ->
                 let values = collected.Values
 
-                match tryParseAddress "--listen-address" values["--listen-address"] with
+                match
+                    tryParseAddress
+                        "--listen-address"
+                        "--listen-port"
+                        values["--listen-address"]
+                with
                 | Error error -> Error error
                 | Ok listenAddress ->
                     match tryParsePort "--listen-port" values["--listen-port"] with
                     | Error error -> Error error
                     | Ok listenPort ->
-                        match tryParseAddress "--backend-host" values["--backend-host"] with
+                        match
+                            tryParseAddress
+                                "--backend-host"
+                                "--backend-port"
+                                values["--backend-host"]
+                        with
                         | Error error -> Error error
                         | Ok backendAddress ->
                             match tryParsePort "--backend-port" values["--backend-port"] with

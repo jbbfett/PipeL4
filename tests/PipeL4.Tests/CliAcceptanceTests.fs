@@ -898,6 +898,105 @@ module CliAcceptanceTests =
             child.HasExited |> should equal false
         }
 
+    [<Theory>]
+    [<InlineData("--help")>]
+    [<InlineData("-h")>]
+    let ``help aliases print structured help to stdout and exit successfully`` (helpOption: string) =
+        task {
+            use child = ChildProcess.Start(applicationHostPath (), [| helpOption |])
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+
+            result.ExitCode |> should equal 0
+            assertOutputCaptureCompleted result
+            result.StandardError |> should equal ""
+            assertStandardOutputContains "Usage: PipeL4 [options]" result
+            assertStandardOutputContains "Required endpoints:" result
+            assertStandardOutputContains "--listen-address" result
+            assertStandardOutputContains "--listen-port" result
+            assertStandardOutputContains "--backend-host" result
+            assertStandardOutputContains "--backend-port" result
+            assertStandardOutputContains "IP addresses only; hostnames are not resolved." result
+            assertStandardOutputContains "--client-to-server-plugin" result
+            assertStandardOutputContains "--server-to-client-plugin" result
+            assertStandardOutputContains "Repeat either option to add stages" result
+            assertStandardOutputContains "Minimum 1; default unbounded." result
+            assertStandardOutputContains "Minimum 2; default unbounded." result
+            assertStandardOutputContains "Runtime diagnostics are enabled by default." result
+            assertStandardOutputContains "--disable-runtime-diagnostics" result
+            assertStandardOutputContains "dotnet run --project src/PipeL4" result
+            result.StandardOutput.Contains("TCP listener started", StringComparison.Ordinal)
+            |> should equal false
+        }
+
+    [<Theory>]
+    [<InlineData("--help")>]
+    [<InlineData("-h")>]
+    let ``configuration followed by help aliases is rejected`` (helpOption: string) =
+        task {
+            use reservedListener = reserveListenerPort ()
+            let listenPort = (reservedListener.LocalEndpoint :?> IPEndPoint).Port
+            let backendPort = reservePort ()
+            let arguments = Array.append (requiredArguments listenPort backendPort) [| helpOption |]
+
+            use child = ChildProcess.Start(applicationHostPath (), arguments)
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+
+            result.ExitCode |> should equal 2
+            assertOutputCaptureCompleted result
+            result.StandardOutput |> should equal ""
+            assertStandardErrorContains "Error: Help options '--help' and '-h' must be used alone." result
+            assertStandardErrorContains "Usage: PipeL4" result
+        }
+
+    [<Fact>]
+    let ``mixed help and configuration arguments are rejected before plugin compilation`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let invalidScript =
+                workspace.WriteSource(
+                    "InvalidHelpPlugin.fsx",
+                    "module InvalidHelpPlugin\nlet value: int = \"wrong\""
+                )
+
+            use reservedListener = reserveListenerPort ()
+            let listenPort = (reservedListener.LocalEndpoint :?> IPEndPoint).Port
+            let backendPort = reservePort ()
+
+            let arguments =
+                Array.concat
+                    [| [| "--help" |]
+                       requiredArguments listenPort backendPort
+                       [| "--client-to-server-plugin"; invalidScript |] |]
+
+            use child = ChildProcess.Start(applicationHostPath (), arguments)
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+
+            result.ExitCode |> should equal 2
+            assertOutputCaptureCompleted result
+            result.StandardOutput |> should equal ""
+            assertStandardErrorContains "Error: Help options '--help' and '-h' must be used alone." result
+            assertStandardErrorContains "Usage: PipeL4" result
+            result.StandardError.Contains("Plugin configuration error:", StringComparison.Ordinal)
+            |> should equal false
+
+            result.StandardError.Contains("TCP listener started", StringComparison.Ordinal)
+            |> should equal false
+        }
+
+    [<Fact>]
+    let ``no arguments retain the established error stream exit code and usage`` () =
+        task {
+            use child = ChildProcess.Start(applicationHostPath (), Array.empty)
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+
+            result.ExitCode |> should equal 2
+            assertOutputCaptureCompleted result
+            result.StandardOutput |> should equal ""
+            assertStandardErrorContains "Error: Missing required argument '--listen-address'." result
+            assertStandardErrorContains "Usage: PipeL4" result
+        }
+
     [<Fact>]
     let ``invalid CLI arguments return the established error code and usage`` () =
         task {
@@ -913,9 +1012,56 @@ module CliAcceptanceTests =
 
             result.ExitCode |> should equal 2
             assertOutputCaptureCompleted result
+            result.StandardOutput |> should equal ""
             assertStandardErrorContains "Error: Unknown argument '--unknown-option'." result
             assertStandardErrorContains "Usage: PipeL4" result
             do! expectConnectionFailure listenPort timeout.Token
+        }
+
+    [<Theory>]
+    [<InlineData("--listen-address", "[::1]:1234", "--listen-port")>]
+    [<InlineData("--backend-host", "[::1]:1234", "--backend-port")>]
+    let ``embedded IPv6 ports are rejected by the real CLI``
+        (addressOption: string)
+        (addressValue: string)
+        (portOption: string)
+        =
+        task {
+            let arguments = requiredArguments (reservePort ()) (reservePort ())
+            let optionIndex = Array.findIndex ((=) addressOption) arguments
+            arguments[optionIndex + 1] <- addressValue
+
+            use child = ChildProcess.Start(applicationHostPath (), arguments)
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+
+            result.ExitCode |> should equal 2
+            assertOutputCaptureCompleted result
+            result.StandardOutput |> should equal ""
+            assertStandardErrorContains "accepts an IP address only" result
+            assertStandardErrorContains addressOption result
+            assertStandardErrorContains portOption result
+            assertStandardErrorContains "Usage: PipeL4" result
+        }
+
+    [<Fact>]
+    let ``unknown option-like plugin values fail during real CLI parsing`` () =
+        task {
+            let arguments =
+                Array.append
+                    (requiredArguments (reservePort ()) (reservePort ()))
+                    [| "--client-to-server-plugin"; "--typo" |]
+
+            use child = ChildProcess.Start(applicationHostPath (), arguments)
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+
+            result.ExitCode |> should equal 2
+            assertOutputCaptureCompleted result
+            result.StandardOutput |> should equal ""
+            assertStandardErrorContains "Unexpected option-like argument '--typo'" result
+            assertStandardErrorContains "--client-to-server-plugin" result
+            assertStandardErrorContains "Usage: PipeL4" result
+            result.StandardError.Contains("Plugin configuration error:", StringComparison.Ordinal)
+            |> should equal false
         }
 
     [<Fact>]
