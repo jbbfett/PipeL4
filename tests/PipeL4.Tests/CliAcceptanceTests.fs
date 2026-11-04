@@ -17,11 +17,21 @@ open Xunit
 
 module CliAcceptanceTests =
     [<NoEquality; NoComparison>]
-    type private ProcessResult =
+    type ProcessResult =
         { ExitCode: int
           StandardOutput: string
           StandardError: string
           OutputCaptureCompleted: bool }
+
+    [<NoEquality; NoComparison>]
+    type ProcessFailureDiagnostics =
+        { NaturalExitCode: int option
+          ForcedTerminationRequested: bool
+          ProcessExited: bool
+          StandardOutput: string
+          StandardError: string
+          OutputCaptureCompleted: bool
+          SecondaryErrors: string list }
 
     [<Sealed>]
     type private ProcessOutputCapture() =
@@ -39,6 +49,16 @@ module CliAcceptanceTests =
                     lines.Add(capturedLine))
 
         member _.Text = lock gate (fun () -> buffer.ToString())
+
+        member _.Tail(maximumCharacters: int) =
+            lock gate (fun () ->
+                if buffer.Length <= maximumCharacters then
+                    buffer.ToString()
+                else
+                    let omitted = "[earlier output omitted]\n"
+                    let tailCharacters = max 0 (maximumCharacters - omitted.Length)
+                    omitted + buffer.ToString(buffer.Length - tailCharacters, tailCharacters))
+
         member _.Completion = completed.Task
 
         member _.HasJsonStringProperties(expectedProperties: (string * string) list) =
@@ -71,12 +91,25 @@ module CliAcceptanceTests =
             this.HasJsonStringProperties([ propertyName, expectedValue ])
 
     [<Sealed>]
-    type private ChildProcess private (
+    type ChildProcess private (
         childProcess: Process,
         standardOutput: ProcessOutputCapture,
         standardError: ProcessOutputCapture
     ) =
         let mutable outputReadCancelled = false
+        let mutable disposed = false
+        let mutable forcedTerminationRequested = 0
+        let terminationGate = obj ()
+
+        let wasForcedTerminationRequested () =
+            Volatile.Read(&forcedTerminationRequested) <> 0
+
+        let naturalExitCodeIfUnforced () =
+            lock terminationGate (fun () ->
+                if wasForcedTerminationRequested () then
+                    None
+                else
+                    Some childProcess.ExitCode)
 
         let cancelOutputRead cancel =
             try
@@ -99,13 +132,21 @@ module CliAcceptanceTests =
                     return false
             }
 
-        let killProcessTree () =
-            if not childProcess.HasExited then
-                try
-                    childProcess.Kill(entireProcessTree = true)
-                with
-                | :? InvalidOperationException -> ()
-                | :? Win32Exception when childProcess.HasExited -> ()
+        let requestProcessTreeTermination () =
+            lock terminationGate (fun () ->
+                if not childProcess.HasExited then
+                    Interlocked.Exchange(&forcedTerminationRequested, 1) |> ignore
+
+                    try
+                        childProcess.Kill(entireProcessTree = true)
+                        true
+                    with
+                    | :? InvalidOperationException -> false
+                    | :? Win32Exception when childProcess.HasExited -> false
+                else
+                    false)
+
+        let killProcessTree () = requestProcessTreeTermination () |> ignore
 
         let waitForProcessExitAsync (timeout: TimeSpan) : Task<bool> =
             Task.Run(fun () ->
@@ -134,6 +175,27 @@ module CliAcceptanceTests =
               StandardError = standardError.Text
               OutputCaptureCompleted = outputCaptureCompleted }
 
+        let disposeCore () =
+            if not disposed then
+                disposed <- true
+
+                try
+                    killProcessTree ()
+
+                    if childProcess.WaitForExit(3000) then
+                        let completion = Task.WhenAll(standardOutput.Completion, standardError.Completion)
+
+                        if not (completion.Wait(TimeSpan.FromSeconds 2.0)) then
+                            cancelOutputRead (fun () -> childProcess.CancelOutputRead())
+                            cancelOutputRead (fun () -> childProcess.CancelErrorRead())
+                    elif not outputReadCancelled then
+                        cancelOutputRead (fun () -> childProcess.CancelOutputRead())
+                        cancelOutputRead (fun () -> childProcess.CancelErrorRead())
+                    else
+                        ()
+                finally
+                    childProcess.Dispose()
+
         member _.Id = childProcess.Id
         member _.HasExited = childProcess.HasExited
         member _.HasListenerStartedRecord(endpoint: string) =
@@ -143,6 +205,58 @@ module CliAcceptanceTests =
             )
         member _.CapturedStandardOutput = standardOutput.Text
         member _.CapturedStandardError = standardError.Text
+
+        member _.CollectFailureDiagnosticsAndCleanupAsync() =
+            task {
+                let secondaryErrors = ResizeArray<string>()
+                let mutable naturalExitCode = None
+                let mutable processExited = false
+                let mutable outputCaptureCompleted = false
+
+                let recordError context (error: exn) =
+                    secondaryErrors.Add(context + ": " + error.ToString())
+
+                try
+                    let! exitedNaturally = waitForProcessExitAsync (TimeSpan.FromMilliseconds 500.0)
+
+                    if exitedNaturally then
+                        processExited <- true
+
+                        naturalExitCode <- naturalExitCodeIfUnforced ()
+                    else
+                        let terminatedByCleanup = requestProcessTreeTermination ()
+                        let! exitedAfterCleanup = waitForProcessExitAsync (TimeSpan.FromSeconds 5.0)
+                        processExited <- exitedAfterCleanup
+
+                        if exitedAfterCleanup
+                           && not terminatedByCleanup
+                           && not (wasForcedTerminationRequested ()) then
+                            naturalExitCode <- naturalExitCodeIfUnforced ()
+
+                    if processExited then
+                        let! captureCompleted = waitForOutputCaptureAsync (TimeSpan.FromSeconds 2.0)
+                        outputCaptureCompleted <- captureCompleted
+                    else
+                        cancelOutputRead (fun () -> childProcess.CancelOutputRead())
+                        cancelOutputRead (fun () -> childProcess.CancelErrorRead())
+                        secondaryErrors.Add("The child process did not exit within the bounded cleanup wait.")
+                with error ->
+                    recordError "Failure diagnostic collection failed" error
+
+                try
+                    disposeCore ()
+                with error ->
+                    recordError "Child-process cleanup failed" error
+
+                return
+                    { NaturalExitCode = naturalExitCode
+                      ForcedTerminationRequested = wasForcedTerminationRequested ()
+                      ProcessExited = processExited
+                      StandardOutput = standardOutput.Tail(16 * 1024)
+                      StandardError = standardError.Tail(16 * 1024)
+                      OutputCaptureCompleted = outputCaptureCompleted
+                      SecondaryErrors = List.ofSeq secondaryErrors }
+            }
 
         member _.WaitForExitAsync(timeout: TimeSpan) =
             task {
@@ -263,23 +377,7 @@ module CliAcceptanceTests =
             ChildProcess.StartWithReadSetup(executablePath, arguments, beginOutputRead, beginErrorRead)
 
         interface IDisposable with
-            member _.Dispose() =
-                try
-                    killProcessTree ()
-
-                    if childProcess.WaitForExit(3000) then
-                        let completion = Task.WhenAll(standardOutput.Completion, standardError.Completion)
-
-                        if not (completion.Wait(TimeSpan.FromSeconds 2.0)) then
-                            cancelOutputRead (fun () -> childProcess.CancelOutputRead())
-                            cancelOutputRead (fun () -> childProcess.CancelErrorRead())
-                    elif not outputReadCancelled then
-                        cancelOutputRead (fun () -> childProcess.CancelOutputRead())
-                        cancelOutputRead (fun () -> childProcess.CancelErrorRead())
-                    else
-                        ()
-                finally
-                    childProcess.Dispose()
+            member _.Dispose() = disposeCore ()
 
     type private TestWorkspace() =
         let rootPath =
@@ -909,23 +1007,45 @@ module CliAcceptanceTests =
             result.ExitCode |> should equal 0
             assertOutputCaptureCompleted result
             result.StandardError |> should equal ""
-            assertStandardOutputContains "Usage: PipeL4 [options]" result
+            assertStandardOutputContains "Usage: pipel4 [options]" result
             assertStandardOutputContains "Required endpoints:" result
             assertStandardOutputContains "--listen-address" result
             assertStandardOutputContains "--listen-port" result
             assertStandardOutputContains "--backend-host" result
             assertStandardOutputContains "--backend-port" result
             assertStandardOutputContains "IP addresses only; hostnames are not resolved." result
+            assertStandardOutputContains "TCP port (1 through 65535)." result
             assertStandardOutputContains "--client-to-server-plugin" result
             assertStandardOutputContains "--server-to-client-plugin" result
             assertStandardOutputContains "Repeat either option to add stages" result
+            assertStandardOutputContains "Each path names an .fsx script" result
+            assertStandardOutputContains "Relative paths start from the current working directory." result
+            assertStandardOutputContains "Scripts execute as trusted code in this process; there is no sandbox." result
+            assertStandardOutputContains "--client-to-server-logical-capacity-bytes" result
+            assertStandardOutputContains "--server-to-client-logical-capacity-bytes" result
+            assertStandardOutputContains "--connection-physical-capacity-bytes" result
             assertStandardOutputContains "Minimum 1; default unbounded." result
             assertStandardOutputContains "Minimum 2; default unbounded." result
             assertStandardOutputContains "Runtime diagnostics are enabled by default." result
-            assertStandardOutputContains "--disable-runtime-diagnostics" result
-            assertStandardOutputContains "dotnet run --project src/PipeL4" result
+            assertStandardOutputContains "--disable-runtime-diagnostics  Takes no value" result
+            assertStandardOutputContains "--version  Show the application version and exit." result
+            assertStandardOutputContains "pipel4 --listen-address" result
             result.StandardOutput.Contains("TCP listener started", StringComparison.Ordinal)
             |> should equal false
+        }
+
+    [<Fact>]
+    let ``version reports assembly package version and exits successfully`` () =
+        task {
+            use child = ChildProcess.Start(applicationHostPath (), [| "--version" |])
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+
+            result.ExitCode |> should equal 0
+            assertOutputCaptureCompleted result
+            result.StandardError |> should equal ""
+            result.StandardOutput.Trim().StartsWith("PipeL4 ", StringComparison.Ordinal)
+            |> should equal true
+            result.StandardOutput.Contains("+", StringComparison.Ordinal) |> should equal false
         }
 
     [<Theory>]
@@ -945,7 +1065,7 @@ module CliAcceptanceTests =
             assertOutputCaptureCompleted result
             result.StandardOutput |> should equal ""
             assertStandardErrorContains "Error: Help options '--help' and '-h' must be used alone." result
-            assertStandardErrorContains "Usage: PipeL4" result
+            assertStandardErrorContains "Usage: pipel4" result
         }
 
     [<Fact>]
@@ -976,7 +1096,7 @@ module CliAcceptanceTests =
             assertOutputCaptureCompleted result
             result.StandardOutput |> should equal ""
             assertStandardErrorContains "Error: Help options '--help' and '-h' must be used alone." result
-            assertStandardErrorContains "Usage: PipeL4" result
+            assertStandardErrorContains "Usage: pipel4" result
             result.StandardError.Contains("Plugin configuration error:", StringComparison.Ordinal)
             |> should equal false
 
@@ -994,7 +1114,27 @@ module CliAcceptanceTests =
             assertOutputCaptureCompleted result
             result.StandardOutput |> should equal ""
             assertStandardErrorContains "Error: Missing required argument '--listen-address'." result
-            assertStandardErrorContains "Usage: PipeL4" result
+            assertStandardErrorContains "Usage: pipel4" result
+        }
+
+    [<Fact>]
+    let ``version mixed with forwarding arguments is rejected`` () =
+        task {
+            use timeout = new CancellationTokenSource(TimeSpan.FromSeconds 10.0)
+            let listenPort = reservePort ()
+            let backendPort = reservePort ()
+            let arguments =
+                Array.append (requiredArguments listenPort backendPort) [| "--version" |]
+
+            use child = ChildProcess.Start(applicationHostPath (), arguments)
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+
+            result.ExitCode |> should equal 2
+            assertOutputCaptureCompleted result
+            result.StandardOutput |> should equal ""
+            assertStandardErrorContains "Error: Version option '--version' must be used alone." result
+            assertStandardErrorContains "Usage: pipel4" result
+            do! expectConnectionFailure listenPort timeout.Token
         }
 
     [<Fact>]
@@ -1014,7 +1154,7 @@ module CliAcceptanceTests =
             assertOutputCaptureCompleted result
             result.StandardOutput |> should equal ""
             assertStandardErrorContains "Error: Unknown argument '--unknown-option'." result
-            assertStandardErrorContains "Usage: PipeL4" result
+            assertStandardErrorContains "Usage: pipel4" result
             do! expectConnectionFailure listenPort timeout.Token
         }
 
@@ -1040,7 +1180,7 @@ module CliAcceptanceTests =
             assertStandardErrorContains "accepts an IP address only" result
             assertStandardErrorContains addressOption result
             assertStandardErrorContains portOption result
-            assertStandardErrorContains "Usage: PipeL4" result
+            assertStandardErrorContains "Usage: pipel4" result
         }
 
     [<Fact>]
@@ -1059,7 +1199,7 @@ module CliAcceptanceTests =
             result.StandardOutput |> should equal ""
             assertStandardErrorContains "Unexpected option-like argument '--typo'" result
             assertStandardErrorContains "--client-to-server-plugin" result
-            assertStandardErrorContains "Usage: PipeL4" result
+            assertStandardErrorContains "Usage: pipel4" result
             result.StandardError.Contains("Plugin configuration error:", StringComparison.Ordinal)
             |> should equal false
         }
@@ -1095,6 +1235,33 @@ module CliAcceptanceTests =
             assertStandardErrorContains "FS" result
             result.StandardError.Contains("Runtime error:", StringComparison.Ordinal) |> should equal false
             reservedListener.Stop()
+            do! expectConnectionFailure listenPort timeout.Token
+        }
+
+    [<Fact>]
+    let ``missing plugin files identify the script path and read failure`` () =
+        task {
+            use timeout = new CancellationTokenSource(TimeSpan.FromSeconds 10.0)
+            use workspace = new TestWorkspace()
+            let missingScript = workspace.GetPath("Missing.fsx")
+            let listenPort = reservePort ()
+            let backendPort = reservePort ()
+            let arguments =
+                Array.concat
+                    [| requiredArguments listenPort backendPort
+                       [| "--client-to-server-plugin"; missingScript |] |]
+
+            use child = ChildProcess.Start(applicationHostPath (), arguments)
+            let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 15.0)
+
+            result.ExitCode |> should equal 2
+            assertOutputCaptureCompleted result
+            result.StandardOutput |> should equal ""
+            assertStandardErrorContains "Plugin configuration error:" result
+            assertStandardErrorContains missingScript result
+            assertStandardErrorContains "The script source could not be read:" result
+            result.StandardError.Contains("TCP listener started", StringComparison.Ordinal)
+            |> should equal false
             do! expectConnectionFailure listenPort timeout.Token
         }
 
@@ -1447,6 +1614,52 @@ module CliAcceptanceTests =
                 descendant.HasExited |> should equal true
             finally
                 cleanupPidFd ownedDescendant
+        }
+
+    [<Fact>]
+    let ``child process diagnostics preserve forced termination provenance`` () =
+        Assert.SkipUnless(
+            OperatingSystem.IsLinux(),
+            "The controlled child-process provenance test uses /bin/sleep and /bin/sh."
+        )
+
+        task {
+            use timedOutChild = ChildProcess.Start("/bin/sleep", [| "60" |])
+            let mutable timeoutFailure: TimeoutException option = None
+
+            try
+                let! _ = timedOutChild.WaitForExitAsync(TimeSpan.FromMilliseconds 250.0)
+                ()
+            with :? TimeoutException as error ->
+                timeoutFailure <- Some error
+
+            let timeoutError =
+                timeoutFailure
+                |> Option.defaultWith (fun () -> failwith "The controlled child did not trigger timeout cleanup.")
+
+            timeoutError.Message.Contains("did not exit before the timeout", StringComparison.Ordinal)
+            |> should equal true
+
+            let! timeoutDiagnostics = timedOutChild.CollectFailureDiagnosticsAndCleanupAsync()
+            timeoutDiagnostics.NaturalExitCode |> should equal None
+            timeoutDiagnostics.ForcedTerminationRequested |> should equal true
+            timeoutDiagnostics.ProcessExited |> should equal true
+
+            use explicitlyKilledChild = ChildProcess.Start("/bin/sleep", [| "60" |])
+            let! _ = explicitlyKilledChild.KillAndWaitAsync()
+            let! killDiagnostics = explicitlyKilledChild.CollectFailureDiagnosticsAndCleanupAsync()
+            killDiagnostics.NaturalExitCode |> should equal None
+            killDiagnostics.ForcedTerminationRequested |> should equal true
+            killDiagnostics.ProcessExited |> should equal true
+
+            use naturallyExitedChild = ChildProcess.Start("/bin/sh", [| "-c"; "exit 23" |])
+            let! naturalResult = naturallyExitedChild.WaitForExitAsync(TimeSpan.FromSeconds 5.0)
+            naturalResult.ExitCode |> should equal 23
+
+            let! naturalDiagnostics = naturallyExitedChild.CollectFailureDiagnosticsAndCleanupAsync()
+            naturalDiagnostics.NaturalExitCode |> should equal (Some 23)
+            naturalDiagnostics.ForcedTerminationRequested |> should equal false
+            naturalDiagnostics.ProcessExited |> should equal true
         }
 
     [<Fact>]

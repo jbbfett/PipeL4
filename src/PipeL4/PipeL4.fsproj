@@ -2,11 +2,23 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>pipel4</ToolCommandName>
+    <PackageId>PipeL4</PackageId>
+    <Version>0.1.0-preview.1</Version>
+    <Authors>PipeL4</Authors>
+    <PackageDescription>Experimental high-performance TCP proxy with programmable F# processing pipelines.</PackageDescription>
+    <PackageTags>tcp;proxy;F#;dotnet-tool;plugin</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <RestoreEnablePackagePruning>false</RestoreEnablePackagePruning>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,22 +1,23 @@
 FROM ubuntu:24.04 AS build
 
-ARG DOTNET_SDK_PACKAGE_VERSION=10.0.112-0ubuntu1~24.04.1
-ARG PAKET_VERSION=10.3.1
-
+# Ubuntu updates the package revision; global.json constrains SDK selection to the
+# requested version or its supported patch roll-forward within the same feature band.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         ca-certificates \
-        dotnet-sdk-10.0=${DOTNET_SDK_PACKAGE_VERSION} \
+        dotnet-sdk-10.0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 
-RUN dotnet tool install --tool-path /tools Paket --version ${PAKET_VERSION}
-ENV PATH="/tools:${PATH}"
+COPY global.json ./
+COPY .config/dotnet-tools.json .config/dotnet-tools.json
+RUN dotnet --version \
+    && dotnet tool restore
 
 COPY . .
 
-RUN paket restore --project src/PipeL4/PipeL4.fsproj \
+RUN dotnet paket restore --project src/PipeL4/PipeL4.fsproj \
     && dotnet restore src/PipeL4/PipeL4.fsproj /p:PaketDisableGlobalRestore=true
 
 RUN dotnet publish src/PipeL4/PipeL4.fsproj \

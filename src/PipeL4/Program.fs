@@ -1,18 +1,42 @@
 module PipeL4.Program
 
 open System
+open System.Reflection
 open System.Threading
 open Microsoft.Extensions.Logging
 open PipeL4.Core
 open PipeL4.Plugins
 
 let private usage =
-    "Usage: PipeL4 --listen-address <ip> --listen-port <port> --backend-host <ip> --backend-port <port> [--client-to-server-plugin <path>]... [--server-to-client-plugin <path>]... [--client-to-server-logical-capacity-bytes <bytes>] [--server-to-client-logical-capacity-bytes <bytes>] [--connection-physical-capacity-bytes <bytes>] [--disable-runtime-diagnostics]"
+    String.concat
+        Environment.NewLine
+        [ "Usage: pipel4 --listen-address <ip> --listen-port <port> --backend-host <ip> --backend-port <port> [--client-to-server-plugin <path>]... [--server-to-client-plugin <path>]... [--client-to-server-logical-capacity-bytes <bytes>] [--server-to-client-logical-capacity-bytes <bytes>] [--connection-physical-capacity-bytes <bytes>] [--disable-runtime-diagnostics]"
+          "       pipel4 --help | --version" ]
+
+let private applicationVersion () =
+    let assembly = Assembly.GetExecutingAssembly()
+
+    let informationalVersion =
+        assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+        |> Option.ofObj
+        |> Option.map _.InformationalVersion
+        |> Option.defaultWith (fun () ->
+            assembly.GetName().Version
+            |> Option.ofObj
+            |> Option.map _.ToString()
+            |> Option.defaultValue "unknown")
+
+    let buildMetadataIndex = informationalVersion.IndexOf('+')
+
+    if buildMetadataIndex < 0 then
+        informationalVersion
+    else
+        informationalVersion.Substring(0, buildMetadataIndex)
 
 let private help =
     String.concat
         Environment.NewLine
-        [ "Usage: PipeL4 [options]"
+        [ "Usage: pipel4 [options]"
           ""
           "Required endpoints:"
           "  --listen-address <ip>      Local address to listen on (IPv4 or IPv6 literal)."
@@ -20,14 +44,18 @@ let private help =
           "  --backend-host <ip>        Backend address (IPv4 or IPv6 literal)."
           "  --backend-port <port>      Backend TCP port (1 through 65535)."
           "  Address options accept IP addresses only; hostnames are not resolved."
+          "  The four endpoint options are required."
           ""
           "Directional plugins:"
           "  --client-to-server-plugin <path>  Add a stage for client-to-backend traffic."
           "  --server-to-client-plugin <path>  Add a stage for backend-to-client traffic."
           "  Repeat either option to add stages; each direction runs them in argument order."
-          "  Plugin scripts are compiled before the listener starts."
+          "  Each path names an .fsx script, compiled and loaded before the listener starts."
+          "  Relative paths start from the current working directory."
+          "  Scripts execute as trusted code in this process; there is no sandbox."
           ""
           "Byte capacities:"
+          "  Supply capacities as decimal byte counts without suffixes."
           "  --client-to-server-logical-capacity-bytes <bytes>  Minimum 1; default unbounded."
           "  --server-to-client-logical-capacity-bytes <bytes>  Minimum 1; default unbounded."
           "  --connection-physical-capacity-bytes <bytes>       Minimum 2; default unbounded."
@@ -35,14 +63,18 @@ let private help =
           ""
           "Diagnostics:"
           "  Runtime diagnostics are enabled by default."
-          "  --disable-runtime-diagnostics  Omit optional counters, timings, progress categories,"
+          "  --disable-runtime-diagnostics  Takes no value; omit optional counters, timings, progress categories,"
           "                                 and terminal runtime-diagnostics summaries."
           ""
-          "Invocation example (run from the repository root with a backend on port 6000):"
-          "  dotnet run --project src/PipeL4 -- --listen-address 127.0.0.1 --listen-port 5000 --backend-host 127.0.0.1 --backend-port 6000 --client-to-server-plugin ./benchmarks/PipeL4.Benchmarks/Scripts/PassThrough.fsx"
+          "Version:"
+          "  --version  Show the application version and exit."
+          ""
+          "Invocation example (run from the repository root):"
+          "  pipel4 --listen-address 127.0.0.1 --listen-port 5000 --backend-host 127.0.0.1 --backend-port 6000 --client-to-server-plugin ./examples/AsciiUppercase.fsx"
           ""
           "Help:"
-          "  -h, --help  Show this help. Use either option by itself." ]
+          "  -h, --help  Show this help. Use either option by itself."
+          "  Help and version options must each be used alone." ]
 
 [<EntryPoint>]
 let main arguments =
@@ -51,8 +83,15 @@ let main arguments =
     | [| "-h" |] ->
         printfn "%s" help
         0
+    | [| "--version" |] ->
+        printfn "PipeL4 %s" (applicationVersion ())
+        0
     | _ when arguments |> Array.exists (fun argument -> argument = "--help" || argument = "-h") ->
         eprintfn "Error: Help options '--help' and '-h' must be used alone."
+        eprintfn "%s" usage
+        2
+    | _ when arguments |> Array.contains "--version" ->
+        eprintfn "Error: Version option '--version' must be used alone."
         eprintfn "%s" usage
         2
     | _ ->

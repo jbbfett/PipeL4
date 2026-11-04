@@ -1,0 +1,92 @@
+name: Distribution validation
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Build and validate .NET Tool
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up .NET SDK from global.json
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Restore Paket tool
+        run: dotnet tool restore
+
+      - name: Clean Release outputs
+        run: dotnet clean src/PipeL4/PipeL4.fsproj --configuration Release -p:PaketDisableCliTest=true -p:BuildInParallel=false
+
+      - name: Restore dependencies
+        run: dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
+
+      - name: Build Release
+        run: dotnet build PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true
+
+      - name: Create release candidate package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/release-candidate
+          pack_log="$RUNNER_TEMP/pipel4-pack.log"
+          dotnet pack src/PipeL4/PipeL4.fsproj \
+            --configuration Release \
+            --no-restore \
+            -p:PaketDisableCliTest=true \
+            -p:BuildInParallel=false \
+            --output ./artifacts/release-candidate 2>&1 | tee "$pack_log"
+          if grep -F "NU5046" "$pack_log"; then
+            echo "Package validation failed: dotnet pack reported a missing package README (NU5046)." >&2
+            exit 1
+          fi
+
+      - name: Verify package validator failure handling
+        run: dotnet fsi scripts/test_validation_exit_codes.fsx ./artifacts/release-candidate
+
+      - name: Validate package metadata and contents
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet fsi scripts/validate_package.fsx ./artifacts/release-candidate
+          mapfile -t packages < <(find ./artifacts/release-candidate -maxdepth 1 -type f -name 'PipeL4.*.nupkg' -print)
+          package_name="${packages[0]##*/}"
+          package_version="${package_name#PipeL4.}"
+          package_version="${package_version%.nupkg}"
+          printf 'package_version=%s\n' "$package_version" >> "$GITHUB_OUTPUT"
+
+      - name: Run regression suite against release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t packages < <(find ./artifacts/release-candidate -maxdepth 1 -type f -name 'PipeL4.*.nupkg' -print)
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "Installed-tool validation failed: expected one validated PipeL4 package, found ${#packages[@]}." >&2
+            exit 1
+          fi
+          PIPEL4_PACKAGE_PATH="${packages[0]}" dotnet test \
+            --solution PipeL4.sln \
+            --configuration Release \
+            --no-restore \
+            -p:PaketDisableCliTest=true \
+            -p:BuildInParallel=false
+          printf '%s\n' "$GITHUB_SHA" > ./artifacts/release-candidate/source-revision.txt
+
+      - name: Upload validated release candidate
+        uses: actions/upload-artifact@v7
+        with:
+          name: PipeL4-${{ steps.package.outputs.package_version }}-release-candidate-${{ github.sha }}
+          path: ./artifacts/release-candidate/
+          if-no-files-found: error
