@@ -11,6 +11,7 @@ let private usage =
     String.concat
         Environment.NewLine
         [ "Usage: pipel4 --listen-address <ip> --listen-port <port> --backend-host <ip> --backend-port <port> [--client-to-server-plugin <path>]... [--server-to-client-plugin <path>]... [--client-to-server-logical-capacity-bytes <bytes>] [--server-to-client-logical-capacity-bytes <bytes>] [--connection-physical-capacity-bytes <bytes>] [--disable-runtime-diagnostics]"
+          "       pipel4 examples list | copy <name> [--output-dir <directory>] [--force]"
           "       pipel4 --help | --version" ]
 
 let private applicationVersion () =
@@ -74,11 +75,13 @@ let private help =
           ""
           "Help:"
           "  -h, --help  Show this help. Use either option by itself."
+          "  pipel4 examples --help  Show bundled-example commands."
           "  Help and version options must each be used alone." ]
 
 [<EntryPoint>]
 let main arguments =
     match arguments with
+    | _ when arguments.Length > 0 && arguments[0] = "examples" -> ExampleDistribution.run arguments[1..]
     | [| "--help" |]
     | [| "-h" |] ->
         printfn "%s" help

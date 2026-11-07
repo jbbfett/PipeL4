@@ -21,6 +21,8 @@
     <Compile Include="ScriptPipelineTests.fs" />
     <Compile Include="ScriptTcpForwarderIntegrationTests.fs" />
     <Compile Include="ExampleProcessorTests.fs" />
+    <Compile Include="BytePatternReplaceTests.fs" />
+    <Compile Include="PrefixModeTests.fs" />
     <Compile Include="CliAcceptanceTests.fs" />
     <Compile Include="InstalledToolIntegrationTests.fs" />
     <Compile Include="SmokeTests.fs" />

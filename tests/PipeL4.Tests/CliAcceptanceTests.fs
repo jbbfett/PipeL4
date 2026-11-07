@@ -6,6 +6,7 @@ open System.Diagnostics
 open System.IO
 open System.Net
 open System.Net.Sockets
+open System.Reflection
 open System.Runtime.InteropServices
 open System.Runtime.ExceptionServices
 open System.Text
@@ -297,12 +298,13 @@ module CliAcceptanceTests =
         static member private StartWithReadSetup(
             executablePath: string,
             arguments: string array,
+            workingDirectory: string,
             beginOutputRead: Process -> unit,
             beginErrorRead: Process -> unit
         ) =
             let startInfo = ProcessStartInfo()
             startInfo.FileName <- executablePath
-            startInfo.WorkingDirectory <- Path.GetTempPath()
+            startInfo.WorkingDirectory <- workingDirectory
             startInfo.UseShellExecute <- false
             startInfo.RedirectStandardOutput <- true
             startInfo.RedirectStandardError <- true
@@ -364,6 +366,16 @@ module CliAcceptanceTests =
             ChildProcess.StartWithReadSetup(
                 executablePath,
                 arguments,
+                Path.GetTempPath(),
+                (fun childToRead -> childToRead.BeginOutputReadLine()),
+                (fun childToRead -> childToRead.BeginErrorReadLine())
+            )
+
+        static member StartInDirectory(executablePath: string, arguments: string array, workingDirectory: string) =
+            ChildProcess.StartWithReadSetup(
+                executablePath,
+                arguments,
+                workingDirectory,
                 (fun childToRead -> childToRead.BeginOutputReadLine()),
                 (fun childToRead -> childToRead.BeginErrorReadLine())
             )
@@ -374,7 +386,13 @@ module CliAcceptanceTests =
             beginOutputRead: Process -> unit,
             beginErrorRead: Process -> unit
         ) =
-            ChildProcess.StartWithReadSetup(executablePath, arguments, beginOutputRead, beginErrorRead)
+            ChildProcess.StartWithReadSetup(
+                executablePath,
+                arguments,
+                Path.GetTempPath(),
+                beginOutputRead,
+                beginErrorRead
+            )
 
         interface IDisposable with
             member _.Dispose() = disposeCore ()
@@ -384,6 +402,8 @@ module CliAcceptanceTests =
             Path.Combine(Path.GetTempPath(), "PipeL4.CliAcceptanceTests", Guid.NewGuid().ToString "N")
 
         do Directory.CreateDirectory rootPath |> ignore
+
+        member _.RootPath = rootPath
 
         member _.WriteSource(fileName: string, source: string) =
             let path = Path.Combine(rootPath, fileName)
@@ -559,7 +579,7 @@ module CliAcceptanceTests =
             | :? EntryPointNotFoundException -> false
             | :? DllNotFoundException -> false
 
-    let private applicationHostPath () =
+    let private repositoryRoot () =
         let rec findRepositoryRoot (directory: DirectoryInfo option) =
             match directory with
             | None ->
@@ -575,6 +595,9 @@ module CliAcceptanceTests =
                 else
                     findRepositoryRoot (current.Parent |> Option.ofObj)
 
+        findRepositoryRoot (Some(DirectoryInfo(AppContext.BaseDirectory)))
+
+    let private applicationHostPath () =
         let outputDirectory = DirectoryInfo(AppContext.BaseDirectory)
         let targetFramework = outputDirectory.Name
 
@@ -584,7 +607,7 @@ module CliAcceptanceTests =
             |> Option.map _.Name
             |> Option.defaultWith (fun () -> failwith "The test output path has no build configuration directory.")
 
-        let repositoryRoot = findRepositoryRoot (Some outputDirectory)
+        let repositoryRoot = repositoryRoot ()
         let executableName = if OperatingSystem.IsWindows() then "PipeL4.exe" else "PipeL4"
 
         let executablePath =
@@ -1895,4 +1918,170 @@ module CliAcceptanceTests =
             File.ReadAllText(disposedMarker) |> should equal "disposed"
             do! expectConnectionClosed (client.GetStream()) timeout.Token
             do! expectConnectionClosed (backend.GetStream()) timeout.Token
+        }
+
+    let private bundledExamples =
+        [| "AsciiUppercase", "AsciiUppercase.fsx", "PipeL4.Examples.AsciiUppercase.fsx"
+           "BytePatternReplace", "BytePatternReplace.fsx", "PipeL4.Examples.BytePatternReplace.fsx"
+           "PrefixMode", "PrefixMode.fsx", "PipeL4.Examples.PrefixMode.fsx" |]
+
+    let private runCliInDirectory workingDirectory arguments =
+        task {
+            use child = ChildProcess.StartInDirectory(applicationHostPath (), arguments, workingDirectory)
+            return! child.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
+        }
+
+    let private assertNoTemporaryExtractionFiles directory fileName =
+        Directory.GetFiles(directory, $".{fileName}.*.tmp").Length |> should equal 0
+
+    [<Fact>]
+    let ``embedded examples have stable resource names and match the source bytes`` () =
+        let applicationAssemblyPath =
+            Path.ChangeExtension(applicationHostPath (), ".dll")
+            |> Option.ofObj
+            |> Option.defaultWith (fun () -> failwith "Could not determine the PipeL4 assembly path.")
+        let applicationAssembly = Assembly.LoadFrom applicationAssemblyPath
+
+        let expectedResourceNames =
+            bundledExamples
+            |> Array.map (fun (_, _, resourceName) -> resourceName)
+            |> Array.sort
+
+        let actualResourceNames =
+            applicationAssembly.GetManifestResourceNames()
+            |> Array.filter (fun name -> name.StartsWith("PipeL4.Examples.", StringComparison.Ordinal))
+            |> Array.sort
+
+        actualResourceNames |> should equal expectedResourceNames
+
+        let examplesDirectory = Path.Combine(repositoryRoot (), "examples")
+
+        for _, fileName, resourceName in bundledExamples do
+            match applicationAssembly.GetManifestResourceStream resourceName |> Option.ofObj with
+            | None -> failwithf "Application resource '%s' was not found." resourceName
+            | Some resource ->
+                use resource = resource
+                use content = new MemoryStream()
+                resource.CopyTo content
+
+                let original = File.ReadAllBytes(Path.Combine(examplesDirectory, fileName))
+                content.ToArray() |> should equal original
+
+    [<Fact>]
+    let ``examples list and copy work from a temporary directory without proxy configuration`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let expectedNames = bundledExamples |> Array.map (fun (name, _, _) -> name)
+            let! listResult = runCliInDirectory workspace.RootPath [| "examples"; "list" |]
+
+            listResult.ExitCode |> should equal 0
+            assertOutputCaptureCompleted listResult
+            listResult.StandardError |> should equal ""
+            listResult.StandardOutput.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+            |> should equal expectedNames
+            listResult.StandardOutput.Contains("TCP listener started", StringComparison.Ordinal)
+            |> should equal false
+
+            let outputDirectory = Path.Combine(workspace.RootPath, "output")
+            Directory.CreateDirectory outputDirectory |> ignore
+
+            for index, (name, fileName, _) in bundledExamples |> Array.indexed do
+                let arguments =
+                    if index = 0 then
+                        [| "examples"; "copy"; name |]
+                    else
+                        [| "examples"; "copy"; name; "--output-dir"; outputDirectory |]
+
+                let! copyResult = runCliInDirectory workspace.RootPath arguments
+                let expectedDirectory = if index = 0 then workspace.RootPath else outputDirectory
+                let copiedPath = Path.Combine(expectedDirectory, fileName)
+                let originalPath = Path.Combine(repositoryRoot (), "examples", fileName)
+
+                copyResult.ExitCode |> should equal 0
+                assertOutputCaptureCompleted copyResult
+                copyResult.StandardError |> should equal ""
+                copyResult.StandardOutput.Contains(fileName, StringComparison.Ordinal) |> should equal true
+                File.ReadAllBytes copiedPath |> should equal (File.ReadAllBytes originalPath)
+                assertNoTemporaryExtractionFiles expectedDirectory fileName
+        }
+
+    [<Fact>]
+    let ``example copies protect conflicts and replace only with force`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let fileName = "AsciiUppercase.fsx"
+            let destination = Path.Combine(workspace.RootPath, fileName)
+            let existingBytes = [| 0uy; 255uy; 10uy; 13uy |]
+            File.WriteAllBytes(destination, existingBytes)
+
+            let! conflict = runCliInDirectory workspace.RootPath [| "examples"; "copy"; "AsciiUppercase" |]
+            conflict.ExitCode |> should equal 1
+            assertOutputCaptureCompleted conflict
+            conflict.StandardOutput |> should equal ""
+            assertStandardErrorContains "already exists" conflict
+            File.ReadAllBytes destination |> should equal existingBytes
+            assertNoTemporaryExtractionFiles workspace.RootPath fileName
+
+            let! overwrite =
+                runCliInDirectory workspace.RootPath [| "examples"; "copy"; "AsciiUppercase"; "--force" |]
+
+            overwrite.ExitCode |> should equal 0
+            assertOutputCaptureCompleted overwrite
+            let originalPath = Path.Combine(repositoryRoot (), "examples", fileName)
+            File.ReadAllBytes destination |> should equal (File.ReadAllBytes originalPath)
+            assertNoTemporaryExtractionFiles workspace.RootPath fileName
+
+            if not (OperatingSystem.IsWindows()) then
+                let linkDestination = Path.Combine(workspace.RootPath, "PrefixMode.fsx")
+                let protectedTarget = Path.Combine(workspace.RootPath, "protected-target.txt")
+                let protectedBytes = [| 9uy; 8uy; 7uy |]
+                File.WriteAllBytes(protectedTarget, protectedBytes)
+                File.CreateSymbolicLink(linkDestination, protectedTarget) |> ignore
+
+                let! symbolicLink =
+                    runCliInDirectory
+                        workspace.RootPath
+                        [| "examples"; "copy"; "PrefixMode"; "--force" |]
+
+                symbolicLink.ExitCode |> should equal 1
+                assertOutputCaptureCompleted symbolicLink
+                assertStandardErrorContains "symbolic link" symbolicLink
+                File.ReadAllBytes protectedTarget |> should equal protectedBytes
+                FileInfo(linkDestination).LinkTarget |> Option.ofObj |> Option.isSome |> should equal true
+        }
+
+    [<Fact>]
+    let ``example CLI rejects unknown names and invalid paths or syntax`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let! unknown = runCliInDirectory workspace.RootPath [| "examples"; "copy"; "../AsciiUppercase" |]
+            unknown.ExitCode |> should equal 2
+            assertOutputCaptureCompleted unknown
+            assertStandardErrorContains "Unknown example" unknown
+
+            let! invalidSyntax =
+                runCliInDirectory workspace.RootPath [| "examples"; "copy"; "AsciiUppercase"; "--output-dir" |]
+
+            invalidSyntax.ExitCode |> should equal 2
+            assertOutputCaptureCompleted invalidSyntax
+            assertStandardErrorContains "requires a directory argument" invalidSyntax
+
+            let missingDirectory = Path.Combine(workspace.RootPath, "missing")
+
+            let! invalidDirectory =
+                runCliInDirectory
+                    workspace.RootPath
+                    [| "examples"; "copy"; "AsciiUppercase"; "--output-dir"; missingDirectory |]
+
+            invalidDirectory.ExitCode |> should equal 1
+            assertOutputCaptureCompleted invalidDirectory
+            assertStandardErrorContains "does not exist" invalidDirectory
+
+            let! help = runCliInDirectory workspace.RootPath [| "examples"; "--help" |]
+            help.ExitCode |> should equal 0
+            assertOutputCaptureCompleted help
+            help.StandardError |> should equal ""
+            assertStandardOutputContains "Usage: pipel4 examples <command>" help
+            assertStandardOutputContains "Example names are case-sensitive." help
         }

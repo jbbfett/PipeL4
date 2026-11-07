@@ -14,6 +14,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="../../examples/AsciiUppercase.fsx" LogicalName="PipeL4.Examples.AsciiUppercase.fsx" />
+    <EmbeddedResource Include="../../examples/BytePatternReplace.fsx" LogicalName="PipeL4.Examples.BytePatternReplace.fsx" />
+    <EmbeddedResource Include="../../examples/PrefixMode.fsx" LogicalName="PipeL4.Examples.PrefixMode.fsx" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="ExampleDistribution.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 

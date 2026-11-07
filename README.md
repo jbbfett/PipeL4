@@ -105,6 +105,43 @@ After PipeL4 is published to NuGet.org, the corresponding global install and upd
 `dotnet tool update --global PipeL4 --prerelease`. Those commands depend on publication and are not
 needed for the local-package workflow above.
 
+## Installed examples
+
+The three user-facing processor scripts are embedded in the PipeL4 executable so they can be
+inspected and copied after installing the .NET Tool, without cloning the repository or downloading
+example files separately. Names are case-sensitive and listed in a stable order:
+
+```sh
+pipel4 examples list
+```
+
+Copy an example into the current directory, or into an existing directory with `--output-dir`:
+
+```sh
+pipel4 examples copy AsciiUppercase
+pipel4 examples copy PrefixMode --output-dir ./plugins
+```
+
+The copied file keeps its original filename, such as `AsciiUppercase.fsx`. An existing destination
+is preserved and the command fails unless `--force` is supplied. With `--force`, an existing
+regular file is replaced; symbolic-link destinations are refused. The output directory must
+already exist. See `pipel4 examples --help` for the command syntax.
+
+Edit the extracted script and load it with the existing directional plugin option, for example:
+
+```sh
+pipel4 \
+  --listen-address 127.0.0.1 \
+  --listen-port 5000 \
+  --backend-host 127.0.0.1 \
+  --backend-port 6000 \
+  --client-to-server-plugin ./AsciiUppercase.fsx
+```
+
+Scripts compiled by the PipeL4 host do not need script-level `#r` directives for PipeL4 assemblies;
+the host supplies its supported references. See the individual example descriptions below for each
+processor's behavior and limits.
+
 ## Practical quickstart
 
 This walkthrough runs the installed `pipel4` command with the repository's example processor. It
@@ -138,6 +175,73 @@ and output memory; the script does not retain or dispose either one. Scripts run
 the PipeL4 process and are not sandboxed. See the [processor contract](docs/architecture.md#processor-model),
 [plugin ownership](docs/architecture.md#plugins), and [EOF contract](docs/backpressure.md#eof-and-half-close)
 for the complete rules.
+
+User-facing processor examples live in `examples/` and use one descriptive PascalCase `.fsx` file
+per processor. `AsciiUppercase.fsx` is the canonical stateless example and
+`BytePatternReplace.fsx` demonstrates bounded stateful matching, while
+`PrefixMode.fsx` demonstrates bounded prefix-based mode selection; the `.fsx` files under
+`benchmarks/` are benchmark fixtures, not user-facing examples. The example intentionally has no
+explicit F# `module` declaration: PipeL4 discovers its one public `IByteStreamProcessor`
+implementation by interface, not by module name. It also has no `#r` directive because the host
+supplies the supported assembly references.
+
+### Stateful byte pattern replacement
+
+The example at [examples/BytePatternReplace.fsx](examples/BytePatternReplace.fsx) replaces each
+non-overlapping, case-sensitive ASCII byte sequence `HELLO` with `WORLD`. It processes bytes
+directly, so arbitrary binary data and the boundaries between TCP reads, processor invocations,
+and input segments do not affect the result. It is stateful because a
+trailing `H`, `HE`, `HEL`, or `HELL` may be the beginning of a match; each processor instance
+copies at most those four pending bytes into its own bounded state. The runtime does not retain
+input memory for this example, and output for an unresolved suffix is delayed until a mismatch,
+more input, or normal EOF. At EOF the incomplete suffix is emitted unchanged exactly once.
+
+Run it with the same echo backend and CLI shape as the stateless example, for example:
+
+```sh
+pipel4 \
+  --listen-address 127.0.0.1 \
+  --listen-port 5000 \
+  --backend-host 127.0.0.1 \
+  --backend-port 6000 \
+  --client-to-server-plugin ./examples/BytePatternReplace.fsx
+```
+
+Sending `Say HELLO\n` through the proxy produces `Say WORLD\n` from the echo backend. The example
+does not decode text, expose protocol framing, support overlapping-match semantics, or provide
+unbounded buffering; it is only a byte-stream replacement demonstration. Use
+`--server-to-client-plugin` instead when the transformation should apply to backend-to-client
+traffic.
+
+### Select a processing mode from the stream prefix
+
+The example at [examples/PrefixMode.fsx](examples/PrefixMode.fsx) inspects the first four bytes of
+the configured direction's stream. It preserves those bytes in the output. If they are ASCII
+`MASK`, it replaces subsequent ASCII digits `0` through `9` with `X`; otherwise, it passes all
+subsequent bytes through unchanged. This is content-based processing-mode selection, not access
+control or connection rejection.
+
+The choice is made once per processor instance and does not depend on TCP read or input-segment
+boundaries. Until the fourth byte arrives, the runtime retains at most the first three bytes. If
+EOF arrives first, those pending bytes are forwarded unchanged. After a decision, later bytes are
+processed in the selected mode without inspecting for another prefix. In masking mode the prefix is
+borrowed from the original input, and generated output is written in bounded batches; pass-through
+data uses borrowed input ranges. The plugin operates on bytes and does not parse a higher-level
+protocol.
+
+Load it on client-to-backend traffic with the existing CLI option:
+
+```sh
+pipel4 \
+  --listen-address 127.0.0.1 \
+  --listen-port 5000 \
+  --backend-host 127.0.0.1 \
+  --backend-port 6000 \
+  --client-to-server-plugin ./examples/PrefixMode.fsx
+```
+
+Use `--server-to-client-plugin` to apply the same content rule independently to backend-to-client
+traffic. Each configured direction has its own processor instance and prefix decision.
 
 Start any TCP echo backend on `127.0.0.1:6000`. For a Unix-like shell, this Python standard-library
 server is a one-connection test backend:
@@ -187,6 +291,26 @@ Script paths are resolved to absolute paths relative to the caller's current wor
 The `./examples/...` path above therefore assumes the command is run from the repository root. An
 installed tool does not resolve relative script paths from its installation directory; use an
 absolute path or a path relative to the directory from which `pipel4` is launched.
+
+### Copy and modify the example
+
+The existing CLI accepts a script at any readable `.fsx` path. Copy the canonical example, edit the
+copy, and pass its path to the same plugin option:
+
+```sh
+cp examples/AsciiUppercase.fsx /tmp/MyAsciiProcessor.fsx
+$EDITOR /tmp/MyAsciiProcessor.fsx
+pipel4 \
+  --listen-address 127.0.0.1 \
+  --listen-port 5000 \
+  --backend-host 127.0.0.1 \
+  --backend-port 6000 \
+  --client-to-server-plugin /tmp/MyAsciiProcessor.fsx
+```
+
+These are PipeL4-hosted scripts: `pipel4` compiles, references, discovers, and runs the processor
+inside the proxy. Running `dotnet fsi examples/AsciiUppercase.fsx` is a different execution mode;
+the script deliberately has no assembly reference directive and is not a standalone FSI program.
 
 ### Configure ordered processors in both directions
 

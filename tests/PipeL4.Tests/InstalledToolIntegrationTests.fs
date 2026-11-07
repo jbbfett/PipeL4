@@ -4,12 +4,15 @@ open System
 open System.ComponentModel
 open System.Diagnostics
 open System.IO
+open System.IO.Compression
 open System.Net
 open System.Net.Sockets
+open System.Runtime.Loader
 open System.Runtime.InteropServices
 open System.Text
 open System.Threading
 open System.Threading.Tasks
+open System.Xml.Linq
 open FsUnit.Xunit
 open Xunit
 
@@ -106,23 +109,62 @@ module InstalledToolIntegrationTests =
         if not result.OutputCaptureCompleted then
             failwith (commandFailure ($"{name} output capture") result)
 
-    let private packageVersion packagePath =
+    [<NoEquality; NoComparison>]
+    type private PackageIdentity =
+        { PackageId: string
+          Version: string
+          ToolCommand: string }
+
+    let private packageIdentity packagePath =
         if not (File.Exists packagePath) then
             failwithf "The release candidate package does not exist at '%s'." packagePath
 
-        let packageName =
-            Path.GetFileNameWithoutExtension packagePath
+        use package = ZipFile.OpenRead packagePath
+
+        let requiredEntry name =
+            package.GetEntry name
             |> Option.ofObj
-            |> Option.defaultWith (fun () -> failwithf "Could not read package name from '%s'." packagePath)
-        let prefix = "PipeL4."
+            |> Option.defaultWith (fun () -> failwithf "Package '%s' is missing '%s'." packagePath name)
 
-        if not (packageName.StartsWith(prefix, StringComparison.Ordinal)) then
-            failwithf "Unexpected generated package name '%s'." packageName
+        let requiredElement name (element: XElement) =
+            element.Elements()
+            |> Seq.tryFind (fun child -> child.Name.LocalName = name)
+            |> Option.defaultWith (fun () -> failwithf "Package '%s' is missing metadata element '%s'." packagePath name)
 
-        packageName.Substring(prefix.Length)
+        let nuspec =
+            package.Entries
+            |> Seq.tryFind (fun entry -> entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase))
+            |> Option.defaultWith (fun () -> failwithf "Package '%s' has no nuspec." packagePath)
+
+        let metadata =
+            use input = nuspec.Open()
+            let document = XDocument.Load input
+            let root = document.Root |> Option.ofObj |> Option.defaultWith (fun () -> failwith "Package nuspec is empty.")
+            requiredElement "metadata" root
+
+        let packageId = (requiredElement "id" metadata).Value.Trim()
+        let version = (requiredElement "version" metadata).Value.Trim()
+        let expectedFilename = $"{packageId}.{version}.nupkg"
+
+        if not (String.Equals(Path.GetFileName packagePath, expectedFilename, StringComparison.OrdinalIgnoreCase)) then
+            failwithf "Package filename '%s' does not match its nuspec identity '%s'." (Path.GetFileName packagePath) expectedFilename
+
+        let toolSettings =
+            use input = (requiredEntry "tools/net10.0/any/DotnetToolSettings.xml").Open()
+            XDocument.Load input
+
+        let toolCommand =
+            toolSettings.Descendants()
+            |> Seq.tryFind (fun element -> element.Name.LocalName = "Command")
+            |> Option.bind (fun command -> command.Attribute(XName.Get "Name") |> Option.ofObj |> Option.map (fun value -> value.Value))
+            |> Option.defaultWith (fun () -> failwithf "Package '%s' has no .NET tool command name." packagePath)
+
+        { PackageId = packageId
+          Version = version
+          ToolCommand = toolCommand }
 
     let private generatedPackage packageDirectory =
-        let packages = Directory.GetFiles(packageDirectory, "PipeL4.*.nupkg")
+        let packages = Directory.GetFiles(packageDirectory, "*.nupkg")
 
         if packages.Length <> 1 then
             failwithf
@@ -131,7 +173,56 @@ module InstalledToolIntegrationTests =
                 packages.Length
 
         let packagePath = packages[0]
-        packagePath, packageVersion packagePath
+        packagePath, packageIdentity packagePath
+
+    let private verifyPackagedExamples
+        (packagePath: string)
+        (repository: string)
+        (workspace: TestWorkspace)
+        =
+        use package = ZipFile.OpenRead packagePath
+        let assemblyEntry =
+            package.GetEntry("tools/net10.0/any/PipeL4.dll")
+            |> Option.ofObj
+            |> Option.defaultWith (fun () -> failwith "The tool package has no PipeL4.dll assembly.")
+
+        let inspectionDirectory = Path.Combine(workspace.RootPath, "package-inspection")
+        Directory.CreateDirectory inspectionDirectory |> ignore
+        let assemblyPath = Path.Combine(inspectionDirectory, "PipeL4.dll")
+
+        do
+            use assemblyBytes = File.Create assemblyPath
+            use packageAssembly = assemblyEntry.Open()
+            packageAssembly.CopyTo assemblyBytes
+
+        let loadContext = new AssemblyLoadContext($"PipeL4 package inspection {Guid.NewGuid():N}", isCollectible = true)
+
+        try
+            let assembly = loadContext.LoadFromAssemblyPath assemblyPath
+            let expectedExamples =
+                [| "AsciiUppercase", "AsciiUppercase.fsx", "PipeL4.Examples.AsciiUppercase.fsx"
+                   "BytePatternReplace", "BytePatternReplace.fsx", "PipeL4.Examples.BytePatternReplace.fsx"
+                   "PrefixMode", "PrefixMode.fsx", "PipeL4.Examples.PrefixMode.fsx" |]
+
+            let expectedResourceNames = expectedExamples |> Array.map (fun (_, _, resourceName) -> resourceName) |> Array.sort
+            let actualResourceNames =
+                assembly.GetManifestResourceNames()
+                |> Array.filter (fun name -> name.StartsWith("PipeL4.Examples.", StringComparison.Ordinal))
+                |> Array.sort
+
+            actualResourceNames |> should equal expectedResourceNames
+
+            for _, fileName, resourceName in expectedExamples do
+                match assembly.GetManifestResourceStream resourceName |> Option.ofObj with
+                | None -> failwithf "Packaged assembly is missing resource '%s'." resourceName
+                | Some resource ->
+                    use resource = resource
+                    use content = new MemoryStream()
+                    resource.CopyTo content
+                    let originalPath = Path.Combine(repository, "examples", fileName)
+                    content.ToArray() |> should equal (File.ReadAllBytes originalPath)
+        finally
+            loadContext.Unload()
 
     let private installToolAsync
         (repository: string)
@@ -157,7 +248,7 @@ module InstalledToolIntegrationTests =
                    "--output"
                    packageDirectory |]
 
-            let! packagePath, packageVersion =
+            let! packagePath, identity =
                 task {
                     match Environment.GetEnvironmentVariable("PIPEL4_PACKAGE_PATH") with
                     | null
@@ -175,8 +266,10 @@ module InstalledToolIntegrationTests =
                                 Path.Combine(repository, candidatePath)
                             |> Path.GetFullPath
 
-                        return candidatePath, packageVersion candidatePath
+                        return candidatePath, packageIdentity candidatePath
                 }
+
+            verifyPackagedExamples packagePath repository workspace
 
             let packageSource =
                 Path.GetDirectoryName packagePath
@@ -187,13 +280,13 @@ module InstalledToolIntegrationTests =
             let installArguments =
                 [| "tool"
                    "install"
-                   "PipeL4"
+                   identity.PackageId
                    "--tool-path"
                    installDirectory
                    "--source"
                    packageSource
                    "--version"
-                   packageVersion
+                   identity.Version
                    "--no-cache" |]
 
             use install = ChildProcess.Start("dotnet", installArguments)
@@ -201,13 +294,17 @@ module InstalledToolIntegrationTests =
             cancellationToken.ThrowIfCancellationRequested()
             requireSuccessfulCommand "local PipeL4 tool installation" installResult
 
-            let executableName = if OperatingSystem.IsWindows() then "pipel4.exe" else "pipel4"
+            let executableName =
+                if OperatingSystem.IsWindows() then
+                    identity.ToolCommand + ".exe"
+                else
+                    identity.ToolCommand
             let executablePath = Path.Combine(installDirectory, executableName)
 
             if not (File.Exists executablePath) then
                 failwithf "The installed PipeL4 command was not created at '%s'." executablePath
 
-            return executablePath, packagePath, packageVersion
+            return executablePath, packagePath, identity
         }
 
     let private reservePort () =
@@ -233,6 +330,23 @@ module InstalledToolIntegrationTests =
                 offset <- offset + read
 
             return result
+        }
+
+    let private readToEnd (stream: NetworkStream) (cancellationToken: CancellationToken) =
+        task {
+            use content = new MemoryStream()
+            let buffer = Array.zeroCreate<byte> 4096
+            let mutable completed = false
+
+            while not completed do
+                let! read = stream.ReadAsync(buffer.AsMemory(), cancellationToken)
+
+                if read = 0 then
+                    completed <- true
+                else
+                    content.Write(buffer, 0, read)
+
+            return content.ToArray()
         }
 
     let private expectEndOfStream
@@ -343,6 +457,227 @@ module InstalledToolIntegrationTests =
 
         InvalidOperationException(message, original)
 
+    let private isPathWithin baseDirectory path =
+        let relative = Path.GetRelativePath(baseDirectory, path)
+        let parentPrefix = ".." + string Path.DirectorySeparatorChar
+
+        not (Path.IsPathRooted relative)
+        && relative <> ".."
+        && not (relative.StartsWith(parentPrefix, StringComparison.Ordinal))
+
+    let private runInstalledCommandAsync executablePath workingDirectory arguments =
+        task {
+            use child = ChildProcess.StartInDirectory(executablePath, arguments, workingDirectory)
+            return! child.WaitForExitAsync(TimeSpan.FromSeconds 15.0)
+        }
+
+    let private verifyInstalledExamplesAsync
+        (installedToolPath: string)
+        (repository: string)
+        (workspace: TestWorkspace)
+        =
+        task {
+            let examples =
+                [| "AsciiUppercase", "AsciiUppercase.fsx"
+                   "BytePatternReplace", "BytePatternReplace.fsx"
+                   "PrefixMode", "PrefixMode.fsx" |]
+
+            let! firstList = runInstalledCommandAsync installedToolPath workspace.RootPath [| "examples"; "list" |]
+            let! secondList = runInstalledCommandAsync installedToolPath workspace.RootPath [| "examples"; "list" |]
+
+            requireSuccessfulCommand "installed pipel4 examples list" firstList
+            requireSuccessfulCommand "repeated installed pipel4 examples list" secondList
+            firstList.StandardError |> should equal ""
+            firstList.StandardOutput |> should equal secondList.StandardOutput
+            firstList.StandardOutput.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+            |> should equal (examples |> Array.map fst)
+            firstList.StandardOutput.Contains("TCP listener started", StringComparison.Ordinal)
+            |> should equal false
+
+            let outputDirectory = Path.Combine(workspace.RootPath, "extracted")
+            Directory.CreateDirectory outputDirectory |> ignore
+
+            for index, (name, fileName) in examples |> Array.indexed do
+                let arguments =
+                    if index = 0 then
+                        [| "examples"; "copy"; name |]
+                    else
+                        [| "examples"; "copy"; name; "--output-dir"; outputDirectory |]
+
+                let! result = runInstalledCommandAsync installedToolPath workspace.RootPath arguments
+                requireSuccessfulCommand $"installed pipel4 examples copy {name}" result
+                result.StandardError |> should equal ""
+
+                let destinationDirectory = if index = 0 then workspace.RootPath else outputDirectory
+                let extractedPath = Path.Combine(destinationDirectory, fileName)
+                let canonicalPath = Path.Combine(repository, "examples", fileName)
+                let scriptText = File.ReadAllText extractedPath
+
+                isPathWithin repository extractedPath |> should equal false
+                File.ReadAllBytes extractedPath |> should equal (File.ReadAllBytes canonicalPath)
+                scriptText.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.exists (fun line ->
+                    let trimmed = line.TrimStart()
+                    trimmed.StartsWith("#r", StringComparison.Ordinal)
+                    && trimmed.Contains("PipeL4", StringComparison.OrdinalIgnoreCase))
+                |> should equal false
+
+                Directory.GetFiles(destinationDirectory, $".{fileName}.*.tmp").Length |> should equal 0
+
+            let asciiPath = Path.Combine(workspace.RootPath, "AsciiUppercase.fsx")
+            let existingBytes = [| 0uy; 255uy; 10uy |]
+            File.WriteAllBytes(asciiPath, existingBytes)
+
+            let! conflict =
+                runInstalledCommandAsync installedToolPath workspace.RootPath [| "examples"; "copy"; "AsciiUppercase" |]
+
+            conflict.ExitCode |> should equal 1
+            conflict.OutputCaptureCompleted |> should equal true
+            conflict.StandardOutput |> should equal ""
+            conflict.StandardError.Contains("already exists", StringComparison.OrdinalIgnoreCase) |> should equal true
+            File.ReadAllBytes asciiPath |> should equal existingBytes
+
+            let! forced =
+                runInstalledCommandAsync
+                    installedToolPath
+                    workspace.RootPath
+                    [| "examples"; "copy"; "AsciiUppercase"; "--force" |]
+
+            requireSuccessfulCommand "installed pipel4 examples copy --force" forced
+            let canonicalAscii = Path.Combine(repository, "examples", "AsciiUppercase.fsx")
+            File.ReadAllBytes asciiPath |> should equal (File.ReadAllBytes canonicalAscii)
+            Directory.GetFiles(workspace.RootPath, ".AsciiUppercase.fsx.*.tmp").Length |> should equal 0
+
+            let! unknown =
+                runInstalledCommandAsync installedToolPath workspace.RootPath [| "examples"; "copy"; "MissingExample" |]
+
+            unknown.ExitCode |> should equal 2
+            unknown.OutputCaptureCompleted |> should equal true
+            unknown.StandardError.Contains("Unknown example", StringComparison.OrdinalIgnoreCase) |> should equal true
+        }
+
+    let private runInstalledPluginSessionsAsync
+        (installedToolPath: string)
+        (workingDirectory: string)
+        (scriptPath: string)
+        (sessions: (byte array array * byte array) list)
+        (cancellationToken: CancellationToken)
+        =
+        task {
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let backendPort = (backendListener.LocalEndpoint :?> IPEndPoint).Port
+            let listenPort = reservePort ()
+
+            let arguments =
+                [| "--listen-address"
+                   "127.0.0.1"
+                   "--listen-port"
+                   string listenPort
+                   "--backend-host"
+                   "127.0.0.1"
+                   "--backend-port"
+                   string backendPort
+                   "--client-to-server-plugin"
+                   scriptPath
+                   "--disable-runtime-diagnostics" |]
+
+            use proxy = ChildProcess.StartInDirectory(installedToolPath, arguments, workingDirectory)
+
+            try
+                for chunks, expectedAtBackend in sessions do
+                    use! client = connectEventually proxy listenPort cancellationToken
+                    use! backend = backendListener.AcceptTcpClientAsync(cancellationToken)
+
+                    let clientStream = client.GetStream()
+                    let backendStream = backend.GetStream()
+
+                    for chunk in chunks do
+                        do! clientStream.WriteAsync(chunk.AsMemory(), cancellationToken)
+
+                    client.Client.Shutdown(SocketShutdown.Send)
+
+                    let! receivedAtBackend = readToEnd backendStream cancellationToken
+                    receivedAtBackend |> should equal expectedAtBackend
+
+                    do! backendStream.WriteAsync(receivedAtBackend.AsMemory(), cancellationToken)
+                    backend.Client.Shutdown(SocketShutdown.Send)
+
+                    let! receivedAtClient = readToEnd clientStream cancellationToken
+                    receivedAtClient |> should equal expectedAtBackend
+
+                proxy.HasExited |> should equal false
+                let! shutdownResult = stopToolAsync proxy
+
+                if OperatingSystem.IsLinux() then
+                    shutdownResult.ExitCode |> should equal 0
+
+                shutdownResult.OutputCaptureCompleted |> should equal true
+                shutdownResult.StandardError.Contains("Plugin configuration error:", StringComparison.Ordinal)
+                |> should equal false
+                shutdownResult.StandardError.Contains("FS0039", StringComparison.Ordinal)
+                |> should equal false
+            with original ->
+                let! diagnostics = proxy.CollectFailureDiagnosticsAndCleanupAsync()
+
+                return
+                    raise (
+                        childProcessFailure
+                            $"Installed-tool example '%s{Path.GetFileName scriptPath}' failed after proxy startup."
+                            original
+                            diagnostics
+                    )
+        }
+
+    let private verifyExtractedExampleTrafficAsync
+        (installedToolPath: string)
+        (workspace: TestWorkspace)
+        (cancellationToken: CancellationToken)
+        =
+        task {
+            let outputDirectory = Path.Combine(workspace.RootPath, "extracted")
+            let asciiPath = Path.Combine(workspace.RootPath, "AsciiUppercase.fsx")
+            let patternPath = Path.Combine(outputDirectory, "BytePatternReplace.fsx")
+            let prefixPath = Path.Combine(outputDirectory, "PrefixMode.fsx")
+
+            let asciiInput = [| byte 'h'; byte 'E'; byte 'l'; byte 'L'; byte 'o'; 0uy; 255uy; byte 'z' |]
+            let asciiExpected = [| byte 'H'; byte 'E'; byte 'L'; byte 'L'; byte 'O'; 0uy; 255uy; byte 'Z' |]
+
+            do!
+                runInstalledPluginSessionsAsync
+                    installedToolPath
+                    workspace.RootPath
+                    asciiPath
+                    [ [| asciiInput |], asciiExpected ]
+                    cancellationToken
+
+            let patternChunks =
+                [| Encoding.ASCII.GetBytes "pre HE"
+                   Encoding.ASCII.GetBytes "L"
+                   Encoding.ASCII.GetBytes "LO / HELLO! heLx" |]
+            let patternExpected = Encoding.ASCII.GetBytes "pre WORLD / WORLD! heLx"
+
+            do!
+                runInstalledPluginSessionsAsync
+                    installedToolPath
+                    workspace.RootPath
+                    patternPath
+                    [ patternChunks, patternExpected ]
+                    cancellationToken
+
+            let passThroughInput = Encoding.ASCII.GetBytes "NOPE MASK123"
+
+            do!
+                runInstalledPluginSessionsAsync
+                    installedToolPath
+                    workspace.RootPath
+                    prefixPath
+                    [ [| Encoding.ASCII.GetBytes "MASK123" |], Encoding.ASCII.GetBytes "MASKXXX"
+                      [| passThroughInput |], passThroughInput
+                      [| Encoding.ASCII.GetBytes "MA" |], Encoding.ASCII.GetBytes "MA" ]
+                    cancellationToken
+        }
+
     let private runFailingTrafficAsync
         (installedToolPath: string)
         (scriptPath: string)
@@ -411,19 +746,19 @@ module InstalledToolIntegrationTests =
     [<Fact>]
     let installedToolCompilesScriptAndTransformsLoopbackTcpTraffic () =
         task {
-            use timeout = new CancellationTokenSource(TimeSpan.FromSeconds 60.0)
+            use timeout = new CancellationTokenSource(TimeSpan.FromSeconds 180.0)
             let repository = repositoryRoot ()
             use workspace = new TestWorkspace()
             workspace.WriteScript()
 
-            let! installedToolPath, packagePath, packageVersion =
+            let! installedToolPath, packagePath, identity =
                 installToolAsync repository workspace timeout.Token
 
             File.Exists packagePath |> should equal true
-            installedToolPath.StartsWith(repository, StringComparison.Ordinal)
-            |> should equal false
+            isPathWithin repository installedToolPath |> should equal false
+            isPathWithin workspace.RootPath installedToolPath |> should equal true
 
-            use help = ChildProcess.Start(installedToolPath, [| "--help" |])
+            use help = ChildProcess.StartInDirectory(installedToolPath, [| "--help" |], workspace.RootPath)
             let! helpResult = help.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
             helpResult.ExitCode |> should equal 0
             helpResult.OutputCaptureCompleted |> should equal true
@@ -432,12 +767,12 @@ module InstalledToolIntegrationTests =
             |> should equal true
             helpResult.StandardOutput.Contains("--version", StringComparison.Ordinal) |> should equal true
 
-            use version = ChildProcess.Start(installedToolPath, [| "--version" |])
+            use version = ChildProcess.StartInDirectory(installedToolPath, [| "--version" |], workspace.RootPath)
             let! versionResult = version.WaitForExitAsync(TimeSpan.FromSeconds 10.0)
             versionResult.ExitCode |> should equal 0
             versionResult.OutputCaptureCompleted |> should equal true
             versionResult.StandardError |> should equal ""
-            versionResult.StandardOutput.Trim() |> should equal $"PipeL4 {packageVersion}"
+            versionResult.StandardOutput.Trim() |> should equal $"PipeL4 {identity.Version}"
 
             use backendListener = new TcpListener(loopback, 0)
             backendListener.Start()
@@ -459,7 +794,7 @@ module InstalledToolIntegrationTests =
                    workspace.ScriptPath
                    "--disable-runtime-diagnostics" |]
 
-            use proxy = ChildProcess.Start(installedToolPath, arguments)
+            use proxy = ChildProcess.StartInDirectory(installedToolPath, arguments, workspace.RootPath)
             try
                 use! client = connectEventually proxy listenPort timeout.Token
                 use! backend = backendListener.AcceptTcpClientAsync(timeout.Token)
@@ -505,69 +840,8 @@ module InstalledToolIntegrationTests =
                             diagnostics
                     )
 
-            do!
-                task {
-                    let listenPort = reservePort ()
-                    let examplePath = Path.Combine(repository, "examples", "AsciiUppercase.fsx")
-
-                    let arguments =
-                        [| "--listen-address"
-                           "127.0.0.1"
-                           "--listen-port"
-                           string listenPort
-                           "--backend-host"
-                           "127.0.0.1"
-                           "--backend-port"
-                           string backendPort
-                           "--client-to-server-plugin"
-                           examplePath
-                           "--disable-runtime-diagnostics" |]
-
-                    use exampleProxy = ChildProcess.Start(installedToolPath, arguments)
-
-                    try
-                        use! client = connectEventually exampleProxy listenPort timeout.Token
-                        use! backend = backendListener.AcceptTcpClientAsync(timeout.Token)
-
-                        let clientStream = client.GetStream()
-                        let backendStream = backend.GetStream()
-                        let payload = Encoding.UTF8.GetBytes("Hello, PipeL4!\n")
-                        let backendReceive = readExactly backendStream payload.Length timeout.Token
-
-                        do! clientStream.WriteAsync(payload, timeout.Token)
-                        client.Client.Shutdown(SocketShutdown.Send)
-
-                        let! receivedAtBackend = backendReceive
-                        receivedAtBackend
-                        |> should equal (Encoding.UTF8.GetBytes("HELLO, PIPEL4!\n"))
-                        do! expectEndOfStream backendStream timeout.Token
-
-                        let response = Encoding.UTF8.GetBytes("backend reply\n")
-                        let clientReceive = readExactly clientStream response.Length timeout.Token
-                        do! backendStream.WriteAsync(response, timeout.Token)
-                        backend.Client.Shutdown(SocketShutdown.Send)
-
-                        let! receivedAtClient = clientReceive
-                        receivedAtClient |> should equal response
-                        do! expectEndOfStream clientStream timeout.Token
-
-                        let! shutdownResult = stopToolAsync exampleProxy
-
-                        if OperatingSystem.IsLinux() then
-                            shutdownResult.ExitCode |> should equal 0
-
-                        shutdownResult.OutputCaptureCompleted |> should equal true
-                    with original ->
-                        let! diagnostics = exampleProxy.CollectFailureDiagnosticsAndCleanupAsync()
-
-                        return
-                            raise (
-                                childProcessFailure
-                                    "Installed-tool AsciiUppercase example scenario failed."
-                                    original
-                                    diagnostics
-                            )
-                }
+            do! verifyInstalledExamplesAsync installedToolPath repository workspace
+            do! verifyExtractedExampleTrafficAsync installedToolPath workspace timeout.Token
         }
 
     [<Fact>]

@@ -1,5 +1,3 @@
-module AsciiUppercase
-
 open System.Threading.Tasks
 open PipeL4.Plugins
 

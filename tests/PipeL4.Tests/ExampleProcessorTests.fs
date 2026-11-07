@@ -33,6 +33,14 @@ module ExampleProcessorTests =
 
         member _.Compiler = compiler
 
+        member _.CopyExampleToExternalDirectory() =
+            let externalDirectory = Path.Combine(rootPath, "external-example")
+            Directory.CreateDirectory externalDirectory |> ignore
+
+            let externalPath = Path.Combine(externalDirectory, "AsciiUppercase.fsx")
+            File.Copy(examplePath, externalPath)
+            externalPath
+
         interface IDisposable with
             member _.Dispose() =
                 if Directory.Exists rootPath then
@@ -102,13 +110,18 @@ module ExampleProcessorTests =
         | Ok configuration -> configuration
         | Error error -> failwithf "Test configuration was invalid: %s" error
 
-    let private loadDefinition (workspace: TestWorkspace) =
+    let private loadDefinition
+        (workspace: TestWorkspace)
+        scriptPath
+        (onCompile: string -> unit)
+        =
         task {
-            let configuration = createConfiguration examplePath
+            let configuration = createConfiguration scriptPath
 
             let! definition =
                 ScriptPipelineLoader.loadWithCompilerAsync
                     (fun path cancellationToken ->
+                        onCompile path
                         workspace.Compiler.CompileAndLoadAsync(path, cancellationToken))
                     configuration.ClientToServerPluginPaths
                     configuration.ServerToClientPluginPaths
@@ -117,10 +130,16 @@ module ExampleProcessorTests =
             return definition
         }
 
-    let private runPipeline createStages chunks =
+    let private runPipelineInWorkspace
+        (workspace: TestWorkspace)
+        scriptPath
+        createStages
+        chunks
+        (onCompile: string -> unit)
+        (expectedAfterPushes: byte array array option)
+        =
         task {
-            use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition workspace scriptPath onCompile
             let state = ConnectionState()
             let! pipelines = definition.CreateProcessorPipelinesAsync(state).AsTask()
             let pool = new TrackingPool()
@@ -136,8 +155,16 @@ module ExampleProcessorTests =
                 chunks
                 |> Array.map (fun bytes -> new TrackingOwner(bytes))
 
-            for owner in owners do
+            match expectedAfterPushes with
+            | Some expected -> expected.Length |> should equal owners.Length
+            | None -> ()
+
+            for index, owner in Array.indexed owners do
                 do! pipeline.PushAsync(owner, owner.Buffer.Length, CancellationToken.None)
+
+                match expectedAfterPushes with
+                | Some expected -> sink.Bytes |> should equal expected[index]
+                | None -> ()
 
             do! pipeline.CompleteAsync(CancellationToken.None)
             let metrics = pipeline.GetStageMetricsSnapshot()
@@ -145,6 +172,26 @@ module ExampleProcessorTests =
             do! (state :> IAsyncDisposable).DisposeAsync().AsTask()
 
             return sink, pool, owners, metrics
+        }
+
+    let private runPipeline createStages chunks =
+        task {
+            use workspace = new TestWorkspace()
+            return! runPipelineInWorkspace workspace examplePath createStages chunks ignore None
+        }
+
+    let private runPipelineWithPushAssertions createStages chunks expectedAfterPushes =
+        task {
+            use workspace = new TestWorkspace()
+
+            return!
+                runPipelineInWorkspace
+                    workspace
+                    examplePath
+                    createStages
+                    chunks
+                    ignore
+                    (Some expectedAfterPushes)
         }
 
     let private ascii (text: string) =
@@ -193,27 +240,89 @@ module ExampleProcessorTests =
                       ValueTask()
                   | _ -> ValueTask() }
 
+    let private observeCompletion
+        (completionFlags: ResizeArray<bool>)
+        (processor: PipeL4.Core.IByteStreamProcessor)
+        =
+        { new PipeL4.Core.IByteStreamProcessor with
+            member _.ProcessAsync(input, output, cancellationToken) =
+                completionFlags.Add input.IsCompleted
+                processor.ProcessAsync(input, output, cancellationToken)
+
+          interface IAsyncDisposable with
+              member _.DisposeAsync() =
+                  match processor with
+                  | :? IAsyncDisposable as disposable -> disposable.DisposeAsync()
+                  | :? IDisposable as disposable ->
+                      disposable.Dispose()
+                      ValueTask()
+                  | _ -> ValueTask() }
+
     [<Fact>]
     let ``repository example compiles and transforms real segmented input`` () =
         task {
-            let! sink, pool, owners, _ =
-                runPipeline
+            let expectedAfterPushes =
+                [| [| 0x41uy; 0x5Auy; 0x2Duy |]
+                   [| 0x41uy; 0x5Auy; 0x2Duy; 0x42uy; 0x31uy; 0x80uy |]
+                   [| 0x41uy; 0x5Auy; 0x2Duy; 0x42uy; 0x31uy; 0x80uy; 0x5Auy; 0x21uy |] |]
+
+            let! sink, pool, owners, metrics =
+                runPipelineWithPushAssertions
                     id
                     [| ascii "aZ-"
                        [| 0x62uy; 0x31uy; 0x80uy |]
                        ascii "z!" |]
+                    expectedAfterPushes
 
             sink.Bytes |> should equal [| 0x41uy; 0x5Auy; 0x2Duy; 0x42uy; 0x31uy; 0x80uy; 0x5Auy; 0x21uy |]
             sink.CompletionCount |> should equal 1
+            metrics |> List.map _.InvocationCount |> should equal [ 4L ]
+            metrics |> List.map _.InputBytes |> should equal [ 8L ]
+            metrics |> List.map _.GeneratedOutputBytes |> should equal [ 8L ]
             owners |> Array.forall (fun owner -> owner.DisposeCount = 1) |> should equal true
             pool.Owners |> Seq.forall (fun owner -> owner.DisposeCount = 1) |> should equal true
         }
 
     [<Fact>]
+    let ``canonical example loads from an external directory without a module or script reference`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let externalPath = workspace.CopyExampleToExternalDirectory()
+            let source = File.ReadAllText externalPath
+            let compilerPaths = ResizeArray<string>()
+
+            source.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+            |> Array.exists (fun line -> line.TrimStart().StartsWith("module ", StringComparison.Ordinal))
+            |> should equal false
+
+            source.Contains("#r", StringComparison.Ordinal) |> should equal false
+
+            let! sink, _, owners, _ =
+                runPipelineInWorkspace
+                    workspace
+                    externalPath
+                    id
+                    [| ascii "a1"; [| 0x62uy; 0x80uy |]; ascii "z!" |]
+                    (fun path -> compilerPaths.Add path)
+                    None
+
+            compilerPaths |> Seq.toArray |> should equal [| Path.GetFullPath externalPath |]
+            sink.Bytes |> should equal [| 0x41uy; 0x31uy; 0x42uy; 0x80uy; 0x5Auy; 0x21uy |]
+            sink.CompletionCount |> should equal 1
+            owners |> Array.forall (fun owner -> owner.DisposeCount = 1) |> should equal true
+        }
+
+    [<Fact>]
     let ``repository example handles empty input and EOF completion`` () =
         task {
-            let! sink, pool, owners, _ = runPipeline id Array.empty
+            let completionFlags = ResizeArray<bool>()
 
+            let! sink, pool, owners, _ =
+                runPipeline
+                    (fun configured -> [| observeCompletion completionFlags configured[0] |])
+                    Array.empty
+
+            completionFlags |> Seq.toArray |> should equal [| true |]
             sink.Bytes |> should be Empty
             sink.CompletionCount |> should equal 1
             owners |> should be Empty
