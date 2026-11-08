@@ -3281,7 +3281,9 @@ type Processor() =
                                                 && snapshot.ClientToBackend.Stages[0].CurrentRetainedBytes = 0L
                                                 && snapshot.ClientToBackend.Stages[0].InputBytes = 6L
                                                 && snapshot.ClientToBackend.Stages[0].InputBackedOutputBytes = 6L
-                                                && snapshot.ClientToBackend.Stages[0].GeneratedOutputBytes = 3L)
+                                                && snapshot.ClientToBackend.Stages[0].GeneratedOutputBytes = 3L
+                                                && snapshot.ClientToBackend.TerminalOutcome = "completed"
+                                                && snapshot.BackendToClient.TerminalOutcome = "completed")
                                             timeout.Token
 
                                     snapshots.Add(final)
@@ -3299,6 +3301,8 @@ type Processor() =
                 snapshot.ClientToBackend.InputBackedOutputBytes |> should equal 6L
                 snapshot.ClientToBackend.GeneratedOutputBytes |> should equal 3L
                 snapshot.ClientToBackend.CurrentRetainedBytes |> should equal 0L
+                snapshot.ClientToBackend.TerminalOutcome |> should equal "completed"
+                snapshot.BackendToClient.TerminalOutcome |> should equal "completed"
                 snapshot.CurrentPhysicalBufferCapacityBytes |> should equal 0L
         }
 
