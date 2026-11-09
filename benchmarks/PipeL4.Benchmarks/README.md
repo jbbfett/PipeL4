@@ -45,6 +45,12 @@ Payloads are 64 B, 4 KiB, and 1 MiB. Reads accumulate the expected byte count an
 that TCP preserves write boundaries. `Logical MiB/s` counts the application payload once in each
 direction; it does not count both TCP legs of a proxied route separately.
 
+Historical SHA values identify the source revisions actually measured. Some are no longer reachable
+from rewritten public master history. A rewritten master commit with the same Git tree can reproduce
+the same tracked source state, but identical tracked content does not mean the original measurement
+ran under the rewritten SHA. Historical side-branch revisions without equivalent master commits
+cannot be checked out from a fresh master-only clone.
+
 Run the full suite in Release mode:
 
 ```sh
@@ -223,12 +229,20 @@ four-stage route reported about 5.13 KiB after versus 5.8 KiB before for the sma
 was not used as a latency attribution because the short run was noisy. The direct allocation
 benchmark above is the authoritative allocation comparison.
 
-This report compares the unchanged forwarding suite at the pre-observability merge base `b6fc7bf`
-with completed revision `a96f504`. The baseline was checked out in a clean detached temporary
+This report compares the unchanged forwarding suite at the pre-observability merge base
+`b6fc7bfb307e769f07d6e31357b01f53dab32b3f` (abbreviated `b6fc7bf` in the historical evidence)
+with completed revision `a96f504286efd1e5cfbd7eadec53414d29601b6e` (abbreviated `a96f504`). The
+baseline was checked out in a clean detached temporary
 clone because the container's `.git` directory does not permit creating worktree metadata. Both
 runs used the same host, Release configuration, SDK/runtime, BenchmarkDotNet configuration, routes,
 and payloads, and were run sequentially. The benchmark project source for
 `RawTcpForwardingBenchmarks` is byte-for-byte unchanged between the two revisions.
+
+Rewritten master commit `50fcd7ca8b434b1c13b839340c5fc5b1a9117421` has the same Git tree as the
+measured baseline and supplies only its equivalent tracked source state. The paired historical
+revision `a96f504286efd1e5cfbd7eadec53414d29601b6e` is not reachable from rewritten master and has no
+tree-equivalent master commit, so the original two-revision comparison cannot be fully reproduced
+from a fresh master-only clone.
 
 Environment: Ubuntu 24.04.5 LTS; Intel Core i5-8365U, 4 physical/8 logical cores; .NET SDK
 10.0.112; .NET 10.0.12 x64 RyuJIT; BenchmarkDotNet 0.15.8; concurrent workstation GC. The host
@@ -236,7 +250,9 @@ reported a permission error when BenchmarkDotNet attempted to raise process prio
 Release build, and the all-case dry job completed before the measured runs. Generated reports stay in
 ignored `BenchmarkDotNet.Artifacts/` directories.
 
-The forwarding command was run once at `b6fc7bf` and once for revision `a96f504`:
+The historical forwarding measurements ran in detached checkouts at the original baseline and
+paired historical revision described above. The following restore, build, and benchmark invocations
+were used for those measurements:
 
 ```sh
 dotnet restore PipeL4.sln /p:PaketDisableGlobalRestore=true
@@ -408,12 +424,16 @@ connection-wide, and production entry points retain unbounded compatibility limi
 
 ### Commands and limitations
 
-The verification commands were:
+The original verification commands ran from a detached checkout at
+`b6fc7bfb307e769f07d6e31357b01f53dab32b3f`. The sequence below is for present-day reproduction; its
+checkout line uses rewritten commit `50fcd7ca8b434b1c13b839340c5fc5b1a9117421` for the equivalent
+tracked baseline source state. The completion counts below are historical outcomes, not results
+from running the rewritten commit.
 
 ```sh
 comparison_root=$(mktemp -d /tmp/pipel4-observability-XXXXXX)
 git clone --no-local . "$comparison_root"
-git -C "$comparison_root" checkout --detach b6fc7bf
+git -C "$comparison_root" checkout --detach 50fcd7ca8b434b1c13b839340c5fc5b1a9117421
 cd "$comparison_root"
 dotnet restore PipeL4.sln /p:PaketDisableGlobalRestore=true
 dotnet build PipeL4.sln -c Release --no-restore
@@ -428,12 +448,12 @@ dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- --fil
 git diff --check
 ```
 
-The dry job discovered and completed all 49 cases (40 forwarding/state cases plus 9 snapshot cases).
-The forwarding command completed all 33 cases in each revision. The snapshot command completed all
-9 stage/direction/connection cases. BenchmarkDotNet could not raise process priority on this host;
-loopback scheduling noise and the 1 MiB multimodal rows limit causal precision. The benchmark does
-not expose copied-byte ratio, logical buffered bytes, or physical reserved memory, so those values
-are not inferred from throughput or managed allocation.
+In the historical verification, the dry job discovered and completed all 49 cases (40 forwarding/state
+cases plus 9 snapshot cases). The forwarding runs completed all 33 cases at each revision. The
+snapshot command completed all 9 stage/direction/connection cases. BenchmarkDotNet could not raise
+process priority on this host; loopback scheduling noise and the 1 MiB multimodal rows limit causal
+precision. The benchmark does not expose copied-byte ratio, logical buffered bytes, or physical
+reserved memory, so those values are not inferred from throughput or managed allocation.
 
 The review found no correctness or ownership defect, global or
 cross-direction serialization, deadlock, lifetime leak, or accidental observability work that
@@ -935,7 +955,11 @@ The minimal correction was to run each historical command from its own checkout 
 solution restore (`-m:1`) was also required: parallel solution restore exited 1 with no MSB/NETSDK
 error, while the same historical solution restored successfully with `-m:1`. No production
 semantics or historical source files were changed. With that correction, both revisions built and
-the matched three-payload `InternalProcessorPipeline` full jobs completed.
+the matched three-payload `InternalProcessorPipeline` full jobs completed. This historical pair is
+not directly runnable from a fresh master-only clone: `82e5eb610f444bb3205b5b28cc50f6283778a244`
+has the rewritten master equivalent `20d63615460ba05405762dbf447ad20acb3de875`, while
+`8aae7248b3b84a7faaa92ee9dd83d8f9401dbef5` has no equivalent on rewritten master. The results below
+retain the original measured SHA attribution.
 
 The valid historical subset is:
 
@@ -950,28 +974,17 @@ row is high-variance/skewed; a `multimodal` label is reserved for reports where 
 actually reported multiple modes. No p95 was emitted; the logs include medians but not p95 for
 these rows. Current-binary A/B conclusions do not depend on this historical subset.
 
-The isolated historical sequence was:
+The equivalent baseline tracked source state can be checked out separately from a fresh master-only
+clone with:
 
 ```sh
-pre_root=$(mktemp -d /tmp/pipel4-history-pre-XXXXXX)
-accepted_root=$(mktemp -d /tmp/pipel4-history-accepted-XXXXXX)
-git clone --no-local . "$pre_root"
-git clone --no-local . "$accepted_root"
-git -C "$pre_root" checkout --detach 82e5eb6
-git -C "$accepted_root" checkout --detach 8aae724
-
-( cd "$pre_root"
-  dotnet restore PipeL4.sln /p:PaketDisableGlobalRestore=true -m:1
-  dotnet build PipeL4.sln -c Release --no-restore -m:1
-  dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
-    --filter '*RawTcpForwardingBenchmarks.InternalProcessorPipeline*' )
-
-( cd "$accepted_root"
-  dotnet restore PipeL4.sln /p:PaketDisableGlobalRestore=true -m:1
-  dotnet build PipeL4.sln -c Release --no-restore -m:1
-  dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
-    --filter '*RawTcpForwardingBenchmarks.InternalProcessorPipeline*' )
+baseline_root=$(mktemp -d /tmp/pipel4-history-baseline-XXXXXX)
+git clone --no-local . "$baseline_root"
+git -C "$baseline_root" checkout --detach 20d63615460ba05405762dbf447ad20acb3de875
 ```
+
+This checkout provides the baseline's equivalent tracked source state only; it cannot reproduce the
+historical two-revision comparison. Any benchmark run from it now would be a new measurement.
 
 ### Bounded versus unbounded forwarding
 

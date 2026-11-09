@@ -16,7 +16,14 @@ The assessment covers Ubuntu 24.04 x64 primarily, .NET 10, TCP byte-stream forwa
 | Package | PipeL4.0.1.0-preview.1.nupkg; PackageId PipeL4; version 0.1.0-preview.1; command pipel4; target net10.0 |
 | SHA-256 | e93186bc53a35294456e522e52c7fddd90e63a59ddc628d7934038b8818e9b1e |
 
-The hash matches the ignored local package at artifacts/release-candidate/. Its source-revision.txt records the reported source revision above; this is local provenance, not a hosted CI attestation. This report may be updated independently of the package; documentation edits after the recorded source revision are not part of that package. The package was not rebuilt for the installation checks.
+The hash matches the ignored local package at artifacts/release-candidate/. Its source-revision.txt
+records the reported source revision above; this is local provenance, not a hosted CI attestation.
+Revision `4b5e593d5e2c38b7cda9e081ccef791aeccea845` is the source revision recorded for this locally
+verified pre-publication package. It is historical artifact provenance and is not expected to be
+reachable from a master-only public clone. This report may be updated independently of the package;
+documentation edits after the recorded source revision are not part of that package. The package
+was not rebuilt for the installation checks. The final prerelease package will be rebuilt and
+verified separately against its actual source revision.
 
 | Stage | Status and evidence boundary |
 | --- | --- |
