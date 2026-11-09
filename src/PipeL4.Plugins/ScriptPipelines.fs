@@ -376,6 +376,8 @@ module internal ScriptTcpForwarder =
                     logger
                     cancellationToken
 
+            logger.LogInformation("Configured scripts loaded before listener startup")
+
             if definition.HasPlugins then
                 return!
                     TcpForwarder.runWithOptionalProcessorPipelineFactoryAsync

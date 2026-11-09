@@ -95,7 +95,8 @@ module CliAcceptanceTests =
     type ChildProcess private (
         childProcess: Process,
         standardOutput: ProcessOutputCapture,
-        standardError: ProcessOutputCapture
+        standardError: ProcessOutputCapture,
+        startedAtTimestamp: int64
     ) =
         let mutable outputReadCancelled = false
         let mutable disposed = false
@@ -199,10 +200,16 @@ module CliAcceptanceTests =
 
         member _.Id = childProcess.Id
         member _.HasExited = childProcess.HasExited
+        member _.ElapsedSinceLaunch = Stopwatch.GetElapsedTime(startedAtTimestamp)
         member _.HasListenerStartedRecord(endpoint: string) =
             standardOutput.HasJsonStringProperties(
                 [ "ListenEndpoint", endpoint
                   "{OriginalFormat}", "TCP listener started on {ListenEndpoint} with backend {BackendEndpoint}" ]
+            )
+        member _.HasScriptsLoadedRecord =
+            standardOutput.HasJsonStringProperty(
+                "{OriginalFormat}",
+                "Configured scripts loaded before listener startup"
             )
         member _.CapturedStandardOutput = standardOutput.Text
         member _.CapturedStandardError = standardError.Text
@@ -318,6 +325,7 @@ module CliAcceptanceTests =
             let mutable outputReadAttempted = false
             let mutable errorReadAttempted = false
 
+            let startedAtTimestamp = Stopwatch.GetTimestamp()
             let started =
                 try
                     childProcess.Start()
@@ -340,7 +348,7 @@ module CliAcceptanceTests =
                 beginOutputRead childProcess
                 errorReadAttempted <- true
                 beginErrorRead childProcess
-                new ChildProcess(childProcess, standardOutput, standardError)
+                new ChildProcess(childProcess, standardOutput, standardError, startedAtTimestamp)
             with setupError ->
                 let attemptCleanup cleanup =
                     try
@@ -678,140 +686,172 @@ module CliAcceptanceTests =
     let private fsharpStringLiteral (value: string) =
         "\"" + value.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""
 
-    let private waitForListenerAsync
+    let private waitForListenerWithDeadlinesAsync
         (child: ChildProcess)
         (listenEndpoint: IPEndPoint)
-        (timeout: TimeSpan)
+        (scriptsConfigured: bool)
+        (startupTimeout: TimeSpan)
+        (readinessTimeout: TimeSpan)
         =
         task {
-            let stopwatch = Stopwatch.StartNew()
-            let mutable earlyExit: ProcessResult option = None
+            let mutable readinessClock =
+                if scriptsConfigured then None else Some(Stopwatch.StartNew())
             let mutable lastConnectionError: string option = None
             let expectedEndpoint = listenEndpoint.ToString()
             let mutable startupRecordObserved = false
 
-            let captureExit () =
+            let failFor reason timedOut : Task<unit> =
                 task {
-                    let! result = child.WaitForExitAsync(TimeSpan.FromSeconds 5.0)
-                    earlyExit <- Some result
+                    let! diagnostics = child.CollectFailureDiagnosticsAndCleanupAsync()
+                    let exitCode =
+                        diagnostics.NaturalExitCode
+                        |> Option.map string
+                        |> Option.defaultValue "unavailable"
+                    let naturalExit = diagnostics.NaturalExitCode.IsSome
+                    let failureReason =
+                        if timedOut && naturalExit then
+                            "PipeL4 exited during startup after the deadline check."
+                        else
+                            reason
+
+                    let details =
+                        String.concat
+                            Environment.NewLine
+                            ([ failureReason
+                               $"Natural exit code: {exitCode}; forced termination requested: {diagnostics.ForcedTerminationRequested}; process exited: {diagnostics.ProcessExited}; output capture completed: {diagnostics.OutputCaptureCompleted}."
+                               "Child stdout:"
+                               diagnostics.StandardOutput
+                               "Child stderr:"
+                               diagnostics.StandardError ]
+                             @ diagnostics.SecondaryErrors)
+
+                    if timedOut && not naturalExit then
+                        return raise (TimeoutException(details))
+                    else
+                        return raise (InvalidOperationException(details))
                 }
 
-            let processExitError (result: ProcessResult) =
-                let details =
-                    String.concat
-                        Environment.NewLine
-                        [ $"PipeL4 exited during listener readiness (code {result.ExitCode})."
-                          result.StandardOutput
-                          result.StandardError ]
+            let pause () =
+                let startupRemaining = startupTimeout - child.ElapsedSinceLaunch
+                let readinessRemaining =
+                    readinessClock
+                    |> Option.map (fun clock -> readinessTimeout - clock.Elapsed)
+                    |> Option.defaultValue startupRemaining
+                let delay = min 25.0 (min startupRemaining.TotalMilliseconds readinessRemaining.TotalMilliseconds)
 
-                InvalidOperationException(details)
+                if delay > 0.0 then
+                    Task.Delay(TimeSpan.FromMilliseconds delay)
+                else
+                    Task.CompletedTask
+
+            // Script loading has its own overall bound. The listener deadline begins
+            // only after the child reports that every configured script was loaded.
+            while readinessClock.IsNone && not child.HasExited && child.ElapsedSinceLaunch < startupTimeout do
+                if child.HasScriptsLoadedRecord then
+                    readinessClock <- Some(Stopwatch.StartNew())
+                else
+                    do! pause ()
+
+            if child.HasExited then
+                do!
+                    failFor "PipeL4 exited before listener readiness during script loading." false
+            elif readinessClock.IsNone then
+                do!
+                    failFor $"PipeL4 script loading exceeded the {startupTimeout} startup bound." true
+
+            let readinessClock = readinessClock.Value
 
             // Wait for the child-owned structured log record before opening any socket.
-            while not startupRecordObserved && earlyExit.IsNone && stopwatch.Elapsed < timeout do
-                if child.HasExited then
-                    do! captureExit ()
+            while
+                not startupRecordObserved
+                && not child.HasExited
+                && child.ElapsedSinceLaunch < startupTimeout
+                && readinessClock.Elapsed < readinessTimeout do
+                startupRecordObserved <- child.HasListenerStartedRecord(expectedEndpoint)
+
+                if not startupRecordObserved then
+                    do! pause ()
+
+            if child.HasExited then
+                do! failFor "PipeL4 exited before listener readiness." false
+            elif not startupRecordObserved then
+                if child.ElapsedSinceLaunch >= startupTimeout then
+                    do! failFor $"PipeL4 startup exceeded the {startupTimeout} overall bound." true
                 else
-                    startupRecordObserved <-
-                        child.HasListenerStartedRecord(expectedEndpoint)
+                    do!
+                        failFor
+                            $"PipeL4 did not report listener {expectedEndpoint} within {readinessTimeout} after script loading."
+                            true
 
-                    if not startupRecordObserved then
-                        let remainingMilliseconds = (timeout - stopwatch.Elapsed).TotalMilliseconds
+            let mutable connection: TcpClient option = None
 
-                        if remainingMilliseconds > 0.0 then
-                            do!
-                                Task.Delay(
-                                    TimeSpan.FromMilliseconds(min 25.0 remainingMilliseconds)
-                                )
+            while
+                connection.IsNone
+                && not child.HasExited
+                && child.ElapsedSinceLaunch < startupTimeout
+                && readinessClock.Elapsed < readinessTimeout do
+                let candidate = new TcpClient(AddressFamily.InterNetwork)
+                let remainingMilliseconds =
+                    min
+                        (startupTimeout - child.ElapsedSinceLaunch).TotalMilliseconds
+                        (readinessTimeout - readinessClock.Elapsed).TotalMilliseconds
 
-            if earlyExit.IsNone && child.HasExited then
-                do! captureExit ()
+                try
+                    if remainingMilliseconds <= 0.0 then
+                        raise (OperationCanceledException("Readiness deadline expired."))
 
-            match earlyExit with
-            | Some result -> return raise (processExitError result)
-            | None when not startupRecordObserved ->
-                let details =
-                    String.concat
-                        Environment.NewLine
-                        [ $"PipeL4 did not report listener {expectedEndpoint} within {timeout}."
-                          child.CapturedStandardOutput
-                          child.CapturedStandardError ]
-
-                return raise (TimeoutException(details))
-            | None ->
-                let mutable connection: TcpClient option = None
-
-                while connection.IsNone && earlyExit.IsNone && stopwatch.Elapsed < timeout do
-                    if child.HasExited then
-                        do! captureExit ()
-                    else
-                        let candidate = new TcpClient(AddressFamily.InterNetwork)
-                        let remainingMilliseconds = (timeout - stopwatch.Elapsed).TotalMilliseconds
-
-                        try
-                            if remainingMilliseconds <= 0.0 then
-                                raise (OperationCanceledException("Readiness deadline expired."))
-
-                            use connectTimeout =
-                                new CancellationTokenSource(
-                                    TimeSpan.FromMilliseconds(min 300.0 remainingMilliseconds)
-                                )
-
-                            do!
-                                candidate.ConnectAsync(
-                                    listenEndpoint.Address,
-                                    listenEndpoint.Port,
-                                    connectTimeout.Token
-                                )
-
-                            if child.HasExited then
-                                candidate.Dispose()
-                                do! captureExit ()
-                            else
-                                connection <- Some candidate
-                        with
-                        | :? SocketException as error ->
-                            candidate.Dispose()
-                            lastConnectionError <- Some error.Message
-                        | :? OperationCanceledException as error ->
-                            candidate.Dispose()
-                            lastConnectionError <- Some error.Message
-
-                        if connection.IsNone && earlyExit.IsNone then
-                            let remainingMilliseconds = (timeout - stopwatch.Elapsed).TotalMilliseconds
-
-                            if remainingMilliseconds > 0.0 then
-                                do!
-                                    Task.Delay(
-                                        TimeSpan.FromMilliseconds(min 25.0 remainingMilliseconds)
-                                    )
-
-                if earlyExit.IsNone && child.HasExited then
-                    do! captureExit ()
-
-                match earlyExit, connection with
-                | Some result, Some client ->
-                    client.Dispose()
-                    return raise (processExitError result)
-                | Some result, None ->
-                    return raise (processExitError result)
-                | None, Some client -> return client
-                | None, None ->
-                    let detail = lastConnectionError |> Option.defaultValue "no connection attempt completed"
-                    let readinessDiagnostic =
-                        $"Child confirmed listener {expectedEndpoint}; TCP readiness timed out after {timeout}. "
-                        + $"Last connection error: {detail}."
-
-                    return
-                        raise (
-                            TimeoutException(
-                                String.concat
-                                    Environment.NewLine
-                                    [ readinessDiagnostic
-                                      child.CapturedStandardOutput
-                                      child.CapturedStandardError ]
-                            )
+                    use connectTimeout =
+                        new CancellationTokenSource(
+                            TimeSpan.FromMilliseconds(min 300.0 remainingMilliseconds)
                         )
+
+                    do!
+                        candidate.ConnectAsync(
+                            listenEndpoint.Address,
+                            listenEndpoint.Port,
+                            connectTimeout.Token
+                        )
+
+                    if child.HasExited then
+                        candidate.Dispose()
+                    else
+                        connection <- Some candidate
+                with
+                | :? SocketException as error ->
+                    candidate.Dispose()
+                    lastConnectionError <- Some error.Message
+                | :? OperationCanceledException as error ->
+                    candidate.Dispose()
+                    lastConnectionError <- Some error.Message
+
+                if connection.IsNone && not child.HasExited then
+                    do! pause ()
+
+            if child.HasExited then
+                connection |> Option.iter (fun client -> client.Dispose())
+                do! failFor "PipeL4 exited before TCP listener readiness." false
+
+            match connection with
+            | Some client -> return client
+            | None ->
+                let detail = lastConnectionError |> Option.defaultValue "no connection attempt completed"
+                let reason =
+                    if child.ElapsedSinceLaunch >= startupTimeout then
+                        $"PipeL4 startup exceeded the {startupTimeout} overall bound."
+                    else
+                        $"Child confirmed listener {expectedEndpoint}; TCP readiness timed out after {readinessTimeout}. Last connection error: {detail}."
+
+                do! failFor reason true
+                return Unchecked.defaultof<TcpClient>
         }
+
+    let private waitForListenerAsync child listenEndpoint readinessTimeout =
+        waitForListenerWithDeadlinesAsync
+            child
+            listenEndpoint
+            true
+            (TimeSpan.FromSeconds 30.0)
+            readinessTimeout
 
     let private connectToListenerAsync port (cancellationToken: CancellationToken) =
         task {
@@ -1324,14 +1364,171 @@ module CliAcceptanceTests =
 
             match readinessFailure with
             | Some message ->
-                message.Contains("code 1", StringComparison.Ordinal) |> should equal true
+                message.Contains("Natural exit code: 1", StringComparison.Ordinal) |> should equal true
+                message.Contains("forced termination requested: False", StringComparison.Ordinal)
+                |> should equal true
+                message.Contains("process exited: True", StringComparison.Ordinal) |> should equal true
                 message.Contains("Runtime error:", StringComparison.Ordinal) |> should equal true
             | None ->
                 failwith "A foreign listener was mistaken for the PipeL4 child listener."
 
-            child.HasExited |> should equal true
             foreignListener.Stop()
             do! expectConnectionFailure listenEndpoint.Port timeout.Token
+        }
+
+    [<Fact>]
+    let ``listener readiness deadline begins after delayed script loading`` () =
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "This test uses a Linux FIFO to delay source loading.")
+
+        task {
+            use workspace = new TestWorkspace()
+            use backendListener = reserveListenerPort ()
+            let listenPort = reservePort ()
+            let backendPort = (backendListener.LocalEndpoint :?> IPEndPoint).Port
+            let scriptPath = workspace.GetPath("DelayedLoad.fsx")
+            UnixFifo.create scriptPath
+
+            use child =
+                ChildProcess.Start(
+                    applicationHostPath (),
+                    Array.concat
+                        [| requiredArguments listenPort backendPort
+                           [| "--client-to-server-plugin"; scriptPath |] |]
+                )
+
+            let endpoint = IPEndPoint(IPAddress.Loopback, listenPort)
+            let readiness =
+                waitForListenerWithDeadlinesAsync
+                    child
+                    endpoint
+                    true
+                    (TimeSpan.FromSeconds 30.0)
+                    (TimeSpan.FromSeconds 1.0)
+
+            let! writerDescriptor =
+                UnixFifo.openWriterWhenReaderIsReadyAsync
+                    child
+                    scriptPath
+                    (TimeSpan.FromSeconds 10.0)
+
+            try
+                // Keep the first read blocked past the old listener deadline.
+                do! Task.Delay(TimeSpan.FromMilliseconds 1250.0)
+                let source = transformSource "DelayedLoad" "generated[index]"
+                File.WriteAllText(scriptPath, source)
+                // The compiler opens the path again, so provide a regular file
+                // for its second read while the first FIFO handle is still open.
+                File.Delete(scriptPath)
+                File.WriteAllText(scriptPath, source)
+            finally
+                UnixFifo.closeWriter writerDescriptor
+
+            use! client = readiness
+            child.HasScriptsLoadedRecord |> should equal true
+            child.HasListenerStartedRecord(endpoint.ToString()) |> should equal true
+        }
+
+    [<Fact>]
+    let ``listener readiness still times out after script loading`` () =
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "This test uses /bin/sh as a controlled child.")
+
+        task {
+            let marker =
+                """{"State":{"{OriginalFormat}":"Configured scripts loaded before listener startup"}}"""
+
+            use child =
+                ChildProcess.Start(
+                    "/bin/sh",
+                    [| "-c"; "printf '%s\\n' " + shellQuote marker + "; exec /bin/sleep 60" |]
+                )
+
+            let endpoint = IPEndPoint(IPAddress.Loopback, reservePort ())
+
+            let! failure =
+                task {
+                    try
+                        use! _ =
+                            waitForListenerWithDeadlinesAsync
+                                child
+                                endpoint
+                                true
+                                (TimeSpan.FromSeconds 5.0)
+                                (TimeSpan.FromMilliseconds 300.0)
+
+                        return None
+                    with :? TimeoutException as error ->
+                        return Some error.Message
+                }
+
+            let message = failure |> Option.defaultWith (fun () -> failwith "Readiness did not time out.")
+            message.Contains("within 00:00:00.3000000 after script loading", StringComparison.Ordinal)
+            |> should equal true
+            message.Contains("forced termination requested: True", StringComparison.Ordinal)
+            |> should equal true
+            message.Contains("Natural exit code: unavailable", StringComparison.Ordinal)
+            |> should equal true
+            message.Contains(marker, StringComparison.Ordinal) |> should equal true
+        }
+
+    [<Fact>]
+    let ``script loading hang retains a separate bounded startup timeout`` () =
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "This test uses /bin/sleep as a controlled child.")
+
+        task {
+            use child = ChildProcess.Start("/bin/sleep", [| "60" |])
+            let endpoint = IPEndPoint(IPAddress.Loopback, reservePort ())
+
+            let! failure =
+                task {
+                    try
+                        use! _ =
+                            waitForListenerWithDeadlinesAsync
+                                child
+                                endpoint
+                                true
+                                (TimeSpan.FromMilliseconds 300.0)
+                                (TimeSpan.FromMilliseconds 100.0)
+
+                        return None
+                    with :? TimeoutException as error ->
+                        return Some error.Message
+                }
+
+            let message = failure |> Option.defaultWith (fun () -> failwith "Startup did not time out.")
+            message.Contains("script loading exceeded", StringComparison.Ordinal) |> should equal true
+            message.Contains("forced termination requested: True", StringComparison.Ordinal)
+            |> should equal true
+        }
+
+    [<Fact>]
+    let ``early child failure retains natural exit and stderr`` () =
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "This test uses /bin/sh as a controlled child.")
+
+        task {
+            use child = ChildProcess.Start("/bin/sh", [| "-c"; "echo controlled startup failure >&2; exit 7" |])
+            let endpoint = IPEndPoint(IPAddress.Loopback, reservePort ())
+
+            let! failure =
+                task {
+                    try
+                        use! _ =
+                            waitForListenerWithDeadlinesAsync
+                                child
+                                endpoint
+                                true
+                                (TimeSpan.FromSeconds 2.0)
+                                (TimeSpan.FromMilliseconds 100.0)
+
+                        return None
+                    with :? InvalidOperationException as error ->
+                        return Some error.Message
+                }
+
+            let message = failure |> Option.defaultWith (fun () -> failwith "Early exit was not reported.")
+            message.Contains("Natural exit code: 7", StringComparison.Ordinal) |> should equal true
+            message.Contains("forced termination requested: False", StringComparison.Ordinal)
+            |> should equal true
+            message.Contains("controlled startup failure", StringComparison.Ordinal) |> should equal true
         }
 
     [<Fact>]

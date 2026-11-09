@@ -77,7 +77,8 @@ The global command is `pipel4`. If the shell cannot find it, add the .NET global
 Windows), then open a new shell.
 
 For a repository-scoped installation, run these commands from the repository root, where
-`./artifacts` was created. Add PipeL4 to the existing local tool manifest:
+`./artifacts` was created. If this directory does not yet have a local tool manifest, create one
+first with `dotnet new tool-manifest`. Then add PipeL4 to the manifest:
 
 ```sh
 dotnet tool install --local PipeL4 --add-source ./artifacts --prerelease
@@ -145,7 +146,9 @@ processor's behavior and limits.
 ## Practical quickstart
 
 This walkthrough runs the installed `pipel4` command with the repository's example processor. It
-uses the local-package installation above and does not require a PipeL4 package from NuGet.org.
+uses the local-package installation above and does not require a PipeL4 package from NuGet.org. To
+use the quickstart outside the repository, follow [Installed examples](#installed-examples) to copy
+`AsciiUppercase.fsx` first, then pass its copied path to the plugin option.
 
 ### Prerequisites
 
