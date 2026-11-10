@@ -31,12 +31,39 @@ let private requiredToolFiles =
       "FSharp.DependencyManager.Nuget.dll"
       "Microsoft.Extensions.Logging.Console.dll" ]
 
+let private requiredNoticeFiles =
+    [ "THIRD_PARTY_NOTICES.md"
+      "notices/FSharp.LICENSE.txt"
+      "notices/DotNet.LICENSE.txt"
+      "notices/DotNet.THIRD-PARTY-NOTICES.txt" ]
+
+let private expectedLicenseUrl = "https://licenses.nuget.org/MIT"
+
+let private supportedNuspecNamespaceUris =
+    [ "http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd"
+      "http://schemas.microsoft.com/packaging/2011/08/nuspec.xsd"
+      "http://schemas.microsoft.com/packaging/2011/10/nuspec.xsd"
+      "http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd"
+      "http://schemas.microsoft.com/packaging/2013/01/nuspec.xsd"
+      "http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd" ]
+
+let private isSupportedNuspecNamespace namespaceUri =
+    supportedNuspecNamespaceUris
+    |> List.exists (fun supportedUri -> String.Equals(namespaceUri, supportedUri, StringComparison.OrdinalIgnoreCase))
+
 let private fail message = raise (ValidationException message)
 
 let private localName (element: XElement) = element.Name.LocalName
 
+let private children (parent: XElement) name =
+    parent.Elements(XName.Get(name, parent.Name.NamespaceName))
+
 let private child (parent: XElement) name =
-    parent.Elements() |> Seq.tryFind (fun element -> localName element = name)
+    children parent name |> Seq.tryHead
+
+let private rejectForeignChild (parent: XElement) name scope =
+    if parent.Elements() |> Seq.exists (fun element -> localName element = name && element.Name.Namespace <> parent.Name.Namespace) then
+        fail $"Nuspec {scope} contains a foreign-namespace '{name}' element."
 
 let private requiredText (parent: XElement) name =
     match child parent name with
@@ -263,10 +290,22 @@ let private validatePackageCore (packagePath: string) =
         use input = package.GetEntry(nuspecs[0]).Open()
         XDocument.Load input
 
+    let nuspecRoot =
+        match nuspec.Root |> Option.ofObj with
+        | None -> fail "Embedded nuspec has no root element; expected 'package'."
+        | Some root when localName root <> "package" ->
+            fail $"Embedded nuspec root must be the NuGet 'package' element; found '{root.Name}'."
+        | Some root when not (isSupportedNuspecNamespace root.Name.NamespaceName) ->
+            fail $"Embedded nuspec package element uses an unsupported namespace '{root.Name.NamespaceName}'."
+        | Some root -> root
+
+    rejectForeignChild nuspecRoot "metadata" "package"
+
+    let metadataElements = children nuspecRoot "metadata" |> Seq.toArray
     let metadata =
-        match nuspec.Root |> Option.ofObj |> Option.bind (fun root -> child root "metadata") with
-        | Some value -> value
-        | None -> fail "Embedded nuspec has no metadata element."
+        match metadataElements with
+        | [| value |] -> value
+        | _ -> fail $"Embedded nuspec must contain exactly one metadata element in namespace '{nuspecRoot.Name.NamespaceName}'."
 
     let packageId = requiredText metadata "id"
     let version = requiredText metadata "version"
@@ -283,8 +322,16 @@ let private validatePackageCore (packagePath: string) =
     requiredText metadata "authors" |> ignore
     requiredText metadata "tags" |> ignore
 
-    if child metadata "licenseUrl" |> Option.isSome then
-        fail "Deprecated nuspec licenseUrl metadata must not be used."
+    rejectForeignChild metadata "license" "metadata"
+    rejectForeignChild metadata "licenseUrl" "metadata"
+
+    let licenseUrls = children metadata "licenseUrl" |> Seq.toArray
+
+    match licenseUrls with
+    | [||] -> ()
+    | [| licenseUrl |] when licenseUrl.Value.Trim() = expectedLicenseUrl -> ()
+    | [| _ |] -> fail "Unexpected nuspec licenseUrl metadata."
+    | _ -> fail "Package must contain at most one licenseUrl metadata element."
 
     match child metadata "projectUrl" with
     | Some projectUrl when not (String.IsNullOrEmpty projectUrl.Value) -> validateUrl (projectUrl.Value.Trim()) "Project URL"
@@ -299,17 +346,20 @@ let private validatePackageCore (packagePath: string) =
         validateUrl repositoryUrl "Repository URL"
     | None -> ()
 
-    match child metadata "license" with
-    | Some license ->
+    let licenses = children metadata "license" |> Seq.toArray
+
+    match licenses with
+    | [| license |] ->
         let licenseType = license.Attribute(XName.Get "type") |> Option.ofObj |> Option.map (fun attribute -> attribute.Value.Trim()) |> Option.defaultValue ""
         let licenseValue = license.Value.Trim()
-        if String.IsNullOrEmpty licenseType || String.IsNullOrEmpty licenseValue then
-            fail "License metadata must include a type and value."
-        if licenseType = "file" && not (entries.Contains licenseValue) then
-            fail $"License file '{licenseValue}' is declared but absent from the package."
-        if licenseType <> "file" && licenseType <> "expression" then
-            fail $"Unsupported NuGet license type '{licenseType}'."
-    | None -> ()
+        if licenseType <> "expression" || licenseValue <> "MIT" then
+            fail "Package license must be the MIT expression."
+    | _ -> fail "Package must contain exactly one MIT expression license element."
+
+    let missingNotices = requiredNoticeFiles |> List.filter (entries.Contains >> not)
+    if not missingNotices.IsEmpty then
+        let displayedNotices = String.Join(", ", missingNotices)
+        fail $"Package is missing bundled dependency notices: {displayedNotices}"
 
     let readmeName = requiredText metadata "readme"
     if readmeName.StartsWith("/", StringComparison.Ordinal)
@@ -329,7 +379,7 @@ let private validatePackageCore (packagePath: string) =
         |> Option.exists (fun packageTypes ->
             packageTypes.Elements()
             |> Seq.exists (fun item ->
-                localName item = "packageType"
+                item.Name = XName.Get("packageType", packageTypes.Name.NamespaceName)
                 && (item.Attribute(XName.Get "name") |> Option.ofObj |> Option.exists (fun attribute -> attribute.Value = "DotnetTool"))))
     if not hasToolPackageType then
         fail "NuGet package type is not DotnetTool."
@@ -421,6 +471,7 @@ let private validatePackageCore (packagePath: string) =
             name = "_rels/.rels"
             || name = nuspecs[0]
             || name = readmeName
+            || List.contains name requiredNoticeFiles
             || name = "[Content_Types].xml"
             || name = ".signature.p7s"
             || name.StartsWith(toolRoot, StringComparison.Ordinal)

@@ -5,10 +5,12 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>pipel4</ToolCommandName>
     <PackageId>PipeL4</PackageId>
-    <Version>0.1.0-preview.1</Version>
-    <Authors>PipeL4</Authors>
-    <PackageDescription>Experimental high-performance TCP proxy with programmable F# processing pipelines.</PackageDescription>
-    <PackageTags>tcp;proxy;F#;dotnet-tool;plugin</PackageTags>
+    <Version>0.1.0-alpha.1</Version>
+    <Authors>Michael Krotenko</Authors>
+    <PackageDescription>Experimental TCP byte-stream proxy and runtime with F# .fsx processor plugins.</PackageDescription>
+    <PackageTags>tcp;proxy;byte-stream;F#;dotnet-tool;plugin</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>2026 Michael Krotenko</Copyright>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RestoreEnablePackagePruning>false</RestoreEnablePackagePruning>
   </PropertyGroup>
@@ -26,6 +28,10 @@
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="THIRD_PARTY_NOTICES.md" Pack="true" PackagePath="\" />
+    <None Include="notices/FSharp.LICENSE.txt" Pack="true" PackagePath="notices/" />
+    <None Include="notices/DotNet.LICENSE.txt" Pack="true" PackagePath="notices/" />
+    <None Include="notices/DotNet.THIRD-PARTY-NOTICES.txt" Pack="true" PackagePath="notices/" />
   </ItemGroup>
 
   <ItemGroup>

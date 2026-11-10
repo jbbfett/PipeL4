@@ -18,6 +18,19 @@ let readEntry (archive: ZipArchive) (entryName: string) =
     input.CopyTo output
     output.ToArray()
 
+let nuspecMetadata packagePath entryName =
+    use archive = ZipFile.OpenRead packagePath
+    use input = archive.GetEntry(entryName).Open()
+    let document = XDocument.Load input
+    match document.Root |> Option.ofObj |> Option.bind (fun root -> root.Elements() |> Seq.tryFind (fun element -> element.Name.LocalName = "metadata")) with
+    | Some metadata -> metadata
+    | None -> failwith "Test package nuspec has no metadata element."
+
+let directChildren (parent: XElement) name =
+    parent.Elements()
+    |> Seq.filter (fun element -> element.Name.LocalName = name)
+    |> Seq.toArray
+
 let rewritePackage sourcePath targetPath omitEntry replacement extraEntry =
     use original = ZipFile.OpenRead sourcePath
     use output = new ZipArchive(new FileStream(targetPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None), ZipArchiveMode.Create)
@@ -112,6 +125,10 @@ let runTests sourceSummary injectFailure =
         |> Seq.find (fun name -> name.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase))
 
     let temporaryRoot = Path.Combine(Path.GetTempPath(), $"PipeL4 package validation tests {Guid.NewGuid():N}")
+    let mitLicense = "<license type=\"expression\">MIT</license>"
+    let sdkLicenseUrl = "<licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>"
+    let foreignLicense = "<x:license xmlns:x=\"urn:foreign\" type=\"expression\">MIT</x:license>"
+    let sdkNuspecNamespace = "http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd"
     let mutable passed = 0
     let mutable failed = 0
 
@@ -140,11 +157,26 @@ let runTests sourceSummary injectFailure =
     try
         Directory.CreateDirectory temporaryRoot |> ignore
 
-        run "candidate package passes" (fun () ->
+        run "accepts MIT expression and SDK-generated license URL" (fun () ->
+            let metadata = nuspecMetadata sourcePath nuspecEntry
+            match directChildren metadata "licenseUrl" with
+            | [| licenseUrl |] when licenseUrl.Value.Trim() = "https://licenses.nuget.org/MIT" -> ()
+            | _ -> failwith "Test package does not contain exactly one SDK-generated MIT license URL."
             match validatePackageFile sourcePath with
             | Ok summary when summary.Version = sourceSummary.Version && summary.PackageId = "PipeL4" -> ()
             | Ok summary -> failwith $"Candidate summary changed unexpectedly: {summary.PackageId} {summary.Version}."
             | Error message -> failwith $"Candidate package was rejected: {message}")
+
+        run "accepts the MIT expression without a license URL" (fun () ->
+            let directory = scenarioDirectory "no license URL"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, sdkLicenseUrl, "")) None
+            let licenseUrls = nuspecMetadata target nuspecEntry |> fun metadata -> directChildren metadata "licenseUrl"
+            if licenseUrls.Length <> 0 then
+                failwith "Test mutation did not remove the license URL."
+            match validateInput target with
+            | Ok _ -> ()
+            | Error message -> failwith $"MIT expression without a license URL was rejected: {message}")
 
         run "rejects multiple package candidates in a directory" (fun () ->
             let directory = scenarioDirectory "multiple packages"
@@ -176,6 +208,12 @@ let runTests sourceSummary injectFailure =
             rewritePackage sourcePath target (Some sourceSummary.ReadmePath) None None
             expectError "declared but missing" target)
 
+        run "rejects a missing bundled dependency notice" (fun () ->
+            let directory = scenarioDirectory "missing dependency notice"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target (Some "notices/DotNet.THIRD-PARTY-NOTICES.txt") None None
+            expectError "missing bundled dependency notices" target)
+
         run "rejects a missing F# scripting runtime dependency" (fun () ->
             let directory = scenarioDirectory "missing scripting runtime"
             let target = Path.Combine(directory, Path.GetFileName sourcePath)
@@ -193,6 +231,95 @@ let runTests sourceSummary injectFailure =
             let target = Path.Combine(directory, Path.GetFileName sourcePath)
             rewritePackage sourcePath target None (Some(nuspecEntry, "<id>PipeL4</id>", "<id>Other</id>")) None
             expectError "Expected PackageId 'PipeL4'" target)
+
+        run "rejects a package without the MIT license expression" (fun () ->
+            let directory = scenarioDirectory "incorrect license"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, mitLicense, "<license type=\"expression\">Apache-2.0</license>")) None
+            expectError "Package license must be the MIT expression" target)
+
+        run "rejects a foreign-namespace license replacing the MIT license" (fun () ->
+            let directory = scenarioDirectory "foreign replacement license"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, mitLicense, foreignLicense)) None
+            expectError "foreign-namespace 'license' element" target)
+
+        run "rejects a foreign-namespace license alongside the MIT license" (fun () ->
+            let directory = scenarioDirectory "foreign additional license"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, mitLicense, mitLicense + foreignLicense)) None
+            expectError "foreign-namespace 'license' element" target)
+
+        run "rejects a foreign-namespace licenseUrl with an unexpected value" (fun () ->
+            let directory = scenarioDirectory "foreign license URL"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            let foreignLicenseUrl = "<x:licenseUrl xmlns:x=\"urn:foreign\">https://example.invalid/license</x:licenseUrl>"
+            rewritePackage sourcePath target None (Some(nuspecEntry, sdkLicenseUrl, foreignLicenseUrl)) None
+            expectError "foreign-namespace 'licenseUrl' element" target)
+
+        run "rejects foreign-namespace metadata alongside package metadata" (fun () ->
+            let directory = scenarioDirectory "foreign metadata impersonation"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            let foreignMetadata = "<x:metadata xmlns:x=\"urn:foreign\"><x:id>PipeL4</x:id></x:metadata></package>"
+            rewritePackage sourcePath target None (Some(nuspecEntry, "</package>", foreignMetadata)) None
+            expectError "foreign-namespace 'metadata' element" target)
+
+        run "rejects a foreign-namespace package and metadata structure" (fun () ->
+            let directory = scenarioDirectory "foreign package namespace"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage
+                sourcePath
+                target
+                None
+                (Some(nuspecEntry, $"xmlns=\"{sdkNuspecNamespace}\"", "xmlns=\"urn:foreign\""))
+                None
+            expectError "unsupported namespace 'urn:foreign'" target)
+
+        run "rejects duplicate identical license elements" (fun () ->
+            let directory = scenarioDirectory "duplicate identical licenses"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, mitLicense, mitLicense + mitLicense)) None
+            expectError "exactly one MIT expression license element" target)
+
+        run "rejects MIT followed by a conflicting license element" (fun () ->
+            let directory = scenarioDirectory "MIT then conflicting license"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            let apacheLicense = "<license type=\"expression\">Apache-2.0</license>"
+            rewritePackage sourcePath target None (Some(nuspecEntry, mitLicense, mitLicense + apacheLicense)) None
+            expectError "exactly one MIT expression license element" target)
+
+        run "rejects a conflicting license element before MIT" (fun () ->
+            let directory = scenarioDirectory "duplicate conflicting licenses"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            let apacheLicense = "<license type=\"expression\">Apache-2.0</license>"
+            rewritePackage sourcePath target None (Some(nuspecEntry, mitLicense, apacheLicense + mitLicense)) None
+            expectError "exactly one MIT expression license element" target)
+
+        run "rejects duplicate identical licenseUrl elements" (fun () ->
+            let directory = scenarioDirectory "duplicate identical license URLs"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, sdkLicenseUrl, sdkLicenseUrl + sdkLicenseUrl)) None
+            expectError "at most one licenseUrl metadata element" target)
+
+        run "rejects the expected license URL followed by a conflicting URL" (fun () ->
+            let directory = scenarioDirectory "expected then conflicting license URLs"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            let unexpectedUrl = "<licenseUrl>https://example.invalid/license</licenseUrl>"
+            rewritePackage sourcePath target None (Some(nuspecEntry, sdkLicenseUrl, sdkLicenseUrl + unexpectedUrl)) None
+            expectError "at most one licenseUrl metadata element" target)
+
+        run "rejects a conflicting license URL before the expected URL" (fun () ->
+            let directory = scenarioDirectory "duplicate conflicting license URLs"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            let unexpectedUrl = "<licenseUrl>https://example.invalid/license</licenseUrl>"
+            rewritePackage sourcePath target None (Some(nuspecEntry, sdkLicenseUrl, unexpectedUrl + sdkLicenseUrl)) None
+            expectError "at most one licenseUrl metadata element" target)
+
+        run "rejects an unexpected license URL" (fun () ->
+            let directory = scenarioDirectory "incorrect license URL"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, "https://licenses.nuget.org/MIT", "https://example.invalid/license")) None
+            expectError "Unexpected nuspec licenseUrl metadata" target)
 
         run "rejects a tool settings document with an invalid root" (fun () ->
             let directory = scenarioDirectory "incorrect tool settings root"

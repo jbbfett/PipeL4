@@ -6,6 +6,77 @@ It explores protocol-agnostic byte-stream processing for integration testing, pr
 
 > **Status:** experimental. Architecture, runtime semantics, and plugin APIs may change as they are validated through implementation and benchmarks.
 
+## Quick Start
+
+PipeL4 forwards TCP bytes to a configured backend and can process each traffic direction with F#
+`.fsx` scripts. It requires the .NET 10 runtime; the .NET 10 SDK includes that runtime. Once
+`0.1.0-alpha.1` is published to NuGet.org, install it with:
+
+```sh
+dotnet tool install --global PipeL4 --version 0.1.0-alpha.1
+```
+
+The package is not published yet. To try it now, [build and install from this checkout](#install-pipel4)
+using the local package source. The installed command is `pipel4`; run `pipel4 --help` for all options.
+
+For a localhost exchange, open three Unix-like terminals. In the first, run this one-connection
+Python 3 echo backend on port 6000:
+
+```sh
+python3 - <<'PY'
+import socket
+
+with socket.socket() as listener:
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 6000))
+    listener.listen(1)
+    connection, _ = listener.accept()
+    with connection:
+        while True:
+            data = connection.recv(65536)
+            if not data:
+                break
+            connection.sendall(data)
+PY
+```
+
+In the second, start PipeL4 with the backend address and port:
+
+```sh
+pipel4 --listen-address 127.0.0.1 --listen-port 5000 \
+  --backend-host 127.0.0.1 --backend-port 6000
+```
+
+In the third, send a line through the proxy. With OpenBSD netcat, `-N` half-closes the connection
+after standard input reaches EOF so the echo response can finish; other `nc` variants may need a
+different flag:
+
+```sh
+printf 'Hello, PipeL4!\n' | nc -N 127.0.0.1 5000
+```
+
+The response is `Hello, PipeL4!`. To try a processor, stop PipeL4 with Ctrl+C, restart the backend,
+then copy the bundled example and start PipeL4 again with one extra option:
+
+```sh
+pipel4 examples copy AsciiUppercase
+pipel4 --listen-address 127.0.0.1 --listen-port 5000 \
+  --backend-host 127.0.0.1 --backend-port 6000 \
+  --client-to-server-plugin ./AsciiUppercase.fsx
+```
+
+Repeat the same `printf ... | nc -N ...` command. The echo response is `HELLO, PIPEL4!` because the
+script changes ASCII lowercase bytes on the client-to-backend path. For example details, see
+[Installed examples](#installed-examples) and [Practical quickstart](#practical-quickstart); for
+processor and memory rules, see [Architecture](docs/architecture.md).
+
+This prerelease is for experiments, not guaranteed production use. It supports TCP byte streams,
+without implicit HTTP or other application framing, and has no TLS support. The backend is chosen
+by the endpoint options, and `.fsx` scripts compile on load and run as trusted, unsandboxed code.
+If the exchange fails, check that the .NET 10 runtime is installed, the backend is listening at
+`127.0.0.1:6000`, and the script path exists; compilation errors appear before PipeL4 starts
+listening. OpenBSD netcat needs `-N` for this EOF-driven example.
+
 ## Core ideas
 
 - TCP only.
@@ -66,11 +137,11 @@ dotnet tool restore
 dotnet paket restore
 dotnet build PipeL4.sln
 dotnet pack src/PipeL4/PipeL4.fsproj --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false --output ./artifacts
-dotnet tool install --global PipeL4 --add-source ./artifacts --prerelease
+dotnet tool install --global PipeL4 --source ./artifacts --version 0.1.0-alpha.1
 ```
 
-`--add-source` adds the local feed while leaving configured NuGet sources available for the
-package's dependencies. `--prerelease` includes the prerelease package produced by this checkout.
+`--version 0.1.0-alpha.1` selects the package version. `--source ./artifacts` replaces configured
+NuGet feeds with the local feed for this installation.
 
 The global command is `pipel4`. If the shell cannot find it, add the .NET global tools directory to
 `PATH` (normally `$HOME/.dotnet/tools` on Linux and macOS or `%USERPROFILE%\.dotnet\tools` on
@@ -81,7 +152,7 @@ For a repository-scoped installation, run these commands from the repository roo
 first with `dotnet new tool-manifest`. Then add PipeL4 to the manifest:
 
 ```sh
-dotnet tool install --local PipeL4 --add-source ./artifacts --prerelease
+dotnet tool install --local PipeL4 --source ./artifacts --version 0.1.0-alpha.1
 dotnet pipel4 --help
 ```
 
@@ -91,8 +162,8 @@ with `dotnet pipel4` followed by its arguments (or use `dotnet tool run pipel4 -
 To install a newer prerelease package from the local feed:
 
 ```sh
-dotnet tool update --global PipeL4 --add-source ./artifacts --prerelease
-dotnet tool update --local PipeL4 --add-source ./artifacts --prerelease
+dotnet tool update --global PipeL4 --source ./artifacts --prerelease
+dotnet tool update --local PipeL4 --source ./artifacts --prerelease
 ```
 
 Remove a global installation with `dotnet tool uninstall --global PipeL4`, or remove a local one
@@ -128,16 +199,8 @@ is preserved and the command fails unless `--force` is supplied. With `--force`,
 regular file is replaced; symbolic-link destinations are refused. The output directory must
 already exist. See `pipel4 examples --help` for the command syntax.
 
-Edit the extracted script and load it with the existing directional plugin option, for example:
-
-```sh
-pipel4 \
-  --listen-address 127.0.0.1 \
-  --listen-port 5000 \
-  --backend-host 127.0.0.1 \
-  --backend-port 6000 \
-  --client-to-server-plugin ./AsciiUppercase.fsx
-```
+Edit the extracted script and load it with `--client-to-server-plugin` as shown in the
+[Quick Start](#quick-start).
 
 Scripts compiled by the PipeL4 host do not need script-level `#r` directives for PipeL4 assemblies;
 the host supplies its supported references. See the individual example descriptions below for each
@@ -145,10 +208,8 @@ processor's behavior and limits.
 
 ## Practical quickstart
 
-This walkthrough runs the installed `pipel4` command with the repository's example processor. It
-uses the local-package installation above and does not require a PipeL4 package from NuGet.org. To
-use the quickstart outside the repository, follow [Installed examples](#installed-examples) to copy
-`AsciiUppercase.fsx` first, then pass its copied path to the plugin option.
+The [Quick Start](#quick-start) gives the shortest complete exchange. The details below explain
+the example processors, directional stages, capacity options, and runtime behavior.
 
 ### Prerequisites
 
@@ -168,7 +229,7 @@ pipel4 --version
 themselves. Listener and backend addresses must be IPv4 or IPv6 literals; PipeL4 does not resolve
 hostnames.
 
-### Run the example end to end
+### AsciiUppercase processor
 
 The example at [examples/AsciiUppercase.fsx](examples/AsciiUppercase.fsx) uses only the public
 `PipeL4.Plugins` processor API. It iterates the incoming `ReadOnlySequence<byte>` segment by segment,
@@ -246,52 +307,8 @@ pipel4 \
 Use `--server-to-client-plugin` to apply the same content rule independently to backend-to-client
 traffic. Each configured direction has its own processor instance and prefix decision.
 
-Start any TCP echo backend on `127.0.0.1:6000`. For a Unix-like shell, this Python standard-library
-server is a one-connection test backend:
-
-```sh
-python3 - <<'PY'
-import socket
-
-with socket.socket() as listener:
-    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(("127.0.0.1", 6000))
-    listener.listen(1)
-    connection, _ = listener.accept()
-    with connection:
-        while True:
-            data = connection.recv(65536)
-            if not data:
-                break
-            connection.sendall(data)
-PY
-```
-
-In another terminal, from the repository root, start the installed tool with explicit
-listener/backend endpoints and the example on client-to-backend traffic:
-
-```sh
-pipel4 \
-  --listen-address 127.0.0.1 \
-  --listen-port 5000 \
-  --backend-host 127.0.0.1 \
-  --backend-port 6000 \
-  --client-to-server-plugin ./examples/AsciiUppercase.fsx
-```
-
-In a third terminal, send data through the proxy. The command below uses OpenBSD netcat's explicit
-`-N` option to shut down the network socket after standard input reaches EOF; other netcat variants
-may use a different flag:
-
-```sh
-printf 'Hello, PipeL4!\n' | nc -N 127.0.0.1 5000
-```
-
-The echo response is `HELLO, PIPEL4!`. Press Ctrl+C in the PipeL4 terminal after the exchange; the
-process shuts down cooperatively and exits successfully.
-
 Script paths are resolved to absolute paths relative to the caller's current working directory.
-The `./examples/...` path above therefore assumes the command is run from the repository root. An
+The `./examples/...` paths above therefore assume the command is run from the repository root. An
 installed tool does not resolve relative script paths from its installation directory; use an
 absolute path or a path relative to the directory from which `pipel4` is launched.
 
@@ -460,4 +477,5 @@ methodology, limitations, and the latest dated benchmark results. Reports are wr
 
 ## License
 
-TBD
+PipeL4 is licensed under the [MIT License](LICENSE). See the
+[third-party notices](THIRD_PARTY_NOTICES.md) for Paket's attribution.

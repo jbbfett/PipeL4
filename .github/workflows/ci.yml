@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up .NET SDK from global.json
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Print selected .NET SDK
+        run: dotnet --version
+
+      - name: Restore Paket tool
+        run: dotnet tool restore
+
+      - name: Clean Release outputs
+        run: dotnet clean src/PipeL4/PipeL4.fsproj --configuration Release -p:PaketDisableCliTest=true -p:BuildInParallel=false
+
+      - name: Restore dependencies
+        run: dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
+
+      - name: Build Release
+        run: dotnet build PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true
+
+      - name: Create and select .NET Tool package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/ci
+          pack_log="$RUNNER_TEMP/pipel4-pack.log"
+          dotnet pack src/PipeL4/PipeL4.fsproj \
+            --configuration Release \
+            --no-restore \
+            -p:PaketDisableCliTest=true \
+            -p:BuildInParallel=false \
+            --output ./artifacts/ci 2>&1 | tee "$pack_log"
+          if grep -F "NU5046" "$pack_log"; then
+            echo "Package creation failed: dotnet pack reported a missing package README (NU5046)." >&2
+            exit 1
+          fi
+
+          expected="./artifacts/ci/PipeL4.0.1.0-alpha.1.nupkg"
+          mapfile -t packages < <(find ./artifacts/ci -maxdepth 1 -type f -name '*.nupkg' -print)
+          if [[ ${#packages[@]} -ne 1 ]]; then
+            echo "Expected exactly one package in ./artifacts/ci, found ${#packages[@]}." >&2
+            exit 1
+          fi
+          if [[ "${packages[0]}" != "$expected" || ! -f "$expected" ]]; then
+            echo "Expected package $expected; found ${packages[0]}." >&2
+            exit 1
+          fi
+          printf 'path=%s\n' "$GITHUB_WORKSPACE/artifacts/ci/PipeL4.0.1.0-alpha.1.nupkg" >> "$GITHUB_OUTPUT"
+
+      - name: Validate package metadata and contents
+        run: dotnet fsi scripts/validate_package.fsx "${{ steps.package.outputs.path }}"
+
+      - name: Run package validation regression tests
+        run: dotnet fsi scripts/test_validate_package.fsx "${{ steps.package.outputs.path }}"
+
+      - name: Verify package validation exit codes
+        run: dotnet fsi scripts/test_validation_exit_codes.fsx "${{ steps.package.outputs.path }}"
+
+      - name: Run Release solution tests against the generated package
+        env:
+          PIPEL4_PACKAGE_PATH: ${{ steps.package.outputs.path }}
+        run: dotnet test --solution PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false
