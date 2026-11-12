@@ -55,11 +55,11 @@ let rewritePackage sourcePath targetPath omitEntry replacement extraEntry =
         targetStream.Write(content, 0, content.Length)
     | None -> ()
 
-let runDotnetFromOutsideRepository arguments =
+let runDotnetFromOutsideRepository (workingDirectory: string) arguments =
     let startInfo = new ProcessStartInfo("dotnet")
     for argument in arguments do
         startInfo.ArgumentList.Add argument
-    startInfo.WorkingDirectory <- Path.GetTempPath()
+    startInfo.WorkingDirectory <- workingDirectory
     startInfo.UseShellExecute <- false
     startInfo.RedirectStandardOutput <- true
     startInfo.RedirectStandardError <- true
@@ -72,12 +72,13 @@ let runDotnetFromOutsideRepository arguments =
     childProcess.WaitForExit()
     childProcess.ExitCode, standardOutput, standardError
 
-let runValidatorFromOutsideRepository packagePath =
+let runValidatorFromOutsideRepository workingDirectory packagePath =
     let validatorPath = Path.Combine(__SOURCE_DIRECTORY__, "validate_package.fsx")
-    runDotnetFromOutsideRepository [ "fsi"; validatorPath; packagePath ]
+    runDotnetFromOutsideRepository workingDirectory [ "fsi"; validatorPath; packagePath ]
 
-let runToolInstallFromOutsideRepository sourcePath toolPath version =
+let runToolInstallFromOutsideRepository workingDirectory sourcePath toolPath version =
     runDotnetFromOutsideRepository
+        workingDirectory
         [ "tool"
           "install"
           "PipeL4"
@@ -125,6 +126,7 @@ let runTests sourceSummary injectFailure =
         |> Seq.find (fun name -> name.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase))
 
     let temporaryRoot = Path.Combine(Path.GetTempPath(), $"PipeL4 package validation tests {Guid.NewGuid():N}")
+    let outsideRepositoryDirectory = Path.Combine(temporaryRoot, "outside repository")
     let mitLicense = "<license type=\"expression\">MIT</license>"
     let sdkLicenseUrl = "<licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>"
     let foreignLicense = "<x:license xmlns:x=\"urn:foreign\" type=\"expression\">MIT</x:license>"
@@ -156,6 +158,9 @@ let runTests sourceSummary injectFailure =
 
     try
         Directory.CreateDirectory temporaryRoot |> ignore
+        Directory.CreateDirectory outsideRepositoryDirectory |> ignore
+        let globalJsonPath = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "..", "global.json"))
+        File.Copy(globalJsonPath, Path.Combine(outsideRepositoryDirectory, "global.json"))
 
         run "accepts MIT expression and SDK-generated license URL" (fun () ->
             let metadata = nuspecMetadata sourcePath nuspecEntry
@@ -344,7 +349,11 @@ let runTests sourceSummary injectFailure =
                 None
             expectError "root must be the unqualified element 'DotNetCliTool'" target
             let exitCode, standardOutput, standardError =
-                runToolInstallFromOutsideRepository directory toolPath sourceSummary.Version
+                runToolInstallFromOutsideRepository
+                    outsideRepositoryDirectory
+                    directory
+                    toolPath
+                    sourceSummary.Version
             let diagnostic = standardOutput + standardError
             if exitCode = 0
                || not (diagnostic.Contains("error in XML document", StringComparison.OrdinalIgnoreCase)) then
@@ -371,13 +380,18 @@ let runTests sourceSummary injectFailure =
             let directory = scenarioDirectory "incorrect ZIP CRC"
             let target = Path.Combine(directory, Path.GetFileName sourcePath)
             writePackageWithIncorrectEntryCrc sourcePath target
-            expectError "corrupt entry" target)
+            match validateInput target with
+            | Error message when message.Contains("corrupt entry", StringComparison.Ordinal)
+                                 || message.Contains("CRC32 checksum of the extracted data does not match the expected value from the archive", StringComparison.Ordinal) -> ()
+            | Error message -> failwith $"Expected an entry corruption diagnostic, but got: {message}"
+            | Ok summary -> failwith $"Expected rejection of a corrupt entry, but {summary.PackagePath} passed.")
 
         run "CLI validates a package path with spaces from outside the repository" (fun () ->
             let directory = scenarioDirectory "CLI package path with spaces"
             let target = Path.Combine(directory, Path.GetFileName sourcePath)
             File.Copy(sourcePath, target)
-            let exitCode, standardOutput, standardError = runValidatorFromOutsideRepository target
+            let exitCode, standardOutput, standardError =
+                runValidatorFromOutsideRepository outsideRepositoryDirectory target
             if exitCode <> 0 || not (standardOutput.Contains("PackageId=PipeL4", StringComparison.Ordinal)) then
                 failwith $"Expected CLI success (exit 0), got {exitCode}. stdout: {standardOutput} stderr: {standardError}")
 
@@ -385,7 +399,7 @@ let runTests sourceSummary injectFailure =
             let directory = scenarioDirectory "CLI corrupt path with spaces"
             let target = Path.Combine(directory, Path.GetFileName sourcePath)
             File.WriteAllBytes(target, Encoding.UTF8.GetBytes "not a NuGet ZIP archive")
-            let exitCode, _, standardError = runValidatorFromOutsideRepository target
+            let exitCode, _, standardError = runValidatorFromOutsideRepository outsideRepositoryDirectory target
             if exitCode = 0 || not (standardError.Contains("NuGet ZIP package", StringComparison.Ordinal)) then
                 failwith $"Expected nonzero CLI exit and archive diagnostic, got {exitCode}. stderr: {standardError}")
 

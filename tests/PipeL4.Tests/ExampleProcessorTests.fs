@@ -13,7 +13,7 @@ open Xunit
 
 module ExampleProcessorTests =
     let private examplePath =
-        Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "examples", "AsciiUppercase.fsx"))
+        Path.Combine(TestRepository.repositoryRoot, "examples", "AsciiUppercase.fsx")
 
     let private sequenceSegmentCount (sequence: ReadOnlySequence<byte>) =
         let mutable position = sequence.Start

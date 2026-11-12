@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="TestRepository.fs" />
     <Compile Include="CapacityAccountingTests.fs" />
     <Compile Include="DiagnosticsTests.fs" />
     <Compile Include="ForwardingConfigurationTests.fs" />
