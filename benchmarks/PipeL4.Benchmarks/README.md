@@ -238,7 +238,7 @@ runs used the same host, Release configuration, SDK/runtime, BenchmarkDotNet con
 and payloads, and were run sequentially. The benchmark project source for
 `RawTcpForwardingBenchmarks` is byte-for-byte unchanged between the two revisions.
 
-Rewritten master commit `50fcd7ca8b434b1c13b839340c5fc5b1a9117421` has the same Git tree as the
+Rewritten master commit `386a130d000d9db35a3a05c09ab23b239f605e87` has the same Git tree as the
 measured baseline and supplies only its equivalent tracked source state. The paired historical
 revision `a96f504286efd1e5cfbd7eadec53414d29601b6e` is not reachable from rewritten master and has no
 tree-equivalent master commit, so the original two-revision comparison cannot be fully reproduced
@@ -426,14 +426,14 @@ connection-wide, and production entry points retain unbounded compatibility limi
 
 The original verification commands ran from a detached checkout at
 `b6fc7bfb307e769f07d6e31357b01f53dab32b3f`. The sequence below is for present-day reproduction; its
-checkout line uses rewritten commit `50fcd7ca8b434b1c13b839340c5fc5b1a9117421` for the equivalent
+checkout line uses rewritten commit `386a130d000d9db35a3a05c09ab23b239f605e87` for the equivalent
 tracked baseline source state. The completion counts below are historical outcomes, not results
 from running the rewritten commit.
 
 ```sh
 comparison_root=$(mktemp -d /tmp/pipel4-observability-XXXXXX)
 git clone --no-local . "$comparison_root"
-git -C "$comparison_root" checkout --detach 50fcd7ca8b434b1c13b839340c5fc5b1a9117421
+git -C "$comparison_root" checkout --detach 386a130d000d9db35a3a05c09ab23b239f605e87
 cd "$comparison_root"
 dotnet restore PipeL4.sln /p:PaketDisableGlobalRestore=true
 dotnet build PipeL4.sln -c Release --no-restore
@@ -957,7 +957,7 @@ error, while the same historical solution restored successfully with `-m:1`. No 
 semantics or historical source files were changed. With that correction, both revisions built and
 the matched three-payload `InternalProcessorPipeline` full jobs completed. This historical pair is
 not directly runnable from a fresh master-only clone: `82e5eb610f444bb3205b5b28cc50f6283778a244`
-has the rewritten master equivalent `20d63615460ba05405762dbf447ad20acb3de875`, while
+has the rewritten master equivalent `8e26f1b3f6b48a3663978b4548098b9b92c126ef`, while
 `8aae7248b3b84a7faaa92ee9dd83d8f9401dbef5` has no equivalent on rewritten master. The results below
 retain the original measured SHA attribution.
 
@@ -980,7 +980,7 @@ clone with:
 ```sh
 baseline_root=$(mktemp -d /tmp/pipel4-history-baseline-XXXXXX)
 git clone --no-local . "$baseline_root"
-git -C "$baseline_root" checkout --detach 20d63615460ba05405762dbf447ad20acb3de875
+git -C "$baseline_root" checkout --detach 8e26f1b3f6b48a3663978b4548098b9b92c126ef
 ```
 
 This checkout provides the baseline's equivalent tracked source state only; it cannot reproduce the
