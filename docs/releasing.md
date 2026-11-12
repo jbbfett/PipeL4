@@ -9,7 +9,8 @@ affected by the change. Record the evidence at each gate before proceeding.
 The [CI workflow](../.github/workflows/ci.yml) runs on pushes to `master`, pull requests targeting
 `master`, and manual dispatch. It restores, builds, tests, packs, and validates a local package on
 Ubuntu 24.04. The separate [distribution validation workflow](../.github/workflows/distribution-validation.yml)
-can upload a validated candidate with `source-revision.txt`; it also does not publish. The earlier
+also runs on Ubuntu 24.04 and can upload a validated candidate with `source-revision.txt`; it does
+not publish. The earlier
 [local readiness report](release-readiness.md) covers a different historical package and cannot
 substitute for validation of this final prerelease.
 

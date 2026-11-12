@@ -14,7 +14,7 @@ open Xunit
 
 module BytePatternReplaceTests =
     let private examplePath =
-        Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "examples", "BytePatternReplace.fsx"))
+        Path.Combine(TestRepository.repositoryRoot, "examples", "BytePatternReplace.fsx")
 
     let private ascii (value: string) = Encoding.ASCII.GetBytes value
 

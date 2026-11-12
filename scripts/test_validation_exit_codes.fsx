@@ -7,13 +7,21 @@ type ScriptResult =
       StandardOutput: string
       StandardError: string }
 
+let private childWorkingDirectory =
+    Path.Combine(Path.GetTempPath(), $"PipeL4 validation harness {Guid.NewGuid():N}")
+
+do
+    Directory.CreateDirectory childWorkingDirectory |> ignore
+    let globalJsonPath = Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "..", "global.json"))
+    File.Copy(globalJsonPath, Path.Combine(childWorkingDirectory, "global.json"))
+
 let runScript (scriptPath: string) (arguments: string list) injectFailure =
     let startInfo = new ProcessStartInfo("dotnet")
     startInfo.ArgumentList.Add "fsi"
     startInfo.ArgumentList.Add scriptPath
     for argument in arguments do
         startInfo.ArgumentList.Add argument
-    startInfo.WorkingDirectory <- Path.GetTempPath()
+    startInfo.WorkingDirectory <- childWorkingDirectory
     startInfo.UseShellExecute <- false
     startInfo.RedirectStandardOutput <- true
     startInfo.RedirectStandardError <- true
@@ -117,9 +125,13 @@ let runHarness () =
 
 let exitStatus =
     try
-        runHarness ()
-    with error ->
-        eprintfn "Unexpected exit-code harness error: %s" error.Message
-        2
+        try
+            runHarness ()
+        with error ->
+            eprintfn "Unexpected exit-code harness error: %s" error.Message
+            2
+    finally
+        if Directory.Exists childWorkingDirectory then
+            Directory.Delete(childWorkingDirectory, true)
 
 Environment.Exit exitStatus

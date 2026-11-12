@@ -13,7 +13,7 @@ open Xunit
 
 module PrefixModeTests =
     let private examplePath =
-        Path.GetFullPath(Path.Combine(__SOURCE_DIRECTORY__, "..", "..", "examples", "PrefixMode.fsx"))
+        Path.Combine(TestRepository.repositoryRoot, "examples", "PrefixMode.fsx")
 
     let private ascii (value: string) = System.Text.Encoding.ASCII.GetBytes value
 
