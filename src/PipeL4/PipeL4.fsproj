@@ -9,6 +9,9 @@
     <Authors>Michael Krotenko</Authors>
     <PackageDescription>Experimental TCP byte-stream proxy and runtime with F# .fsx processor plugins.</PackageDescription>
     <PackageTags>tcp;proxy;byte-stream;F#;dotnet-tool;plugin</PackageTags>
+    <PackageProjectUrl>https://github.com/jbbfett/PipeL4</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jbbfett/PipeL4.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <Copyright>2026 Michael Krotenko</Copyright>
     <PackageReadmeFile>README.md</PackageReadmeFile>

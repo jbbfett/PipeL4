@@ -38,6 +38,9 @@ let private requiredNoticeFiles =
       "notices/DotNet.THIRD-PARTY-NOTICES.txt" ]
 
 let private expectedLicenseUrl = "https://licenses.nuget.org/MIT"
+let private expectedProjectUrl = "https://github.com/jbbfett/PipeL4"
+let private expectedRepositoryUrl = "https://github.com/jbbfett/PipeL4.git"
+let private expectedRepositoryType = "git"
 
 let private supportedNuspecNamespaceUris =
     [ "http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd"
@@ -49,7 +52,7 @@ let private supportedNuspecNamespaceUris =
 
 let private isSupportedNuspecNamespace namespaceUri =
     supportedNuspecNamespaceUris
-    |> List.exists (fun supportedUri -> String.Equals(namespaceUri, supportedUri, StringComparison.OrdinalIgnoreCase))
+    |> List.exists (fun supportedUri -> String.Equals(namespaceUri, supportedUri, StringComparison.Ordinal))
 
 let private fail message = raise (ValidationException message)
 
@@ -74,6 +77,25 @@ let private validateUrl value label =
     match Uri.TryCreate(value, UriKind.Absolute) with
     | true, uri when uri.Scheme = Uri.UriSchemeHttps && not (String.IsNullOrWhiteSpace uri.Host) -> ()
     | _ -> fail $"{label} must be an absolute HTTPS URL; found '{value}'."
+
+let private hasUnexpectedAttributes (element: XElement) allowedNames =
+    element.Attributes()
+    |> Seq.exists (fun attribute ->
+        not attribute.IsNamespaceDeclaration
+        && (attribute.Name.NamespaceName <> "" || not (List.contains attribute.Name.LocalName allowedNames)))
+
+let private hasNestedElementsOrNonWhitespaceText (element: XElement) =
+    element.Nodes()
+    |> Seq.exists (function
+        | :? XElement -> true
+        | :? XText as text -> not (String.IsNullOrWhiteSpace text.Value)
+        | _ -> false)
+
+let private hasOnlyScalarText (element: XElement) =
+    element.Nodes()
+    |> Seq.forall (function
+        | :? XText -> true
+        | _ -> false)
 
 let private normalizePackagePath (path: string) =
     let parts =
@@ -333,18 +355,33 @@ let private validatePackageCore (packagePath: string) =
     | [| _ |] -> fail "Unexpected nuspec licenseUrl metadata."
     | _ -> fail "Package must contain at most one licenseUrl metadata element."
 
-    match child metadata "projectUrl" with
-    | Some projectUrl when not (String.IsNullOrEmpty projectUrl.Value) -> validateUrl (projectUrl.Value.Trim()) "Project URL"
-    | _ -> ()
+    rejectForeignChild metadata "projectUrl" "metadata"
+    match children metadata "projectUrl" |> Seq.toArray with
+    | [| projectUrl |] ->
+        if hasUnexpectedAttributes projectUrl [] then
+            fail "Project URL metadata must not contain attributes."
+        if not (hasOnlyScalarText projectUrl) then
+            fail "Project URL metadata must contain scalar text only."
+        if projectUrl.Value <> expectedProjectUrl then
+            fail $"Project URL must be exactly '{expectedProjectUrl}', found '{projectUrl.Value}'."
+        validateUrl projectUrl.Value "Project URL"
+    | _ -> fail $"Package must contain exactly one project URL '{expectedProjectUrl}'."
 
-    match child metadata "repository" with
-    | Some repository ->
-        let repositoryUrl = repository.Attribute(XName.Get "url") |> Option.ofObj |> Option.map (fun attribute -> attribute.Value.Trim()) |> Option.defaultValue ""
-        let repositoryType = repository.Attribute(XName.Get "type") |> Option.ofObj |> Option.map (fun attribute -> attribute.Value.Trim()) |> Option.defaultValue ""
-        if String.IsNullOrEmpty repositoryUrl || String.IsNullOrEmpty repositoryType then
-            fail "Repository metadata must include both URL and type."
+    rejectForeignChild metadata "repository" "metadata"
+    match children metadata "repository" |> Seq.toArray with
+    | [| repository |] ->
+        if hasUnexpectedAttributes repository [ "url"; "type"; "branch"; "commit" ] then
+            fail "Repository metadata contains an unexpected or namespace-qualified attribute."
+        let repositoryUrl = repository.Attribute(XName.Get "url") |> Option.ofObj |> Option.map (fun attribute -> attribute.Value) |> Option.defaultValue ""
+        let repositoryType = repository.Attribute(XName.Get "type") |> Option.ofObj |> Option.map (fun attribute -> attribute.Value) |> Option.defaultValue ""
+        if repositoryUrl <> expectedRepositoryUrl then
+            fail $"Repository URL must be '{expectedRepositoryUrl}', found '{repositoryUrl}'."
+        if repositoryType <> expectedRepositoryType then
+            fail $"Repository type must be '{expectedRepositoryType}', found '{repositoryType}'."
+        if hasNestedElementsOrNonWhitespaceText repository then
+            fail "Repository metadata must not contain nested elements or non-whitespace text."
         validateUrl repositoryUrl "Repository URL"
-    | None -> ()
+    | _ -> fail "Package must contain exactly one repository metadata element."
 
     let licenses = children metadata "license" |> Seq.toArray
 

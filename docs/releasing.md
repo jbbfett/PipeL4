@@ -35,19 +35,18 @@ inventory. Stop if `master` or its reachable history is not approved for public 
 
 ## Gate B — public GitHub repository and hosted CI
 
-Decide the final GitHub owner and repository name. The canonical URL is **not yet established**;
-`<GITHUB-OWNER>` and `<GITHUB-REPOSITORY>` below are placeholders. Create a public repository under
-that owner with **no** GitHub-generated README, license, `.gitignore`, or other initial commit.
-With GitHub access configured and the empty remote confirmed, publish only approved `master`:
+The public repository identity is established as
+[`jbbfett/PipeL4`](https://github.com/jbbfett/PipeL4), with canonical URL
+`https://github.com/jbbfett/PipeL4`. Verify that the configured remote points to this repository
+and record the currently published `master` SHA for comparison with the intended source:
 
 ```sh
-git remote add origin https://github.com/<GITHUB-OWNER>/<GITHUB-REPOSITORY>.git
 git remote -v
-git push -u origin master
+git ls-remote origin refs/heads/master
 ```
 
-If a remote exists, inspect it and use the approved URL; do not blindly add or replace it. Do not
-use `git push --all`, `git push --mirror`, or a tag push at this gate. Verify the public branch list
+Do not blindly add or replace an existing remote. Do not use `git push --all`, `git push --mirror`,
+or a tag push at this gate. Verify the public branch list
 and tags contain only intended refs. Confirm `master` is the GitHub default branch (set it in
 repository Settings if needed). Inspect the public [README](../README.md), [MIT license](../LICENSE),
 [repository notices](../THIRD_PARTY_NOTICES.md), and [package notices](../src/PipeL4/THIRD_PARTY_NOTICES.md).
@@ -63,18 +62,19 @@ and [default-branch instructions](https://docs.github.com/en/repositories/config
 
 ### Publication prerequisites
 
-Settle the final source before tagging or packing. Verify that the intended nuget.org account or
-organization can publish PackageId `PipeL4` and will own the package. A previously observed 404
-from its package index does not prove the ID is claimable. Confirm version `0.1.0-alpha.1`,
-ToolCommandName `pipel4`, author Michael Krotenko, and MIT license in
-[`PipeL4.fsproj`](../src/PipeL4/PipeL4.fsproj). Decide whether to add `PackageProjectUrl`,
-`RepositoryUrl`, and `RepositoryType` now that the canonical URL is known. None is currently set.
-If repository metadata is added, include both `RepositoryUrl` and `RepositoryType`; the package
-validator requires the pair.
-If any are added, commit the approved change, rerun hosted CI, then rebuild and revalidate the
-package from that new source revision. Verify that [package notices](../src/PipeL4/THIRD_PARTY_NOTICES.md)
-still cover the distributed F# and Microsoft assemblies; the [Paket notice](../THIRD_PARTY_NOTICES.md)
-covers build tooling outside the package. Refresh the inventory if dependencies or payload change.
+Settle the final source before tagging or packing. The project metadata records the known GitHub
+identity in `PackageProjectUrl`, `RepositoryUrl`, and `RepositoryType`; package validation requires
+those exact values. This identifies the source repository only. NuGet publication identity and
+authorization remain pending: the intended nuget.org account or organization must confirm it can
+publish PackageId `PipeL4` and will own the package. A previously observed 404 from its package
+index does not prove the ID is claimable. Confirm version
+`0.1.0-alpha.1`, ToolCommandName `pipel4`, author Michael Krotenko, and MIT license in
+[`PipeL4.fsproj`](../src/PipeL4/PipeL4.fsproj). After the metadata change is approved and merged,
+rerun hosted CI, then rebuild and revalidate the package from that source revision. Verify that the
+[package notices](../src/PipeL4/THIRD_PARTY_NOTICES.md) still cover the distributed F# and Microsoft
+assemblies; the [Paket notice](../THIRD_PARTY_NOTICES.md) covers build tooling outside the package.
+Refresh the inventory if dependencies or payload change. The final source SHA, checksum, and tag
+remain pending until the release artifact is approved.
 
 Freeze the approved `master` SHA after all release-affecting source and documentation edits. Plan
 `v0.1.0-alpha.1` for that SHA, but create no tag until source is final and the artifact passes all
@@ -84,6 +84,7 @@ shell and fresh `artifacts/first-prerelease` directory. A CI-downloaded candidat
 instead only after matching its recorded SHA, contents, test results, and checksum to this gate.
 
 ```sh
+set -euo pipefail
 git switch master
 test -z "$(git status --porcelain)"
 approved_sha="$(git rev-parse HEAD)"
@@ -105,8 +106,81 @@ dotnet fsi scripts/test_validation_exit_codes.fsx "$package_path"
 PIPEL4_PACKAGE_PATH="$package_path" dotnet test --solution PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false
 test "$(git rev-parse HEAD)" = "$approved_sha"
 test -z "$(git status --porcelain)"
+python3 - "$package_path" "$approved_sha" <<'PY'
+import re
+import sys
+import zipfile
+import xml.etree.ElementTree as ET
+
+def fail(message):
+    raise SystemExit(f"Package source provenance check failed: {message}")
+
+package_path, approved_sha = sys.argv[1:]
+full_sha = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+if not full_sha.fullmatch(approved_sha):
+    fail("approved_sha is not a full commit SHA")
+
+supported_namespaces = {
+    "http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd",
+    "http://schemas.microsoft.com/packaging/2011/08/nuspec.xsd",
+    "http://schemas.microsoft.com/packaging/2011/10/nuspec.xsd",
+    "http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd",
+    "http://schemas.microsoft.com/packaging/2013/01/nuspec.xsd",
+    "http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd",
+}
+
+try:
+    with zipfile.ZipFile(package_path) as package:
+        nuspec_names = [name for name in package.namelist() if name.lower().endswith(".nuspec")]
+        if len(nuspec_names) != 1:
+            fail(f"expected one embedded nuspec, found {len(nuspec_names)}")
+        root = ET.fromstring(package.read(nuspec_names[0]))
+except (OSError, zipfile.BadZipFile, ET.ParseError) as error:
+    fail(f"could not read the selected package's embedded nuspec: {error}")
+
+if not root.tag.startswith("{"):
+    fail("nuspec package element has no NuGet namespace")
+namespace, root_name = root.tag[1:].split("}", 1)
+if root_name != "package" or namespace not in supported_namespaces:
+    fail("nuspec package element has an unexpected expanded XML name")
+
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+metadata_nodes = [element for element in root if local_name(element.tag) == "metadata"]
+if len(metadata_nodes) != 1 or metadata_nodes[0].tag != f"{{{namespace}}}metadata":
+    fail("nuspec metadata is missing, foreign, or ambiguous")
+metadata = metadata_nodes[0]
+repository_nodes = [element for element in metadata if local_name(element.tag) == "repository"]
+if len(repository_nodes) != 1 or repository_nodes[0].tag != f"{{{namespace}}}repository":
+    fail("canonical repository metadata is missing, foreign, or ambiguous")
+repository = repository_nodes[0]
+
+allowed_attributes = {"url", "type", "branch", "commit"}
+if any(name.startswith("{") or name not in allowed_attributes for name in repository.attrib):
+    fail("repository metadata has unexpected or namespace-qualified attributes")
+if repository.attrib.get("url") != "https://github.com/jbbfett/PipeL4.git":
+    fail("repository URL is absent or not canonical")
+if repository.attrib.get("type") != "git":
+    fail("repository type is absent or not git")
+if len(repository) != 0 or (repository.text or "").strip():
+    fail("repository metadata contains nested elements or non-whitespace text")
+
+package_commit = repository.attrib.get("commit", "")
+if not full_sha.fullmatch(package_commit):
+    fail("repository commit is absent or is not a full commit SHA")
+if package_commit != approved_sha:
+    fail("repository commit does not exactly match approved_sha")
+
+print(f"Verified package repository commit: {package_commit}")
+PY
 sha256sum "$package_path"
 ```
+
+If the repository commit assertion fails, stop before recording or approving the checksum, creating
+the tag, or authorizing NuGet publication. Investigate source provenance, then rebuild and revalidate
+the candidate from the approved revision. Do not edit the nuspec inside the package to make the
+assertion pass.
 
 Require exactly one `.nupkg` in the output directory and no `NU5046` missing-README warning in
 the pack output. The validator checks identity, version, tool metadata, runtime files, README,

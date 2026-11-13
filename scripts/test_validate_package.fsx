@@ -55,6 +55,30 @@ let rewritePackage sourcePath targetPath omitEntry replacement extraEntry =
         targetStream.Write(content, 0, content.Length)
     | None -> ()
 
+let rewritePackageNuspec sourcePath targetPath nuspecEntry mutate =
+    use original = ZipFile.OpenRead sourcePath
+    use output = new ZipArchive(new FileStream(targetPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None), ZipArchiveMode.Create)
+
+    for entry in original.Entries do
+        let content =
+            if entry.FullName = nuspecEntry then
+                use input = entry.Open()
+                let document = XDocument.Load input
+                let metadata =
+                    document.Root.Elements()
+                    |> Seq.filter (fun element -> element.Name.LocalName = "metadata")
+                    |> Seq.exactlyOne
+                mutate metadata
+                use serialized = new MemoryStream()
+                document.Save(serialized, SaveOptions.DisableFormatting)
+                serialized.ToArray()
+            else
+                readEntry original entry.FullName
+
+        let target = output.CreateEntry(entry.FullName, CompressionLevel.Optimal)
+        use targetStream = target.Open()
+        targetStream.Write(content, 0, content.Length)
+
 let runDotnetFromOutsideRepository (workingDirectory: string) arguments =
     let startInfo = new ProcessStartInfo("dotnet")
     for argument in arguments do
@@ -129,6 +153,8 @@ let runTests sourceSummary injectFailure =
     let outsideRepositoryDirectory = Path.Combine(temporaryRoot, "outside repository")
     let mitLicense = "<license type=\"expression\">MIT</license>"
     let sdkLicenseUrl = "<licenseUrl>https://licenses.nuget.org/MIT</licenseUrl>"
+    let projectUrl = "https://github.com/jbbfett/PipeL4"
+    let repositoryUrl = "https://github.com/jbbfett/PipeL4.git"
     let foreignLicense = "<x:license xmlns:x=\"urn:foreign\" type=\"expression\">MIT</x:license>"
     let sdkNuspecNamespace = "http://schemas.microsoft.com/packaging/2012/06/nuspec.xsd"
     let mutable passed = 0
@@ -147,6 +173,14 @@ let runTests sourceSummary injectFailure =
         let directory = Path.Combine(temporaryRoot, name)
         Directory.CreateDirectory directory |> ignore
         directory
+
+    let canonicalChild (metadata: XElement) name =
+        metadata.Elements(XName.Get(name, metadata.Name.NamespaceName)) |> Seq.exactlyOne
+
+    let rewriteMetadata targetDirectory mutate =
+        let target = Path.Combine(targetDirectory, Path.GetFileName sourcePath)
+        rewritePackageNuspec sourcePath target nuspecEntry mutate
+        target
 
     let expectError (expectedText: string) (path: string) =
         match validateInput path with
@@ -171,6 +205,147 @@ let runTests sourceSummary injectFailure =
             | Ok summary when summary.Version = sourceSummary.Version && summary.PackageId = "PipeL4" -> ()
             | Ok summary -> failwith $"Candidate summary changed unexpectedly: {summary.PackageId} {summary.Version}."
             | Error message -> failwith $"Candidate package was rejected: {message}")
+
+        run "accepts the canonical project and repository metadata" (fun () ->
+            let metadata = nuspecMetadata sourcePath nuspecEntry
+            match directChildren metadata "projectUrl" with
+            | [| value |] when value.Value.Trim() = projectUrl -> ()
+            | _ -> failwith "Test package does not contain the canonical project URL."
+            match directChildren metadata "repository" with
+            | [| repository |]
+                when repository.Attribute(XName.Get "url").Value = repositoryUrl
+                     && repository.Attribute(XName.Get "type").Value = "git" -> ()
+            | _ -> failwith "Test package does not contain the canonical Git repository URL and type.")
+
+        run "accepts standard optional repository branch and commit attributes" (fun () ->
+            let directory = scenarioDirectory "optional repository attributes"
+            let commit =
+                System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes "optional repository metadata regression")
+                |> Convert.ToHexString
+                |> fun value -> value.ToLowerInvariant()
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    let repository = canonicalChild metadata "repository"
+                    repository.SetAttributeValue(XName.Get "branch", "feature/metadata-regression")
+                    repository.SetAttributeValue(XName.Get "commit", commit))
+            match validateInput target with
+            | Ok _ -> ()
+            | Error message -> failwith $"Standard optional repository attributes were rejected: {message}")
+
+        run "accepts repository metadata without optional branch or commit attributes" (fun () ->
+            let directory = scenarioDirectory "repository without optional attributes"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    let repository = canonicalChild metadata "repository"
+                    for name in [ "branch"; "commit" ] do
+                        repository.Attribute(XName.Get name)
+                        |> Option.ofObj
+                        |> Option.iter (fun attribute -> attribute.Remove()))
+            match validateInput target with
+            | Ok _ -> ()
+            | Error message -> failwith $"Repository metadata without optional attributes was rejected: {message}")
+
+        run "rejects a missing projectUrl node" (fun () ->
+            let directory = scenarioDirectory "missing project URL"
+            let target = rewriteMetadata directory (fun metadata -> canonicalChild metadata "projectUrl" |> fun element -> element.Remove())
+            expectError "exactly one project URL" target)
+
+        run "rejects a missing repository node" (fun () ->
+            let directory = scenarioDirectory "missing repository node"
+            let target = rewriteMetadata directory (fun metadata -> canonicalChild metadata "repository" |> fun element -> element.Remove())
+            expectError "exactly one repository metadata element" target)
+
+        run "rejects duplicate projectUrl nodes" (fun () ->
+            let directory = scenarioDirectory "duplicate project URLs"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    metadata.Add(XElement(canonicalChild metadata "projectUrl")))
+            expectError "exactly one project URL" target)
+
+        run "rejects duplicate repository nodes" (fun () ->
+            let directory = scenarioDirectory "duplicate repository nodes"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    metadata.Add(XElement(canonicalChild metadata "repository")))
+            expectError "exactly one repository metadata element" target)
+
+        run "rejects a foreign-namespace projectUrl sibling" (fun () ->
+            let directory = scenarioDirectory "foreign project URL sibling"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    metadata.Add(XElement(XName.Get("projectUrl", "urn:foreign"), projectUrl)))
+            expectError "foreign-namespace 'projectUrl' element" target)
+
+        run "rejects a foreign-namespace repository sibling" (fun () ->
+            let directory = scenarioDirectory "foreign repository sibling"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    let repository = XElement(XName.Get("repository", "urn:foreign"))
+                    repository.Add(XAttribute(XName.Get "type", "git"))
+                    repository.Add(XAttribute(XName.Get "url", repositoryUrl))
+                    metadata.Add repository)
+            expectError "foreign-namespace 'repository' element" target)
+
+        run "rejects nested foreign XML inside projectUrl" (fun () ->
+            let directory = scenarioDirectory "nested foreign project URL XML"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    let project = canonicalChild metadata "projectUrl"
+                    project.RemoveNodes()
+                    project.Add(XElement(XName.Get("nested", "urn:foreign"), projectUrl)))
+            expectError "scalar text only" target)
+
+        run "rejects nested foreign XML inside repository" (fun () ->
+            let directory = scenarioDirectory "nested foreign repository XML"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    (canonicalChild metadata "repository").Add(XElement(XName.Get("nested", "urn:foreign"), "unexpected")))
+            expectError "nested elements or non-whitespace text" target)
+
+        run "rejects unexpected projectUrl attributes" (fun () ->
+            let directory = scenarioDirectory "project URL attribute"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    (canonicalChild metadata "projectUrl").Add(XAttribute(XName.Get "source", "ambiguous")))
+            expectError "must not contain attributes" target)
+
+        run "rejects a namespace-qualified repository url attribute" (fun () ->
+            let directory = scenarioDirectory "qualified repository URL attribute"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    (canonicalChild metadata "repository").Add(XAttribute(XName.Get("url", "urn:foreign"), "https://example.invalid/PipeL4.git")))
+            expectError "unexpected or namespace-qualified attribute" target)
+
+        run "rejects a namespace-qualified repository type attribute" (fun () ->
+            let directory = scenarioDirectory "qualified repository type attribute"
+            let target =
+                rewriteMetadata directory (fun metadata ->
+                    (canonicalChild metadata "repository").Add(XAttribute(XName.Get("type", "urn:foreign"), "svn")))
+            expectError "unexpected or namespace-qualified attribute" target)
+
+        run "rejects an incorrect project URL" (fun () ->
+            let directory = scenarioDirectory "incorrect project URL"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, projectUrl, "https://example.invalid/PipeL4")) None
+            expectError "Project URL must be" target)
+
+        run "rejects an incorrect repository URL" (fun () ->
+            let directory = scenarioDirectory "incorrect repository URL"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, repositoryUrl, "https://example.invalid/PipeL4.git")) None
+            expectError "Repository URL must be" target)
+
+        run "rejects an incorrect repository type" (fun () ->
+            let directory = scenarioDirectory "incorrect repository type"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, "type=\"git\"", "type=\"svn\"")) None
+            expectError "Repository type must be 'git'" target)
+
+        run "rejects a missing repository URL" (fun () ->
+            let directory = scenarioDirectory "missing repository URL"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target None (Some(nuspecEntry, repositoryUrl, "")) None
+            expectError "Repository URL must be" target)
 
         run "accepts the MIT expression without a license URL" (fun () ->
             let directory = scenarioDirectory "no license URL"
@@ -279,6 +454,21 @@ let runTests sourceSummary injectFailure =
                 (Some(nuspecEntry, $"xmlns=\"{sdkNuspecNamespace}\"", "xmlns=\"urn:foreign\""))
                 None
             expectError "unsupported namespace 'urn:foreign'" target)
+
+        run "rejects a case-changed NuGet namespace URI" (fun () ->
+            let directory = scenarioDirectory "case-changed NuGet namespace"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            let caseChangedNuspecNamespace = "http://schemas.microsoft.com/packaging/2012/06/Nuspec.xsd"
+            rewritePackage
+                sourcePath
+                target
+                None
+                (Some(
+                    nuspecEntry,
+                    $"xmlns=\"{sdkNuspecNamespace}\"",
+                    $"xmlns=\"{caseChangedNuspecNamespace}\""))
+                None
+            expectError $"unsupported namespace '{caseChangedNuspecNamespace}'" target)
 
         run "rejects duplicate identical license elements" (fun () ->
             let directory = scenarioDirectory "duplicate identical licenses"
