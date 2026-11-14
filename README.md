@@ -9,15 +9,16 @@ It explores protocol-agnostic byte-stream processing for integration testing, pr
 ## Quick Start
 
 PipeL4 forwards TCP bytes to a configured backend and can process each traffic direction with F#
-`.fsx` scripts. It requires the .NET 10 runtime; the .NET 10 SDK includes that runtime. Once
-`0.1.0-alpha.1` is published to NuGet.org, install it with:
+`.fsx` scripts. It requires the .NET 10 runtime; the .NET 10 SDK includes that runtime. Install the
+published [PipeL4 0.1.0-alpha.1 package on NuGet.org](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.1)
+with the exact-version command below. See the [GitHub Release](https://github.com/jbbfett/PipeL4/releases/tag/v0.1.0-alpha.1)
+for this prerelease's release notes.
 
 ```sh
 dotnet tool install --global PipeL4 --version 0.1.0-alpha.1
 ```
 
-The package is not published yet. To try it now, [build and install from this checkout](#install-pipel4)
-using the local package source. The installed command is `pipel4`; run `pipel4 --help` for all options.
+The installed command is `pipel4`; run `pipel4 --help` for all options.
 
 For a localhost exchange, open three Unix-like terminals. In the first, run this one-connection
 Python 3 echo backend on port 6000:
@@ -130,7 +131,21 @@ Current non-goals:
 PipeL4 targets `net10.0`. Install the .NET 10 SDK to use the .NET tool commands below; it includes
 the .NET 10 runtime required to run PipeL4.
 
-The package can be created and installed from this checkout:
+### Public NuGet installation
+
+For ordinary use, install the published prerelease from NuGet.org at its exact version:
+
+```sh
+dotnet tool install --global PipeL4 --version 0.1.0-alpha.1
+```
+
+See the [PipeL4 NuGet package](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.1) and its
+[GitHub Release](https://github.com/jbbfett/PipeL4/releases/tag/v0.1.0-alpha.1). The command
+installs the global `pipel4` command.
+
+### Local build and package installation
+
+Contributors and package validators can create and install a package from this checkout:
 
 ```sh
 dotnet tool restore
@@ -159,23 +174,15 @@ dotnet pipel4 --help
 The manifest is discovered from the current directory or a parent directory. Run the local tool
 with `dotnet pipel4` followed by its arguments (or use `dotnet tool run pipel4 -- <arguments>`).
 
-To install a newer prerelease package from the local feed:
-
-```sh
-dotnet tool update --global PipeL4 --source ./artifacts --prerelease
-dotnet tool update --local PipeL4 --source ./artifacts --prerelease
-```
+For local package iteration, build a package into `./artifacts` and install its selected version
+using `--source ./artifacts` as shown above. This local workflow does not indicate that later
+prerelease versions are available on NuGet.org.
 
 Remove a global installation with `dotnet tool uninstall --global PipeL4`, or remove a local one
 with `dotnet tool uninstall --local PipeL4`.
 
 Maintainers should follow the [release procedure](docs/releasing.md) to build and validate a release
 candidate. CI validates packages but does not publish them.
-
-After PipeL4 is published to NuGet.org, the corresponding global install and update commands are
-`dotnet tool install --global PipeL4 --prerelease` and
-`dotnet tool update --global PipeL4 --prerelease`. Those commands depend on publication and are not
-needed for the local-package workflow above.
 
 ## Installed examples
 

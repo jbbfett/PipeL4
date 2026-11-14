@@ -16,8 +16,9 @@ with IPv4 or IPv6 literal endpoint addresses. It does not provide TLS, implicit 
 plugin-controlled routing, or a plugin sandbox. Scripts run as trusted in-process code and have
 limited dependency references.
 
-After the package is published to nuget.org, install this exact prerelease version with the .NET
-10 SDK. The installed command is `pipel4`:
+PipeL4 0.1.0-alpha.1 is available on
+[nuget.org](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.1). Install this exact prerelease
+version with the .NET 10 SDK. The installed command is `pipel4`:
 
 ```sh
 dotnet tool install --global PipeL4 --version 0.1.0-alpha.1

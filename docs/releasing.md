@@ -1,10 +1,15 @@
-# First prerelease: manual publication
+# First prerelease: manual publication record
 
-This runbook is for the first public `PipeL4` .NET Tool package, version
-`0.1.0-alpha.1`, and GitHub tag `v0.1.0-alpha.1`. The [release notes](first-prerelease-notes.md)
-are the proposed GitHub Release body. All publication steps below are future actions; CI does not
-publish a package, tag, or GitHub Release. Stop at a failed check, resolve it, and repeat checks
-affected by the change. Record the evidence at each gate before proceeding.
+`PipeL4` version `0.1.0-alpha.1` has been released as the [NuGet package](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.1)
+and [GitHub prerelease](https://github.com/jbbfett/PipeL4/releases/tag/v0.1.0-alpha.1), from source
+commit `075a4502101cef4740c1d4496b3785bbc0771bef`, under tag `v0.1.0-alpha.1`. The [release notes](first-prerelease-notes.md)
+document this release's scope and installation instructions.
+
+The gates below preserve the first-release procedure and its checks as a historical, reproducible
+record; their approval and publication actions for `0.1.0-alpha.1` are complete. CI does not publish
+a package, tag, or GitHub Release. For a future version, adapt the recorded procedure to that
+version and its source, and record evidence at each gate before proceeding. Stop at a failed check,
+resolve it, and repeat checks affected by the change.
 
 The [CI workflow](../.github/workflows/ci.yml) runs on pushes to `master`, pull requests targeting
 `master`, and manual dispatch. It restores, builds, tests, packs, and validates a local package on
@@ -65,16 +70,18 @@ and [default-branch instructions](https://docs.github.com/en/repositories/config
 Settle the final source before tagging or packing. The project metadata records the known GitHub
 identity in `PackageProjectUrl`, `RepositoryUrl`, and `RepositoryType`; package validation requires
 those exact values. This identifies the source repository only. NuGet publication identity and
-authorization remain pending: the intended nuget.org account or organization must confirm it can
-publish PackageId `PipeL4` and will own the package. A previously observed 404 from its package
-index does not prove the ID is claimable. Confirm version
+authorization were confirmed for the first release: the nuget.org account or organization had to
+confirm it could publish PackageId `PipeL4` and would own the package. A previously observed 404
+from its package index did not prove the ID was claimable. Confirm version
 `0.1.0-alpha.1`, ToolCommandName `pipel4`, author Michael Krotenko, and MIT license in
 [`PipeL4.fsproj`](../src/PipeL4/PipeL4.fsproj). After the metadata change is approved and merged,
 rerun hosted CI, then rebuild and revalidate the package from that source revision. Verify that the
 [package notices](../src/PipeL4/THIRD_PARTY_NOTICES.md) still cover the distributed F# and Microsoft
 assemblies; the [Paket notice](../THIRD_PARTY_NOTICES.md) covers build tooling outside the package.
-Refresh the inventory if dependencies or payload change. The final source SHA, checksum, and tag
-remain pending until the release artifact is approved.
+Refresh the inventory if dependencies or payload change. For the published release, the source SHA
+is `075a4502101cef4740c1d4496b3785bbc0771bef`, the artifact passed its release validation, and tag
+`v0.1.0-alpha.1` points to that source. The remaining checks below preserve the procedure used to
+verify those release inputs.
 
 Freeze the approved `master` SHA after all release-affecting source and documentation edits. Plan
 `v0.1.0-alpha.1` for that SHA, but create no tag until source is final and the artifact passes all

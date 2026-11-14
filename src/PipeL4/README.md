@@ -3,7 +3,8 @@
 PipeL4 is an experimental TCP byte-stream proxy with programmable F# processing pipelines.
 It targets .NET 10 and requires the .NET 10 runtime (also included with the .NET 10 SDK).
 
-After this prerelease is published to NuGet.org, install it with:
+PipeL4 0.1.0-alpha.1 is available on
+[NuGet.org](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.1). Install this exact version with:
 
 ```sh
 dotnet tool install --global PipeL4 --version 0.1.0-alpha.1
