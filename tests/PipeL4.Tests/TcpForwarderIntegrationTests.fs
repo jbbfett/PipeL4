@@ -84,15 +84,19 @@ module TcpForwarderIntegrationTests =
             member _.Dispose() = ()
 
     type private RecordingLogger() =
-        let firstFailure = TaskCompletionSource<exn>(TaskCreationOptions.RunContinuationsAsynchronously)
-        let twoFailures = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let firstFailure = TaskCompletionSource<exn> TaskCreationOptions.RunContinuationsAsynchronously
+        let twoFailures = TaskCompletionSource<unit> TaskCreationOptions.RunContinuationsAsynchronously
+        let terminalDirectionDiagnosticsPublished =
+            TaskCompletionSource<unit> TaskCreationOptions.RunContinuationsAsynchronously
         let failures = ConcurrentQueue<exn>()
         let messages = ConcurrentQueue<string>()
         let structuredRecords = ConcurrentQueue<StructuredLogRecord>()
         let mutable failureCount = 0
+        let mutable terminalDirectionDiagnosticCount = 0
 
         member _.FirstFailure = firstFailure.Task
         member _.TwoFailures = twoFailures.Task
+        member _.TerminalDirectionDiagnosticsPublished = terminalDirectionDiagnosticsPublished.Task
         member _.Failures = failures.ToArray()
         member _.Messages = messages.ToArray()
         member _.StructuredRecords = structuredRecords.ToArray()
@@ -111,7 +115,8 @@ module TcpForwarderIntegrationTests =
                     error: exn | null,
                     formatter: Func<'TState, exn | null, string>
                 ) =
-                messages.Enqueue(formatter.Invoke(state, error))
+                let message = formatter.Invoke(state, error)
+                messages.Enqueue message
 
                 let properties =
                     match box state with
@@ -119,11 +124,19 @@ module TcpForwarderIntegrationTests =
                         values |> Seq.map (fun value -> value.Key, value.Value) |> Seq.toArray
                     | _ -> Array.empty
 
-                structuredRecords.Enqueue(
+                let record =
                     { Level = _logLevel
-                      Message = formatter.Invoke(state, error)
+                      Message = message
                       Properties = properties }
-                )
+
+                structuredRecords.Enqueue record
+
+                if
+                    record.Message.StartsWith "Direction "
+                    && not (record.Message.Contains " stage ")
+                    && Interlocked.Increment(&terminalDirectionDiagnosticCount) = 2
+                then
+                    terminalDirectionDiagnosticsPublished.TrySetResult(()) |> ignore
 
                 match Option.ofObj error with
                 | Some error ->
@@ -651,6 +664,7 @@ module TcpForwarderIntegrationTests =
                             backend.Client.Shutdown(SocketShutdown.Send)
                             do! expectEndOfStream clientStream timeout.Token
                             do! expectEndOfStream backendStream timeout.Token
+                            do! logger.TerminalDirectionDiagnosticsPublished.WaitAsync timeout.Token
                         })
 
             let snapshot = observed.Task.Result.GetSnapshot()
@@ -869,6 +883,7 @@ module TcpForwarderIntegrationTests =
                                 actual |> should equal [| 1uy; 2uy |]
                                 do! expectEndOfStream backendStream timeout.Token
                                 do! expectEndOfStream clientStream timeout.Token
+                                do! logger.TerminalDirectionDiagnosticsPublished.WaitAsync timeout.Token
                             })
             finally
                 expansionCommitted.TrySetResult(()) |> ignore
