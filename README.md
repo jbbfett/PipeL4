@@ -145,38 +145,41 @@ installs the global `pipel4` command.
 
 ### Local build and package installation
 
-Contributors and package validators can create and install a package from this checkout:
+The published NuGet.org release remains `0.1.0-alpha.1`. This checkout currently builds the local,
+unpublished `0.1.0-alpha.2` candidate. Contributors and package validators can create and install
+that candidate from this checkout:
 
 ```sh
 dotnet tool restore
 dotnet paket restore
 dotnet build PipeL4.sln
-dotnet pack src/PipeL4/PipeL4.fsproj --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false --output ./artifacts
-dotnet tool install --global PipeL4 --source ./artifacts --version 0.1.0-alpha.1
+mkdir -p ./artifacts/release-candidate
+dotnet pack src/PipeL4/PipeL4.fsproj --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false --output ./artifacts/release-candidate
+dotnet tool install --global PipeL4 --source ./artifacts/release-candidate --version 0.1.0-alpha.2
 ```
 
-`--version 0.1.0-alpha.1` selects the package version. `--source ./artifacts` replaces configured
-NuGet feeds with the local feed for this installation.
+`--version 0.1.0-alpha.2` selects the local candidate. `--source ./artifacts/release-candidate`
+replaces configured NuGet feeds with the local feed for this installation.
 
 The global command is `pipel4`. If the shell cannot find it, add the .NET global tools directory to
 `PATH` (normally `$HOME/.dotnet/tools` on Linux and macOS or `%USERPROFILE%\.dotnet\tools` on
 Windows), then open a new shell.
 
 For a repository-scoped installation, run these commands from the repository root, where
-`./artifacts` was created. If this directory does not yet have a local tool manifest, create one
-first with `dotnet new tool-manifest`. Then add PipeL4 to the manifest:
+`./artifacts/release-candidate` was created. If this directory does not yet have a local tool
+manifest, create one first with `dotnet new tool-manifest`. Then add PipeL4 to the manifest:
 
 ```sh
-dotnet tool install --local PipeL4 --source ./artifacts --version 0.1.0-alpha.1
+dotnet tool install --local PipeL4 --source ./artifacts/release-candidate --version 0.1.0-alpha.2
 dotnet pipel4 --help
 ```
 
 The manifest is discovered from the current directory or a parent directory. Run the local tool
 with `dotnet pipel4` followed by its arguments (or use `dotnet tool run pipel4 -- <arguments>`).
 
-For local package iteration, build a package into `./artifacts` and install its selected version
-using `--source ./artifacts` as shown above. This local workflow does not indicate that later
-prerelease versions are available on NuGet.org.
+For local package iteration, build a candidate into `./artifacts/release-candidate` and install its
+selected version from that directory. The `0.1.0-alpha.2` candidate is not a NuGet.org release; use
+the published `0.1.0-alpha.1` instructions above for public installation.
 
 Remove a global installation with `dotnet tool uninstall --global PipeL4`, or remove a local one
 with `dotnet tool uninstall --local PipeL4`.

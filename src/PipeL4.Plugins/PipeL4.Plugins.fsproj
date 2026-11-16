@@ -1,11 +1,29 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <PackageId>PipeL4.Plugins</PackageId>
+    <AssemblyName>PipeL4.Plugins</AssemblyName>
+    <Version>$(PipeL4PackageVersion)</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <Authors>Michael Krotenko</Authors>
+    <PackageDescription>Public F# processor contracts for the PipeL4 TCP byte-stream runtime.</PackageDescription>
+    <PackageTags>tcp;proxy;byte-stream;F#;plugin;processor-api</PackageTags>
+    <PackageProjectUrl>https://github.com/jbbfett/PipeL4</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/jbbfett/PipeL4.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <Copyright>2026 Michael Krotenko</Copyright>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <RestoreEnablePackagePruning>false</RestoreEnablePackagePruning>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Include="ProcessorApi.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="../../LICENSE" Pack="true" PackagePath="\" Link="LICENSE" />
   </ItemGroup>
 
   <Import Project="..\..\.paket\Paket.Restore.targets" />

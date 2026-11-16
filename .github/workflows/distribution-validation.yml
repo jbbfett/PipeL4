@@ -3,8 +3,10 @@ name: Distribution validation
 on:
   push:
     branches:
-      - "**"
+      - master
   pull_request:
+    branches:
+      - master
   workflow_dispatch:
 
 permissions:
@@ -12,7 +14,7 @@ permissions:
 
 jobs:
   validate:
-    name: Build and validate .NET Tool
+    name: Build and validate distributable packages
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -27,7 +29,7 @@ jobs:
         run: dotnet tool restore
 
       - name: Clean Release outputs
-        run: dotnet clean src/PipeL4/PipeL4.fsproj --configuration Release -p:PaketDisableCliTest=true -p:BuildInParallel=false
+        run: dotnet clean PipeL4.sln --configuration Release -p:PaketDisableCliTest=true -p:BuildInParallel=false
 
       - name: Restore dependencies
         run: dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
@@ -52,6 +54,23 @@ jobs:
             exit 1
           fi
 
+      - name: Create public API candidate package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/public-api-candidate
+          pack_log="$RUNNER_TEMP/pipel4-public-api-pack.log"
+          dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj \
+            --configuration Release \
+            --no-restore \
+            -p:PaketDisableCliTest=true \
+            -p:BuildInParallel=false \
+            --output ./artifacts/public-api-candidate 2>&1 | tee "$pack_log"
+          if grep -F "NU5046" "$pack_log"; then
+            echo "Package validation failed: dotnet pack reported a missing public API package README (NU5046)." >&2
+            exit 1
+          fi
+
       - name: Verify package validator failure handling
         run: dotnet fsi scripts/test_validation_exit_codes.fsx ./artifacts/release-candidate
 
@@ -60,12 +79,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          dotnet fsi scripts/validate_package.fsx ./artifacts/release-candidate
-          mapfile -t packages < <(find ./artifacts/release-candidate -maxdepth 1 -type f -name 'PipeL4.*.nupkg' -print)
-          package_name="${packages[0]##*/}"
-          package_version="${package_name#PipeL4.}"
-          package_version="${package_version%.nupkg}"
-          printf 'package_version=%s\n' "$package_version" >> "$GITHUB_OUTPUT"
+          mapfile -t tool_packages < <(find ./artifacts/release-candidate -maxdepth 1 -type f -name 'PipeL4.*.nupkg' -print)
+          mapfile -t api_packages < <(find ./artifacts/public-api-candidate -maxdepth 1 -type f -name 'PipeL4.Plugins.*.nupkg' -print)
+          if [[ ${#tool_packages[@]} -ne 1 ]]; then
+            echo "Tool package validation failed: expected one PipeL4 package, found ${#tool_packages[@]}." >&2
+            exit 1
+          fi
+          if [[ ${#api_packages[@]} -ne 1 ]]; then
+            echo "Public API package validation failed: expected one PipeL4.Plugins package, found ${#api_packages[@]}." >&2
+            exit 1
+          fi
+          dotnet fsi scripts/validate_package.fsx "${tool_packages[0]}"
+          dotnet fsi scripts/validate_public_api_package.fsx "${api_packages[0]}"
+          tool_package_name="${tool_packages[0]##*/}"
+          tool_version="${tool_package_name#PipeL4.}"
+          tool_version="${tool_version%.nupkg}"
+          api_package_name="${api_packages[0]##*/}"
+          api_version="${api_package_name#PipeL4.Plugins.}"
+          api_version="${api_version%.nupkg}"
+          if [[ "$tool_version" != "$api_version" ]]; then
+            echo "Distribution validation failed: PipeL4 version '$tool_version' does not match PipeL4.Plugins version '$api_version'." >&2
+            exit 1
+          fi
+          printf 'Validated lockstep package version %s.\n' "$tool_version"
+          printf 'package_version=%s\n' "$tool_version" >> "$GITHUB_OUTPUT"
+          api_package_path="$(realpath "${api_packages[0]}")"
+          printf 'public_api_package_path=%s\n' "$api_package_path" >> "$GITHUB_OUTPUT"
+
+      - name: Verify public API consumer compilation failure handling
+        env:
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
+        run: dotnet fsi scripts/test_public_api_consumer.fsx "$PUBLIC_API_PACKAGE_PATH"
 
       - name: Run regression suite against release candidate
         shell: bash
@@ -73,7 +117,7 @@ jobs:
           set -euo pipefail
           mapfile -t packages < <(find ./artifacts/release-candidate -maxdepth 1 -type f -name 'PipeL4.*.nupkg' -print)
           if [[ ${#packages[@]} -ne 1 ]]; then
-            echo "Installed-tool validation failed: expected one validated PipeL4 package, found ${#packages[@]}." >&2
+            echo "Installed-tool validation failed: expected one validated PipeL4 package, found ${#packages[@]}" >&2
             exit 1
           fi
           PIPEL4_PACKAGE_PATH="${packages[0]}" dotnet test \
@@ -83,10 +127,13 @@ jobs:
             -p:PaketDisableCliTest=true \
             -p:BuildInParallel=false
           printf '%s\n' "$GITHUB_SHA" > ./artifacts/release-candidate/source-revision.txt
+          printf '%s\n' "$GITHUB_SHA" > ./artifacts/public-api-candidate/source-revision.txt
 
       - name: Upload validated release candidate
         uses: actions/upload-artifact@v7
         with:
           name: PipeL4-${{ steps.package.outputs.package_version }}-release-candidate-${{ github.sha }}
-          path: ./artifacts/release-candidate/
+          path: |
+            ./artifacts/release-candidate/
+            ./artifacts/public-api-candidate/
           if-no-files-found: error

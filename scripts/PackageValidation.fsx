@@ -25,6 +25,7 @@ let private requiredToolFiles =
       "PipeL4.deps.json"
       "PipeL4.runtimeconfig.json"
       "PipeL4.Core.dll"
+      "PipeL4.PluginHost.dll"
       "PipeL4.Plugins.dll"
       "FSharp.Compiler.Service.dll"
       "FSharp.Core.dll"

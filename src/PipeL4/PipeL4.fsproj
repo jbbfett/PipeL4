@@ -5,7 +5,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>pipel4</ToolCommandName>
     <PackageId>PipeL4</PackageId>
-    <Version>0.1.0-alpha.1</Version>
+    <Version>$(PipeL4PackageVersion)</Version>
     <Authors>Michael Krotenko</Authors>
     <PackageDescription>Experimental TCP byte-stream proxy and runtime with F# .fsx processor plugins.</PackageDescription>
     <PackageTags>tcp;proxy;byte-stream;F#;dotnet-tool;plugin</PackageTags>
