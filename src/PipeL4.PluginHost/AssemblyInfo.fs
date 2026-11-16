@@ -1,4 +1,4 @@
-namespace PipeL4.Plugins
+namespace PipeL4.PluginHost
 
 open System.Runtime.CompilerServices
 

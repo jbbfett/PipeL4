@@ -16,6 +16,7 @@
     <Compile Include="ConnectionStateTests.fs" />
     <Compile Include="TcpForwarderIntegrationTests.fs" />
     <Compile Include="ProcessorContractTests.fs" />
+    <Compile Include="PublicApiBoundaryTests.fs" />
     <Compile Include="ProcessorPipelineTests.fs" />
     <Compile Include="ScriptProcessorTests.fs" />
     <Compile Include="ScriptCompilerTests.fs" />
@@ -32,6 +33,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/PipeL4.Core/PipeL4.Core.fsproj" />
     <ProjectReference Include="../../src/PipeL4.Plugins/PipeL4.Plugins.fsproj" />
+    <ProjectReference Include="../../src/PipeL4.PluginHost/PipeL4.PluginHost.fsproj" />
     <ProjectReference Include="../../src/PipeL4/PipeL4.fsproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 

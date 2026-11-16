@@ -11,6 +11,7 @@ open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
 open PipeL4.Core
+open PipeL4.PluginHost
 open PipeL4.Plugins
 open Xunit
 

@@ -28,6 +28,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/PipeL4.Core/PipeL4.Core.fsproj" />
     <ProjectReference Include="../../src/PipeL4.Plugins/PipeL4.Plugins.fsproj" />
+    <ProjectReference Include="../../src/PipeL4.PluginHost/PipeL4.PluginHost.fsproj" />
   </ItemGroup>
 
   <Import Project="..\..\.paket\Paket.Restore.targets" />

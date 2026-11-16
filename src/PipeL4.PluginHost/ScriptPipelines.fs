@@ -1,4 +1,4 @@
-namespace PipeL4.Plugins
+namespace PipeL4.PluginHost
 
 open System
 open System.Collections.Generic
@@ -8,6 +8,7 @@ open System.Threading
 open System.Threading.Tasks
 open Microsoft.Extensions.Logging
 open PipeL4.Core
+open PipeL4.Plugins
 
 type internal ScriptPluginConfigurationException(message: string) =
     inherit Exception(message)

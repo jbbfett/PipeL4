@@ -1,9 +1,10 @@
-namespace PipeL4.Plugins
+namespace PipeL4.PluginHost
 
 open System
 open System.Reflection
 open System.Runtime.ExceptionServices
 open System.Threading.Tasks
+open PipeL4.Plugins
 
 type internal ConnectionStateAdapter(state: PipeL4.Core.ConnectionState) =
     do

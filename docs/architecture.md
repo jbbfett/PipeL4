@@ -221,10 +221,11 @@ concurrent shutdown request. If an `OperationCanceledException` and shutdown req
 token state at that boundary determines the result. Once the listener has started, its established
 cancellation and connection-cleanup behavior applies.
 
-`PipeL4.Plugins` owns in-process script compilation and assembly loading. The host supplies a
-controlled reference set consisting of the running .NET runtime, FSharp.Core, and the public
-`PipeL4.Plugins` API; plugin-authored `#r`, `#I`, and `#load` directives are rejected rather than
-used to expand that set. `PipeL4.Core` and compiler-service APIs are not script references.
+`PipeL4.Plugins` contains the public processor contracts. `PipeL4.PluginHost` owns in-process
+script compilation and assembly loading and depends on `PipeL4.Plugins` and `PipeL4.Core`. The host
+supplies a controlled reference set consisting of the running .NET runtime, FSharp.Core, and the
+public `PipeL4.Plugins` API; plugin-authored `#r`, `#I`, and `#load` directives are rejected rather
+than used to expand that set. `PipeL4.Core` and compiler-service APIs are not script references.
 Compiler outputs are isolated in a per-compilation temporary directory, loaded from memory into
 the default assembly load context, and then removed. Assemblies loaded this way remain present
 for the process lifetime; unload and reload semantics are outside the current runtime scope.
@@ -273,7 +274,7 @@ Plugins may observe, transform, drop, delay, buffer, frame, and maintain protoco
 The runtime creates exactly one internal connection-state registry for every accepted TCP
 connection, including connections that use only raw forwarding. The per-connection processor
 factory receives that registry once, so every stage in both directions can be associated with the
-same instance. Registries are never shared between connections. `PipeL4.Plugins` creates one
+same instance. Registries are never shared between connections. `PipeL4.PluginHost` creates one
 non-owning `IConnectionState` view of that registry per connection and passes the same view to every
 state-aware script processor constructor in both directions. The processor invocation signature is
 unchanged, and parameterless processors do not need state-related boilerplate.

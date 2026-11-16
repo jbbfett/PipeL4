@@ -1,4 +1,4 @@
-namespace PipeL4.Plugins
+namespace PipeL4.PluginHost
 
 open System
 open System.IO
@@ -8,6 +8,7 @@ open System.Threading.Tasks
 open FSharp.Compiler.CodeAnalysis
 open FSharp.Compiler.Diagnostics
 open FSharp.Compiler.Tokenization
+open PipeL4.Plugins
 
 [<RequireQualifiedAccess>]
 type internal ScriptDiagnosticSeverity =

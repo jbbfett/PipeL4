@@ -5,7 +5,7 @@ open System.Reflection
 open System.Threading
 open Microsoft.Extensions.Logging
 open PipeL4.Core
-open PipeL4.Plugins
+open PipeL4.PluginHost
 
 let private usage =
     String.concat
