@@ -1,38 +1,446 @@
-# First prerelease: manual publication record
+# Release procedures and publication records
+
+## 0.1.0-alpha.1 publication record
 
 `PipeL4` version `0.1.0-alpha.1` has been released as the [NuGet package](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.1)
 and [GitHub prerelease](https://github.com/jbbfett/PipeL4/releases/tag/v0.1.0-alpha.1), from source
 commit `075a4502101cef4740c1d4496b3785bbc0771bef`, under tag `v0.1.0-alpha.1`. The [release notes](first-prerelease-notes.md)
 document this release's scope and installation instructions.
 
-## Future lockstep packages
+## Lockstep packages
 
 Future releases distribute both `PipeL4` (the .NET tool) and `PipeL4.Plugins` (the public API
 library) at the same NuGet version and publish them together. Set the single
 `PipeL4PackageVersion` property in [`Directory.Build.props`](../Directory.Build.props); both
 distributable projects derive their package `Version` from it. The current candidate is
 `0.1.0-alpha.2`, following the published `PipeL4 0.1.0-alpha.1` CLI release. The alpha.1 release
-was the tool package; the matching `PipeL4.Plugins` package was not published at that version. The
-matching alpha.2 tool and library are local release candidates and have not been published. Build
-the tool into `artifacts/release-candidate` and the library into `artifacts/public-api-candidate`;
-validate both and confirm their package versions match before retaining or publishing either
-package. CI validates candidates but does not publish them.
+was the tool package; the matching `PipeL4.Plugins` package was not published at that version. This
+checkout identifies both alpha.2 packages as local release candidates. Verify their live NuGet
+status and publishing account ownership before release. The commands below build and validate both
+packages; CI and Distribution validation do not publish them.
 
-The gates below preserve the first-release procedure and its checks as a historical, reproducible
-record; their approval and publication actions for `0.1.0-alpha.1` are complete. CI does not publish
-a package, tag, or GitHub Release. For a future version, adapt the recorded procedure to that
-version and its source, and record evidence at each gate before proceeding. Stop at a failed check,
-resolve it, and repeat checks affected by the change.
+## 0.1.0-alpha.2 release procedure
+
+### Package model and compatibility
+
+The release consists of two packages at the same NuGet version:
+
+- `PipeL4` is the `net10.0` .NET Tool. It installs the `pipel4` command and bundles the public
+  contract assembly and runtime dependencies required by the tool.
+- `PipeL4.Plugins` is a `net10.0` library containing the public F# processor contracts. It contains
+  the contract assembly, README, and MIT license, and declares `FSharp.Core` as its only package
+  dependency. It does not depend on the tool, runtime, or script host.
+
+Both package versions come from `PipeL4PackageVersion` in
+[`Directory.Build.props`](../Directory.Build.props). For this release, the version is
+`0.1.0-alpha.2`; the package version is separate from the public contract assembly's CLR version
+`1.0.0.0`. Public API consumers need a .NET 10-compatible project and the matching
+`PipeL4.Plugins` package version. The tool already carries that assembly, so a script run by
+`PipeL4` does not need a separate package install or restore.
+
+For editor and F# Interactive type checking, the repository example guards the package reference
+with `INTERACTIVE`:
+
+```fsharp
+#if INTERACTIVE
+#r "nuget: PipeL4.Plugins, 0.1.0-alpha.2"
+#endif
+```
+
+The alpha.2 version in this checkout is a local candidate in the documented workflow. The PipeL4
+host compiles the guarded reference out and uses its bundled contract assembly. A public consumer
+should use the same released version of `PipeL4.Plugins` as the tool. A NuGet package version that
+has already been published cannot be replaced.
+
+F# Interactive also resolves an implicit `FSharp.Core` package. If its SDK-selected version is
+older than the dependency declared by `PipeL4.Plugins`, restore can report `NU1605`. Set
+`FSharpCoreImplicitPackageVersion` to the package's declared dependency version before launching
+FSI or VS Code/Ionide. For alpha.2, the package declares `FSharp.Core` `10.1.401`; this setting
+does not add another script reference or change PipeL4's runtime loading path.
+
+### 1. Local source validation
+
+Run from a clean checkout of the release branch. Record the selected SDK and source revision. The
+repository requests SDK `10.0.112` in `global.json`; use the SDK selected by the installed `dotnet`
+resolver. These commands assume a Unix-like shell and the configured Microsoft.Testing.Platform
+runner:
+
+```sh
+set -euo pipefail
+dotnet --version
+git status --short
+git rev-parse HEAD
+dotnet tool restore
+dotnet clean PipeL4.sln --configuration Release -m:1 -p:PaketDisableCliTest=true -p:BuildInParallel=false
+dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
+dotnet build PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true
+```
+
+Stop on a failed command. Do not change the test runner configuration to work around an invocation
+or environment failure; record and resolve the failure before release review.
+
+### 2. Create and inspect both local packages
+
+Use fresh output directories. Both `dotnet pack` commands must complete without a missing README
+warning (`NU5046`), and each directory must contain only its expected package:
+
+```sh
+set -euo pipefail
+tool_dir=./artifacts/second-prerelease/tool
+api_dir=./artifacts/second-prerelease/plugins
+test ! -e "$tool_dir"
+test ! -e "$api_dir"
+mkdir -p "$tool_dir" "$api_dir"
+dotnet pack src/PipeL4/PipeL4.fsproj --configuration Release --no-restore \
+  -p:PaketDisableCliTest=true -p:BuildInParallel=false --output "$tool_dir"
+dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj --configuration Release --no-restore \
+  -p:PaketDisableCliTest=true -p:BuildInParallel=false --output "$api_dir"
+tool_package="$tool_dir/PipeL4.0.1.0-alpha.2.nupkg"
+api_package="$api_dir/PipeL4.Plugins.0.1.0-alpha.2.nupkg"
+test -f "$tool_package"
+test -f "$api_package"
+test "$(find "$tool_dir" -maxdepth 1 -type f -name '*.nupkg' | wc -l)" -eq 1
+test "$(find "$api_dir" -maxdepth 1 -type f -name '*.nupkg' | wc -l)" -eq 1
+```
+
+Inspect package entries and nuspecs directly. Check each package ID, version, target, author,
+description, tags, project and repository URLs, license metadata, README, and payload. Confirm the
+tool nuspec identifies a `DotnetTool` with command `pipel4`; confirm its runtime files include every
+asset from `PipeL4.deps.json` and include `PipeL4.Plugins.dll`. Confirm the library's only assembly
+is `lib/net10.0/PipeL4.Plugins.dll` and its only dependency is `FSharp.Core`.
+
+```sh
+unzip -l "$tool_package"
+unzip -p "$tool_package" PipeL4.nuspec
+unzip -l "$api_package"
+unzip -p "$api_package" PipeL4.Plugins.nuspec
+sha256sum "$tool_package" "$api_package"
+```
+
+Record each path and checksum with the source revision. These pre-merge packages are review
+candidates; final release artifacts must come from the hosted Distribution validation run for the
+squash-merged source SHA.
+
+### 3. Verify package consumers
+
+Run the repository validators and consumer checks against those exact files. The public API
+validator checks the package metadata and payload, creates a separate F# consumer project, restores
+from an isolated local feed containing the candidate and cached `FSharp.Core`, and builds it. The
+FSI checks use the same `AsciiUppercase.fsx` example referenced above.
+
+```sh
+set -euo pipefail
+tool_dir=./artifacts/second-prerelease/tool
+api_dir=./artifacts/second-prerelease/plugins
+tool_package="$tool_dir/PipeL4.0.1.0-alpha.2.nupkg"
+api_package="$api_dir/PipeL4.Plugins.0.1.0-alpha.2.nupkg"
+dotnet fsi scripts/validate_package.fsx "$tool_package"
+dotnet fsi scripts/test_validate_package.fsx "$tool_package"
+dotnet fsi scripts/test_validation_exit_codes.fsx "$tool_dir"
+dotnet fsi scripts/validate_public_api_package.fsx "$api_package"
+dotnet fsi scripts/test_public_api_consumer.fsx "$api_package"
+dotnet fsi scripts/test_fsi_authoring_cache.fsx "$api_package" examples/AsciiUppercase.fsx
+dotnet fsi scripts/validate_fsi_authoring.fsx "$api_package" examples/AsciiUppercase.fsx
+PIPEL4_PACKAGE_PATH="$tool_package" dotnet test --solution PipeL4.sln \
+  --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false
+```
+
+The package-backed suite includes installed-tool and TCP integration coverage. Also install the
+exact local tool package into a disposable path, not an existing global installation, and check its
+first-use commands:
+
+```sh
+set -euo pipefail
+tool_dir=./artifacts/second-prerelease/tool
+tool_path="$(mktemp -d)"
+dotnet tool install PipeL4 --tool-path "$tool_path" --source "$tool_dir" --version 0.1.0-alpha.2
+"$tool_path/pipel4" --help
+"$tool_path/pipel4" --version
+"$tool_path/pipel4" examples list
+```
+
+Stop if a validator, consumer build, FSI check, package-backed test, or installed-tool check fails.
+Repeat checks affected by changes to source, package metadata, or package content.
+
+### 3a. Manual VS Code/Ionide authoring gate
+
+Before approving the pre-merge candidate, a reviewer must perform this check in VS Code with the
+Ionide F# extension and the .NET 10 SDK installed. Start with the
+[README authoring instructions](../README.md#f-script-authoring). Build the local
+`PipeL4.Plugins.0.1.0-alpha.2.nupkg` in step 2 first. On a Unix-like workstation, launch a fresh
+VS Code window with a disposable external workspace and isolated NuGet and FSI caches:
+
+```sh
+ide_root="$(mktemp -d)"
+mkdir -p "$ide_root/workspace" "$ide_root/home" "$ide_root/packages" "$ide_root/http-cache" "$ide_root/dotnet-home"
+cp examples/AsciiUppercase.fsx "$ide_root/workspace/AsciiUppercase.fsx"
+api_feed="$(realpath ./artifacts/second-prerelease/plugins)"
+FSharpCoreImplicitPackageVersion=10.1.401 \
+  RestoreSources="$api_feed;https://api.nuget.org/v3/index.json" \
+  NUGET_PACKAGES="$ide_root/packages" NUGET_HTTP_CACHE_PATH="$ide_root/http-cache" \
+  DOTNET_CLI_HOME="$ide_root/dotnet-home" HOME="$ide_root/home" \
+  code --new-window --user-data-dir "$ide_root/vscode-data" \
+    --extensions-dir "$HOME/.vscode/extensions" "$ide_root/workspace"
+```
+
+The `--extensions-dir` path assumes the normal VS Code extension directory on Linux; adjust it to
+the actual directory containing Ionide. Keep this window separate from an existing VS Code process
+so the environment reaches Ionide and FSI. The local feed supplies the unpublished API candidate;
+NuGet.org supplies dependencies such as `FSharp.Core`. The empty cache and home prevent an older
+package or a previous FSI dependency-manager result from satisfying the check. Inspect the
+`#if INTERACTIVE` reference in the copied file and confirm that it names
+`PipeL4.Plugins, 0.1.0-alpha.2`.
+
+In that external workspace, open `AsciiUppercase.fsx`. Wait for Ionide to finish, then confirm
+`IByteStreamProcessor` and `ProcessorResult` resolve, hover shows their F# types, and diagnostics
+appear for a temporary `let intentionalError: int = "wrong type"` line and clear when it is
+removed. Use **F#: Send File to F# Interactive** and confirm successful evaluation. Confirm that no
+PipeL4 source project or project reference is present in the workspace. After FSI restore, compare
+the cached candidate with the reviewed package:
+
+```sh
+sha256sum ./artifacts/second-prerelease/plugins/PipeL4.Plugins.0.1.0-alpha.2.nupkg \
+  "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/pipel4.plugins.0.1.0-alpha.2.nupkg"
+```
+
+Record the IDE/extension and SDK versions, the observed type information, diagnostics, FSI result,
+and matching checksums. A failure or an unperformed IDE check blocks release approval. Repository
+FSI validation is separate evidence and does not complete this manual gate. **Execution pending:**
+this procedure has not itself been performed in an IDE as part of the documentation change.
+
+### 4. Independent release audit
+
+Have a reviewer who did not create the candidate inspect the source diff, both local packages,
+nuspecs, checksums, validation output, consumer evidence, and the manual IDE result from step 3a.
+Confirm both package IDs and versions, the documented dependency boundary, and release scope. The
+reviewer should identify the candidate source revision and explicitly approve moving it to `master`.
+Stop for an unresolved finding.
+
+### 4a. Hosted pull request validation before merge
+
+Before squash-merging, require both GitHub Actions checks to succeed for the latest pull request
+revision:
+
+- `CI / Build and test`
+- `Distribution validation / Build and validate distributable packages`
+
+Confirm each run belongs to this pull request and corresponds to its current head and base
+revisions. Both workflows use `actions/checkout@v7` without a `ref` override. For a
+`pull_request` event, that checks out GitHub's synthetic pull request merge ref; the run's tested
+`GITHUB_SHA` can therefore differ from the pull request branch's head SHA. Do not require those
+SHAs to be equal. Record both run URLs, the pull request head and base SHAs, the event, and each
+run's tested SHA. If the pull request head or base changes after validation, require both checks to
+pass again for the updated pull request state and record the new runs before merging.
+
+### 5. Squash merge into `master`
+
+Merge the approved release pull request into `master` using the repository's squash-merge
+convention. Do not tag or publish the pre-merge packages. The squash merge creates the source
+revision from which the final release artifacts must be built.
+
+### 6. Hosted CI and Distribution validation
+
+After the merge, verify both hosted workflows for the same `master` commit. These runs are separate
+from the pre-merge pull request checks in step 4a:
+
+- [CI](../.github/workflows/ci.yml) restores, builds, tests, packs, and validates the `PipeL4` tool
+  package. It does not validate the `PipeL4.Plugins` distribution by itself.
+- [Distribution validation](../.github/workflows/distribution-validation.yml) packs both packages,
+  validates each package and their matching versions, builds the independent public API consumer,
+  checks FSI authoring, runs the package-backed solution suite, and uploads both candidates with
+  `source-revision.txt` files.
+
+Both workflows run on pushes and pull requests targeting `master` and support manual dispatch.
+Neither workflow publishes NuGet packages, creates a Git tag, or publishes a GitHub Release. Save
+the run URLs, confirm every required job passed, and download the Distribution artifact for the
+merged commit. Do not use an artifact from a pre-merge or unrelated run.
+
+### 7. Verify the final source SHA
+
+Before tagging, check the clean `master` checkout, remote branch, both downloaded
+`source-revision.txt` files, and the `repository commit` attributes in both package nuspecs. Each
+must identify the same full squash-merge commit SHA. Distribution records the source revision in
+the artifact but does not compare it with both nuspec commits, so make that comparison explicitly.
+Re-run package validators on the downloaded files and record their SHA-256 checksums. Stop if the
+workflow, source revision, nuspec commit, or local `master` SHA differs.
+
+```sh
+git status --short
+git rev-parse HEAD
+git ls-remote origin refs/heads/master
+```
+
+Compare these revisions with the hosted run's commit and both artifact revision files. Inspect the
+repository commit in `PipeL4.nuspec` and `PipeL4.Plugins.nuspec`; verify both equal that same SHA.
+
+```sh
+dotnet fsi scripts/validate_package.fsx /path/to/PipeL4.0.1.0-alpha.2.nupkg
+dotnet fsi scripts/validate_public_api_package.fsx /path/to/PipeL4.Plugins.0.1.0-alpha.2.nupkg
+sha256sum /path/to/PipeL4.0.1.0-alpha.2.nupkg /path/to/PipeL4.Plugins.0.1.0-alpha.2.nupkg
+```
+
+The earlier alpha.1 [tool package](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.1) and tag
+are historical and must not be reused for alpha.2.
+
+### 8. Verify publication eligibility before tagging
+
+Before creating or pushing the alpha.2 tag, verify eligibility and exact-version availability for
+both package IDs with the intended publishing account:
+
+- Confirm the account or organization is authorized to publish `PipeL4`.
+- Confirm it is authorized to publish `PipeL4.Plugins`, including package ID reservation, ownership,
+  or transfer constraints. The prior `PipeL4` publication does not establish permission for this
+  second ID.
+- Confirm `0.1.0-alpha.2` is available for each package and that neither exact version is already
+  published, unlisted, pending, or otherwise in conflict.
+
+Use the publisher account's package management and ownership information, and contact NuGet or the
+current package owner if reservation or ownership is unclear. A public feed query, search result,
+or missing package page alone does not prove publishing authorization or claimability. Record the
+evidence for both IDs. Any failed or inconclusive ownership, authorization, or version-availability
+check blocks tagging; stop and resolve it before continuing.
+
+Record final release approval only after the hosted checks, final source and artifact provenance,
+manual IDE result, and both publication-eligibility checks have passed. This approval applies to
+the final squash-merged revision and its downloaded Distribution artifacts, not the pre-merge
+candidate.
+
+### 9. Create and verify the Git tag
+
+Only after steps 7 and 8 pass, create an annotated tag at the approved full source SHA and push
+only that tag. Confirm that the remote peeled tag target equals the approved commit; never move or
+overwrite an existing tag.
+
+```sh
+set -euo pipefail
+approved_sha="<APPROVED-SOURCE-SHA>"
+release_tag=v0.1.0-alpha.2
+test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = "$approved_sha"
+test "$(git branch --show-current)" = master
+test -z "$(git tag --list "$release_tag")"
+remote_before="$(git ls-remote --tags origin "refs/tags/${release_tag}" "refs/tags/${release_tag}^{}")"
+test -z "$remote_before"
+git tag -a "$release_tag" "$approved_sha" -m "PipeL4 0.1.0-alpha.2"
+test "$(git rev-parse "refs/tags/${release_tag}^{commit}")" = "$approved_sha"
+git push origin "refs/tags/${release_tag}"
+remote_after="$(git ls-remote --tags origin "refs/tags/${release_tag}" "refs/tags/${release_tag}^{}")"
+remote_commit="$(printf '%s\n' "$remote_after" | awk -v ref="refs/tags/${release_tag}^{}" '$2 == ref {print $1}')"
+test "$remote_commit" = "$approved_sha"
+```
+
+If a local or remote tag already exists, a push result is ambiguous, or the peeled target differs,
+stop and investigate. Do not delete, move, or force-push the tag. Record the verified remote tag
+target with the release evidence.
+
+### 10. Manually publish both NuGet packages
+
+Immediately before the first upload, repeat the eligibility check from step 8 for both IDs:
+confirm publishing authorization and confirm neither exact version has become published, unlisted,
+pending, or conflicting since the tag was pushed. Do not treat a NuGet feed query alone as proof of
+authorization. Before each later upload, recheck authorization and exact-version status for that
+package, accounting for any earlier package already confirmed published.
+
+Use the two exact downloaded and approved `.nupkg` files from step 7, recheck their checksums, and
+submit each through the signed-in NuGet Gallery **Upload Package** flow. Check the displayed package
+ID and `0.1.0-alpha.2` version for each submission. No package-publishing workflow is configured
+in the checked-in repository. If using a CLI, follow the official
+[`dotnet nuget push` instructions](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-nuget-push)
+with an explicit NuGet source and protected API key; never put a key in source, shell history, or
+retained logs.
+
+NuGet submissions are independent, not atomic. After **any** failed, timed-out, or uncertain
+submission, stop all further package submissions and do not create the GitHub Release. Inspect that
+package's status in the publisher account and on NuGet, including published or unlisted state,
+validation messages, pending uploads, and notification email. Establish whether the exact ID and
+version were accepted, rejected/not accepted, or remain pending/uncertain. Do not blindly retry the
+same package or proceed to the next package.
+
+- **Accepted:** Verify the accepted package is the reviewed artifact and record its status. Do not
+  retry it. Resume only after confirming the remaining package is still authorized and its exact
+  version is available.
+- **Rejected or confirmed not accepted:** Record the reason. Retry only after NuGet confirms there
+  is no accepted or pending upload, the same reviewed file and checksum are still approved, and
+  publishing authorization remains valid. If resolving the rejection changes package content or
+  metadata, stop for a new artifact and release review.
+- **Pending or uncertain:** Wait for NuGet to resolve the status or contact NuGet support. Do not
+  retry or submit the other package while the result is unknown.
+
+Resume submissions only after the package state is positively established and fresh authorization
+and version-availability checks confirm that the next action is safe.
+
+If one package succeeds and the other fails or remains uncertain, keep the successful version
+unchanged and apply the same recovery steps to the other package; do not proceed to GitHub Release
+publication until both packages are confirmed. A published package cannot be replaced. If a
+published artifact needs content or metadata changes, stop and review a new coordinated version
+for both packages. A duplicate-upload response alone does not prove that the intended file was
+accepted.
+
+### 11. Verify both public packages
+
+Wait for validation and indexing. Verify the public pages for
+[`PipeL4 0.1.0-alpha.2`](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.2) and
+[`PipeL4.Plugins 0.1.0-alpha.2`](https://www.nuget.org/packages/PipeL4.Plugins/0.1.0-alpha.2)
+show the expected IDs, version, author, license, README, target framework, and dependency metadata.
+Download each public package and compare its identity, nuspec, and non-signature payload with the
+approved artifact. If NuGet has added package-signature metadata, inspect it separately from the
+application payload. From a clean .NET 10 environment, install the exact public tool version and
+run first-use commands:
+
+```sh
+public_tool_path="$(mktemp -d)"
+dotnet tool install PipeL4 --tool-path "$public_tool_path" \
+  --source https://api.nuget.org/v3/index.json --version 0.1.0-alpha.2
+"$public_tool_path/pipel4" --help
+"$public_tool_path/pipel4" --version
+"$public_tool_path/pipel4" examples list
+```
+
+Compile an independent F# consumer against the public `PipeL4.Plugins` `0.1.0-alpha.2` package in
+a fresh external .NET 10 environment, restoring only from NuGet.org. Check public FSI authoring
+with an empty package and dependency-manager cache, outside the repository:
+
+```sh
+public_fsi_root="$(mktemp -d)"
+mkdir -p "$public_fsi_root/home" "$public_fsi_root/packages" "$public_fsi_root/http-cache" "$public_fsi_root/dotnet-home"
+cp examples/AsciiUppercase.fsx "$public_fsi_root/AsciiUppercase.fsx"
+HOME="$public_fsi_root/home" DOTNET_CLI_HOME="$public_fsi_root/dotnet-home" \
+  NUGET_PACKAGES="$public_fsi_root/packages" NUGET_HTTP_CACHE_PATH="$public_fsi_root/http-cache" \
+  RestoreSources=https://api.nuget.org/v3/index.json FSharpCoreImplicitPackageVersion=10.1.401 \
+  dotnet fsi --exec "$public_fsi_root/AsciiUppercase.fsx"
+```
+
+Confirm the guarded `#r "nuget: PipeL4.Plugins, 0.1.0-alpha.2"` restored the public package in the
+fresh cache. Repeat the TCP echo and processor check with the public tool installation. Do not
+continue while either package page, restore, consumer build, FSI check, or tool check is missing or
+failing.
+
+### 12. Publish the GitHub prerelease
+
+Only after both packages are publicly available and verified, review the
+[alpha.2 release notes draft](second-prerelease-notes.md) against the published artifacts. Then
+manually draft a GitHub Release
+from the `v0.1.0-alpha.2` tag. Mark it as a prerelease, link both
+NuGet packages, and verify the release page, tag target, notes, and links before publishing.
+GitHub Release creation is separate from tagging and NuGet publication. Record the public release
+and package URLs.
+
+## Historical alpha.1 release procedure
+
+The gates below preserve the first release's original procedure, values, approvals, and provenance.
+Its actions for `0.1.0-alpha.1` are complete. The hard-coded version, package list, paths, and
+release notes are historical and must not be reused for alpha.2. Follow the alpha.2 procedure above
+for the two-package release.
 
 The [CI workflow](../.github/workflows/ci.yml) runs on pushes to `master`, pull requests targeting
-`master`, and manual dispatch. It restores, builds, tests, packs, and validates a local package on
-Ubuntu 24.04. The separate [distribution validation workflow](../.github/workflows/distribution-validation.yml)
-also runs on Ubuntu 24.04 and can upload a validated candidate with `source-revision.txt`; it does
-not publish. The earlier
+`master`, and manual dispatch. It restores, builds, tests, packs, and validates the `PipeL4` tool
+package on Ubuntu 24.04. The separate [distribution validation workflow](../.github/workflows/distribution-validation.yml)
+also runs on Ubuntu 24.04, validates both packages, and can upload candidates with
+`source-revision.txt`; it does not publish. The earlier
 [local readiness report](release-readiness.md) covers a different historical package and cannot
 substitute for validation of this final prerelease.
 
-## Gate A — approved source is on master
+### Gate A — approved source is on master
 
 **Proceed only after PRE-06 has passed and `release/first-prerelease` has been squash-merged into
 `master`.** Record the final `master` SHA and check the clean working tree. Review reachable public
@@ -51,7 +459,7 @@ git branch --show-current
 Evidence: PRE-06 approval, merge result, clean status, reviewed commit graph and tracked-file
 inventory. Stop if `master` or its reachable history is not approved for public release.
 
-## Gate B — public GitHub repository and hosted CI
+### Gate B — public GitHub repository and hosted CI
 
 The public repository identity is established as
 [`jbbfett/PipeL4`](https://github.com/jbbfett/PipeL4), with canonical URL
@@ -76,9 +484,9 @@ Evidence: approved owner/URL, public `master` history and files, default branch,
 list, and passing hosted CI at the relevant SHA. See [GitHub's import instructions](https://docs.github.com/en/migrations/importing-source-code/using-the-command-line-to-import-source-code/adding-locally-hosted-code-to-github)
 and [default-branch instructions](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-branches-in-your-repository/changing-the-default-branch).
 
-## Gate C — final metadata, source, artifact, and verified tag
+### Gate C — final metadata, source, artifact, and verified tag
 
-### Publication prerequisites
+#### Publication prerequisites
 
 Settle the final source before tagging or packing. The project metadata records the known GitHub
 identity in `PackageProjectUrl`, `RepositoryUrl`, and `RepositoryType`; package validation requires
@@ -266,7 +674,7 @@ push result; do not overwrite, delete, move, or force-push a published tag. If s
 content must change after tagging, stop and explicitly review the release candidate, version,
 checksum, and tag plan before any further publication step.
 
-## Gate D — explicit authorization for NuGet publication
+### Gate D — explicit authorization for NuGet publication
 
 Present Gate C evidence, including the verified remote tag target and exact `.nupkg` SHA-256, to
 the publication approver. Obtain explicit authorization for irreversible public nuget.org
@@ -276,7 +684,7 @@ A package version already published to nuget.org cannot be overwritten; correcti
 version and new release review. See [NuGet's publishing guidance](https://learn.microsoft.com/en-us/nuget/nuget-org/publish-a-package)
 and [push semantics](https://learn.microsoft.com/en-us/nuget/api/package-publish-resource).
 
-## Gate E — publish on nuget.org and verify public installation
+### Gate E — publish on nuget.org and verify public installation
 
 Sign in to the approved nuget.org publishing account. Use **Upload Package** in the nuget.org UI
 to select the exact Gate C file, verify displayed PackageId and version, inspect the preview, and
@@ -289,7 +697,7 @@ retained log. The SDK requested by `global.json` (`10.0.112`) predates documente
 support introduced with SDK `10.0.300`; do not assume that shortcut works. No credential or
 publishing workflow is configured here.
 
-### Resolve uncertain upload results
+#### Resolve uncertain upload results
 
 If a CLI push times out, loses its connection, or reports an ambiguous result, **do not retry
 immediately**. An apparently successful upload that is missing from public search also needs a
@@ -335,7 +743,7 @@ Repeat the [TCP echo and AsciiUppercase example](../src/PipeL4/README.md#local-t
 with this public installation. Stop if indexing, exact-version installation, CLI output, or TCP
 behavior fails. An upload response alone is not a completed release.
 
-## Gate F — publish the GitHub prerelease
+### Gate F — publish the GitHub prerelease
 
 After Gate E succeeds, confirm the existing `v0.1.0-alpha.1` remote tag still peels to Gate C's
 approved source commit. Tag creation in Gate C and GitHub Release publication here are separate

@@ -288,6 +288,24 @@ current local candidate and is not a NuGet.org release. Active `#r` directives, 
 assembly paths, `#load`, and `#I` remain unsupported; arbitrary package references are rejected
 even inside inactive branches.
 
+F# Interactive also restores its implicit `FSharp.Core` package. If the SDK's implicit version is
+older than the one required by `PipeL4.Plugins`, restore can report `NU1605`. Set
+`FSharpCoreImplicitPackageVersion` to the `FSharp.Core` version declared by the API package before
+starting F# Interactive or VS Code/Ionide. For the `0.1.0-alpha.2` candidate that version is
+`10.1.401`:
+
+Once the matching API package is available from the configured package sources, run F# Interactive
+with:
+
+```sh
+FSharpCoreImplicitPackageVersion=10.1.401 dotnet fsi --exec ./examples/AsciiUppercase.fsx
+```
+
+The variable aligns F# Interactive's implicit package selection; it does not add another script
+reference. For the unpublished local candidate, use the isolated validation command below; it reads
+the dependency version from the candidate package and sets this variable. PipeL4's host still
+compiles the guarded `#r` out and uses its bundled API assembly.
+
 To typecheck the example with a locally built API candidate, create the package and run the isolated
 FSI check. The validator reads the shared version from the package, creates a temporary local feed
 containing that candidate and its cached `FSharp.Core` dependency, and executes the same `.fsx` file
@@ -314,10 +332,13 @@ that tool package and does not restore the script's package reference.
 
 For an editor check, install the Ionide F# extension in VS Code, then launch VS Code from the
 repository root with `RestoreSources` set to the absolute local candidate directory and NuGet.org
-as a source for any uncached dependencies:
+as a source for any uncached dependencies. Also pass the matching API package's `FSharp.Core`
+dependency version to F# Interactive:
 
 ```sh
-RestoreSources="$(realpath ./artifacts/public-api-candidate);https://api.nuget.org/v3/index.json" code .
+FSharpCoreImplicitPackageVersion=10.1.401 \
+  RestoreSources="$(realpath ./artifacts/public-api-candidate);https://api.nuget.org/v3/index.json" \
+  code .
 ```
 
 Open `examples/AsciiUppercase.fsx`, wait for Ionide's type checking to finish, and check that
@@ -325,7 +346,9 @@ Open `examples/AsciiUppercase.fsx`, wait for Ionide's type checking to finish, a
 **F#: Send File to F# Interactive** and confirm the file evaluates successfully. The candidate
 version is not available from NuGet.org, so the local feed supplies `PipeL4.Plugins`; NuGet.org is
 available for uncached dependencies such as `FSharp.Core`. Ionide editor diagnostics have not been
-automatically verified by repository checks.
+automatically verified by repository checks. For release approval, use the
+[manual IDE gate](docs/releasing.md#3a-manual-vs-codeionide-authoring-gate), which checks an external
+workspace with isolated caches and records the actual IDE result.
 
 ### Stateful byte pattern replacement
 
