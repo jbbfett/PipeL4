@@ -107,6 +107,88 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
            "--nologo"
            $"--out:{outputPath}" |]
 
+    let isSemVer (version: string) =
+        let isAsciiDigit value = value >= '0' && value <= '9'
+
+        let isIdentifierCharacter value =
+            isAsciiDigit value
+            || (value >= 'A' && value <= 'Z')
+            || (value >= 'a' && value <= 'z')
+            || value = '-'
+
+        let hasValidIdentifiers allowNumericLeadingZero (value: string) =
+            let identifiers = value.Split '.'
+
+            identifiers.Length > 0
+            && (identifiers
+                |> Array.forall (fun identifier ->
+                    identifier.Length > 0
+                    && (identifier |> Seq.forall isIdentifierCharacter)
+                    && (allowNumericLeadingZero
+                        || not (identifier |> Seq.forall isAsciiDigit)
+                        || identifier.Length = 1
+                        || identifier[0] <> '0')))
+
+        let versionAndMetadata = version.Split '+'
+
+        if versionAndMetadata.Length > 2 || String.IsNullOrEmpty versionAndMetadata[0] then
+            false
+        else
+            let versionAndPrerelease = versionAndMetadata[0]
+            let prereleaseSeparator = versionAndPrerelease.IndexOf '-'
+
+            let core, prerelease =
+                if prereleaseSeparator < 0 then
+                    versionAndPrerelease, None
+                else
+                    versionAndPrerelease.Substring(0, prereleaseSeparator),
+                    Some(versionAndPrerelease.Substring(prereleaseSeparator + 1))
+
+            let coreParts = core.Split '.'
+
+            let validCore =
+                coreParts.Length = 3
+                && (coreParts
+                    |> Array.forall (fun part ->
+                        part.Length > 0
+                        && (part |> Seq.forall isAsciiDigit)
+                        && (part.Length = 1 || part[0] <> '0')))
+
+            let validPrerelease =
+                prerelease
+                |> Option.forall (hasValidIdentifiers false)
+
+            let validMetadata =
+                versionAndMetadata.Length = 1
+                || hasValidIdentifiers true versionAndMetadata[1]
+
+            validCore && validPrerelease && validMetadata
+
+    let isSupportedEditorReference (line: string) (directiveStart: int) (name: string) =
+        let directiveEnd = directiveStart + name.Length
+
+        if name <> "r"
+           || directiveEnd > line.Length
+           || not (String.Equals(line.Substring(directiveStart, name.Length), "r", StringComparison.Ordinal)) then
+            false
+        else
+            let mutable argumentStart = directiveEnd
+
+            while argumentStart < line.Length
+                  && (line[argumentStart] = ' ' || line[argumentStart] = '\t') do
+                argumentStart <- argumentStart + 1
+
+            let argument = line.Substring(argumentStart).TrimEnd(' ', '\t')
+
+            if argument.Length < 2 || argument[0] <> '"' || argument[argument.Length - 1] <> '"' then
+                false
+            else
+                let reference = argument.Substring(1, argument.Length - 2)
+                let packagePrefix = "nuget: PipeL4.Plugins, "
+
+                reference.StartsWith(packagePrefix, StringComparison.Ordinal)
+                && isSemVer (reference.Substring packagePrefix.Length)
+
     let forbiddenDirectiveDiagnostics sourcePath (source: string) =
         let parsingOptions, _ =
             Array.append
@@ -129,16 +211,19 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
             )
         let lines = source.Split '\n'
 
-        let isConditionalControl (line: string) (firstNonWhitespace: int) =
+        let conditionalControl (line: string) (firstNonWhitespace: int) =
             if firstNonWhitespace >= line.Length || line[firstNonWhitespace] <> '#' then
-                false
+                None
             else
                 let afterHash = line.Substring(firstNonWhitespace + 1).TrimStart(' ', '\t')
 
                 [| "if"; "elif"; "else"; "endif" |]
-                |> Array.exists (fun name ->
-                    afterHash.StartsWith(name, StringComparison.Ordinal)
-                    && isDirectiveBoundary afterHash name.Length)
+                |> Array.tryPick (fun name ->
+                    if afterHash.StartsWith(name, StringComparison.Ordinal)
+                       && isDirectiveBoundary afterHash name.Length then
+                        Some(name, afterHash.Substring(name.Length).Trim(' ', '\t'))
+                    else
+                        None)
 
         // Use the tokenizer's real preprocessor state to find branch boundaries. In
         // active code it distinguishes controls from literal text. In inactive code,
@@ -147,30 +232,139 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
         // lines, where the compiler itself skips lexical constructs.
         let mutable controlLexState = FSharpTokenizerLexState.Initial
 
-        let conditionalControlLines =
-            lines
-            |> Array.mapi (fun _ sourceLine ->
-                let line = sourceLine.TrimEnd '\r'
+        let conditionalControlLines, inactiveCodeLines =
+            let inactiveCodeLines = Array.zeroCreate<bool> lines.Length
+
+            let conditionalControlLines =
+                lines
+                |> Array.mapi (fun lineIndex sourceLine ->
+                    let line = sourceLine.TrimEnd '\r'
+                    let firstNonWhitespace = line.Length - line.TrimStart(' ', '\t').Length
+                    let lineTokenizer = tokenizer.CreateLineTokenizer line
+                    let mutable scanning = true
+                    let mutable isControl = false
+
+                    while scanning do
+                        let token, nextState = lineTokenizer.ScanToken controlLexState
+                        controlLexState <- nextState
+
+                        match token with
+                        | Some info when info.TokenName = "INACTIVECODE" ->
+                            inactiveCodeLines[lineIndex] <- true
+                            isControl <- conditionalControl line firstNonWhitespace |> Option.isSome
+                        | Some info
+                            when info.LeftColumn = firstNonWhitespace
+                                 && info.TokenName = "HASH_IF" ->
+                            isControl <- conditionalControl line firstNonWhitespace |> Option.isSome
+                        | None -> scanning <- false
+                        | Some _ -> ()
+
+                    if isControl then
+                        conditionalControl line firstNonWhitespace
+                    else
+                        None)
+
+            conditionalControlLines, inactiveCodeLines
+
+        // The only permitted editor reference is one canonical PipeL4.Plugins NuGet
+        // reference in a top-level INTERACTIVE branch. FCS supplies the branch state;
+        // this small structural check deliberately rejects nesting and alternate arms.
+        let allowedEditorReferenceLines = Array.zeroCreate<bool> lines.Length
+        let mutable conditionalDepth = 0
+        let mutable isInteractiveBlock = false
+        let mutable isSimpleInteractiveBlock = false
+        let mutable editorReferenceLine = -1
+        let mutable hasAcceptedEditorReference = false
+
+        let isExactConditionalDirective (line: string) firstNonWhitespace name argument =
+            if firstNonWhitespace >= line.Length || line[firstNonWhitespace] <> '#' then
+                false
+            else
+                let afterHash = line.Substring(firstNonWhitespace + 1)
+
+                afterHash.StartsWith(name, StringComparison.Ordinal)
+                && isDirectiveBoundary afterHash name.Length
+                && String.Equals(
+                    afterHash.Substring(name.Length).Trim(' ', '\t'),
+                    argument,
+                    StringComparison.Ordinal
+                )
+
+        for lineIndex in 0 .. lines.Length - 1 do
+            match conditionalControlLines[lineIndex] with
+            | Some("if", condition) ->
+                if conditionalDepth = 0 then
+                    let line = lines[lineIndex].TrimEnd '\r'
+                    let firstNonWhitespace = line.Length - line.TrimStart(' ', '\t').Length
+
+                    isInteractiveBlock <-
+                        condition = "INTERACTIVE"
+                        && isExactConditionalDirective line firstNonWhitespace "if" "INTERACTIVE"
+
+                    isSimpleInteractiveBlock <- isInteractiveBlock
+                    editorReferenceLine <- -1
+                else
+                    isSimpleInteractiveBlock <- false
+
+                conditionalDepth <- conditionalDepth + 1
+            | Some(("elif" | "else"), _) when conditionalDepth > 0 ->
+                isSimpleInteractiveBlock <- false
+            | Some("endif", _) when conditionalDepth > 0 ->
+                let line = lines[lineIndex].TrimEnd '\r'
                 let firstNonWhitespace = line.Length - line.TrimStart(' ', '\t').Length
-                let lineTokenizer = tokenizer.CreateLineTokenizer line
-                let mutable scanning = true
-                let mutable isControl = false
 
-                while scanning do
-                    let token, nextState = lineTokenizer.ScanToken controlLexState
-                    controlLexState <- nextState
+                if conditionalDepth = 1
+                   && not (isExactConditionalDirective line firstNonWhitespace "endif" "") then
+                    isSimpleInteractiveBlock <- false
 
-                    match token with
-                    | Some info
-                        when info.TokenName = "INACTIVECODE"
-                             || (info.LeftColumn = firstNonWhitespace
-                                 && info.TokenName = "HASH_IF") ->
-                        isControl <-
-                            isConditionalControl line firstNonWhitespace
-                    | None -> scanning <- false
-                    | Some _ -> ()
+                if conditionalDepth = 1
+                   && isInteractiveBlock
+                   && isSimpleInteractiveBlock
+                   && editorReferenceLine >= 0
+                   && not hasAcceptedEditorReference then
+                    allowedEditorReferenceLines[editorReferenceLine] <- true
+                    hasAcceptedEditorReference <- true
 
-                isControl)
+                conditionalDepth <- conditionalDepth - 1
+
+                if conditionalDepth = 0 then
+                    isInteractiveBlock <- false
+                    isSimpleInteractiveBlock <- false
+                    editorReferenceLine <- -1
+            | _ when conditionalDepth = 1 && isInteractiveBlock && isSimpleInteractiveBlock ->
+                let line = lines[lineIndex].TrimEnd '\r'
+                let firstNonWhitespace = line.Length - line.TrimStart(' ', '\t').Length
+
+                if firstNonWhitespace < line.Length then
+                    let dependencyCandidate =
+                        if line[firstNonWhitespace] <> '#' then
+                            None
+                        else
+                            let mutable directiveStart = firstNonWhitespace + 1
+
+                            while directiveStart < line.Length
+                                  && (line[directiveStart] = ' ' || line[directiveStart] = '\t') do
+                                directiveStart <- directiveStart + 1
+
+                            let remaining = line.Substring directiveStart
+
+                            [| "load"; "r"; "i" |]
+                            |> Array.tryFind (fun name ->
+                                remaining.StartsWith(name, StringComparison.OrdinalIgnoreCase)
+                                && isDirectiveBoundary remaining name.Length)
+                            |> Option.map (fun name -> name, directiveStart)
+
+                    match dependencyCandidate with
+                    | Some("r", directiveStart)
+                        when inactiveCodeLines[lineIndex]
+                             && directiveStart = firstNonWhitespace + 1
+                             && isSupportedEditorReference line directiveStart "r" ->
+                        if editorReferenceLine < 0 then
+                            editorReferenceLine <- lineIndex
+                        else
+                            isSimpleInteractiveBlock <- false
+                    | _ -> isSimpleInteractiveBlock <- false
+            | _ -> ()
 
         let mutable lexState = FSharpTokenizerLexState.Initial
 
@@ -179,7 +373,7 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
             let line = sourceLine.TrimEnd '\r'
             let firstNonWhitespace = line.Length - line.TrimStart(' ', '\t').Length
 
-            if conditionalControlLines[lineIndex] then
+            if conditionalControlLines[lineIndex].IsSome then
                 // Each conditional arm is checked independently. This is essential
                 // because the compiler skips inactive text before lexing the next arm.
                 lexState <- FSharpTokenizerLexState.Initial
@@ -220,7 +414,8 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                     | Some _ -> ()
 
                 match candidate with
-                | Some(name, directiveStart) when dependencyHashIsCode ->
+                | Some(name, directiveStart)
+                    when dependencyHashIsCode && not allowedEditorReferenceLines[lineIndex] ->
                     let range =
                         { Start =
                             { Line = lineIndex + 1
@@ -229,12 +424,18 @@ type internal ScriptCompiler internal (temporaryRoot: string) =
                             { Line = lineIndex + 1
                               Column = directiveStart + name.Length } }
 
+                    let message =
+                        if name = "r" && line.Contains("PipeL4.Plugins", StringComparison.Ordinal) then
+                            "The PipeL4.Plugins editor reference must be a single versioned NuGet reference inside a top-level '#if INTERACTIVE' block without nested or alternate branches."
+                        else
+                            $"Script dependency directive '#{name}' is not supported; references are supplied by PipeL4."
+
                     Some(
                         diagnostic
                             ScriptDiagnosticSeverity.Error
                             (Some sourcePath)
                             (Some range)
-                            $"Script dependency directive '#{name}' is not supported; references are supplied by PipeL4."
+                            message
                     )
                 | _ -> None
         )

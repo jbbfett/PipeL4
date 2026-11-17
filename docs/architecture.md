@@ -224,8 +224,13 @@ cancellation and connection-cleanup behavior applies.
 `PipeL4.Plugins` contains the public processor contracts. `PipeL4.PluginHost` owns in-process
 script compilation and assembly loading and depends on `PipeL4.Plugins` and `PipeL4.Core`. The host
 supplies a controlled reference set consisting of the running .NET runtime, FSharp.Core, and the
-public `PipeL4.Plugins` API; plugin-authored `#r`, `#I`, and `#load` directives are rejected rather
-than used to expand that set. `PipeL4.Core` and compiler-service APIs are not script references.
+public `PipeL4.Plugins` API. One versioned `PipeL4.Plugins` NuGet reference is allowed only inside a
+top-level `#if INTERACTIVE` block whose body contains no other content besides optional blank lines,
+and only when FCS confirms that the line is inactive for host compilation. The block cannot contain
+nested or alternate branches. This reference is for editor tooling and F# Interactive;
+the host compiles the original source without restoring packages and binds scripts to its own API
+assembly. Active `#r` directives, arbitrary packages, assembly paths, `#I`, and `#load` remain
+rejected. `PipeL4.Core` and compiler-service APIs are not script references.
 Compiler outputs are isolated in a per-compilation temporary directory, loaded from memory into
 the default assembly load context, and then removed. Assemblies loaded this way remain present
 for the process lifetime; unload and reload semantics are outside the current runtime scope.

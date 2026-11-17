@@ -213,8 +213,10 @@ Edit the extracted script and load it with `--client-to-server-plugin` as shown 
 [Quick Start](#quick-start).
 
 Scripts compiled by the PipeL4 host do not need script-level `#r` directives for PipeL4 assemblies;
-the host supplies its supported references. See the individual example descriptions below for each
-processor's behavior and limits.
+the host supplies its supported references. `AsciiUppercase.fsx` includes one narrowly supported
+`#if INTERACTIVE` package reference so F# Interactive and Ionide can resolve the public processor
+API. PipeL4 does not restore that package at runtime. See [F# script authoring](#f-script-authoring)
+for the accepted syntax and local validation command.
 
 ## Practical quickstart
 
@@ -256,8 +258,53 @@ per processor. `AsciiUppercase.fsx` is the canonical stateless example and
 `PrefixMode.fsx` demonstrates bounded prefix-based mode selection; the `.fsx` files under
 `benchmarks/` are benchmark fixtures, not user-facing examples. The example intentionally has no
 explicit F# `module` declaration: PipeL4 discovers its one public `IByteStreamProcessor`
-implementation by interface, not by module name. It also has no `#r` directive because the host
-supplies the supported assembly references.
+implementation by interface, not by module name. Its top-level `#if INTERACTIVE` block references
+the public API package for editor tooling and F# Interactive; the PipeL4 host compiles that branch
+out and supplies its own `PipeL4.Plugins` assembly reference.
+
+### F# script authoring
+
+The supported editor reference uses the exact `PipeL4.Plugins` package ID and a three-part SemVer
+version (optionally with prerelease or build metadata). It must be the only nonblank content in one
+top-level block; nested conditionals and `#else`/`#elif` arms are rejected:
+
+```fsharp
+#if INTERACTIVE
+#r "nuget: PipeL4.Plugins, 0.1.0-alpha.2"
+#endif
+```
+
+F# Interactive defines `INTERACTIVE` and restores `PipeL4.Plugins` for type checking. The PipeL4
+host does not define it, so it compiles the reference out, performs no NuGet restore, and binds the
+script to its runtime-provided public API assembly. The API package version in the example is the
+current local candidate and is not a NuGet.org release. Active `#r` directives, other packages,
+assembly paths, `#load`, and `#I` remain unsupported; arbitrary package references are rejected
+even inside inactive branches.
+
+To validate the example with a locally built API candidate, create the package and run the isolated
+FSI check. The validator reads the shared version from the package, uses only that package as its
+NuGet source, and executes the same `.fsx` file used by PipeL4:
+
+```sh
+mkdir -p ./artifacts/public-api-candidate
+dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj --configuration Release --no-restore \
+  -p:PaketDisableCliTest=true -p:BuildInParallel=false \
+  --output ./artifacts/public-api-candidate
+dotnet fsi scripts/validate_fsi_authoring.fsx \
+  ./artifacts/public-api-candidate ./examples/AsciiUppercase.fsx
+```
+
+For a manual Ionide check with this unpublished candidate, launch VS Code from the repository root
+with `RestoreSources` set to the absolute local candidate directory:
+
+```sh
+RestoreSources="$(realpath ./artifacts/public-api-candidate)" code .
+```
+
+Open `examples/AsciiUppercase.fsx`, check that `IByteStreamProcessor` and `ProcessorResult` resolve,
+then run **F#: Send File to F# Interactive**. The candidate version is not available from NuGet.org;
+the environment setting keeps this check on the local feed. Ionide editor diagnostics have not been
+automatically verified by the repository tests.
 
 ### Stateful byte pattern replacement
 
@@ -339,8 +386,9 @@ pipel4 \
 ```
 
 These are PipeL4-hosted scripts: `pipel4` compiles, references, discovers, and runs the processor
-inside the proxy. Running `dotnet fsi examples/AsciiUppercase.fsx` is a different execution mode;
-the script deliberately has no assembly reference directive and is not a standalone FSI program.
+inside the proxy. `examples/AsciiUppercase.fsx` can also be opened in Ionide or run with
+`dotnet fsi` when the package version in its `#if INTERACTIVE` block is available. For the current
+unpublished candidate, use the local validation command in [F# script authoring](#f-script-authoring).
 
 ### Configure ordered processors in both directions
 

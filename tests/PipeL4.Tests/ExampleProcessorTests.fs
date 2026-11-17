@@ -285,7 +285,7 @@ module ExampleProcessorTests =
         }
 
     [<Fact>]
-    let ``canonical example loads from an external directory without a module or script reference`` () =
+    let ``canonical example loads externally with its editor-only package reference`` () =
         task {
             use workspace = new TestWorkspace()
             let externalPath = workspace.CopyExampleToExternalDirectory()
@@ -296,7 +296,8 @@ module ExampleProcessorTests =
             |> Array.exists (fun line -> line.TrimStart().StartsWith("module ", StringComparison.Ordinal))
             |> should equal false
 
-            source.Contains("#r", StringComparison.Ordinal) |> should equal false
+            source.Contains("#if INTERACTIVE", StringComparison.Ordinal) |> should equal true
+            source.Contains("#r \"nuget: PipeL4.Plugins, ", StringComparison.Ordinal) |> should equal true
 
             let! sink, _, owners, _ =
                 runPipelineInWorkspace

@@ -111,6 +111,11 @@ jobs:
           PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
         run: dotnet fsi scripts/test_public_api_consumer.fsx "$PUBLIC_API_PACKAGE_PATH"
 
+      - name: Validate F# Interactive authoring with the local API candidate
+        env:
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
+        run: dotnet fsi scripts/validate_fsi_authoring.fsx "$PUBLIC_API_PACKAGE_PATH" examples/AsciiUppercase.fsx
+
       - name: Run regression suite against release candidate
         shell: bash
         run: |
