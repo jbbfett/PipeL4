@@ -325,7 +325,9 @@ Open `examples/AsciiUppercase.fsx`, wait for Ionide's type checking to finish, a
 **F#: Send File to F# Interactive** and confirm the file evaluates successfully. The candidate
 version is not available from NuGet.org, so the local feed supplies `PipeL4.Plugins`; NuGet.org is
 available for uncached dependencies such as `FSharp.Core`. Ionide editor diagnostics have not been
-automatically verified by repository checks.
+automatically verified by repository checks. For release approval, use the
+[manual IDE gate](docs/releasing.md#3a-manual-vs-codeionide-authoring-gate), which checks an external
+workspace with isolated caches and records the actual IDE result.
 
 ### Stateful byte pattern replacement
 

@@ -156,12 +156,58 @@ dotnet tool install PipeL4 --tool-path "$tool_path" --source "$tool_dir" --versi
 Stop if a validator, consumer build, FSI check, package-backed test, or installed-tool check fails.
 Repeat checks affected by changes to source, package metadata, or package content.
 
+### 3a. Manual VS Code/Ionide authoring gate
+
+Before approving the pre-merge candidate, a reviewer must perform this check in VS Code with the
+Ionide F# extension and the .NET 10 SDK installed. Start with the
+[README authoring instructions](../README.md#f-script-authoring). Build the local
+`PipeL4.Plugins.0.1.0-alpha.2.nupkg` in step 2 first. On a Unix-like workstation, launch a fresh
+VS Code window with a disposable external workspace and isolated NuGet and FSI caches:
+
+```sh
+ide_root="$(mktemp -d)"
+mkdir -p "$ide_root/workspace" "$ide_root/home" "$ide_root/packages" "$ide_root/http-cache" "$ide_root/dotnet-home"
+cp examples/AsciiUppercase.fsx "$ide_root/workspace/AsciiUppercase.fsx"
+api_feed="$(realpath ./artifacts/second-prerelease/plugins)"
+RestoreSources="$api_feed;https://api.nuget.org/v3/index.json" \
+  NUGET_PACKAGES="$ide_root/packages" NUGET_HTTP_CACHE_PATH="$ide_root/http-cache" \
+  DOTNET_CLI_HOME="$ide_root/dotnet-home" HOME="$ide_root/home" \
+  code --new-window --user-data-dir "$ide_root/vscode-data" \
+    --extensions-dir "$HOME/.vscode/extensions" "$ide_root/workspace"
+```
+
+The `--extensions-dir` path assumes the normal VS Code extension directory on Linux; adjust it to
+the actual directory containing Ionide. Keep this window separate from an existing VS Code process
+so the environment reaches Ionide and FSI. The local feed supplies the unpublished API candidate;
+NuGet.org supplies dependencies such as `FSharp.Core`. The empty cache and home prevent an older
+package or a previous FSI dependency-manager result from satisfying the check. Inspect the
+`#if INTERACTIVE` reference in the copied file and confirm that it names
+`PipeL4.Plugins, 0.1.0-alpha.2`.
+
+In that external workspace, open `AsciiUppercase.fsx`. Wait for Ionide to finish, then confirm
+`IByteStreamProcessor` and `ProcessorResult` resolve, hover shows their F# types, and diagnostics
+appear for a temporary `let intentionalError: int = "wrong type"` line and clear when it is
+removed. Use **F#: Send File to F# Interactive** and confirm successful evaluation. Confirm that no
+PipeL4 source project or project reference is present in the workspace. After FSI restore, compare
+the cached candidate with the reviewed package:
+
+```sh
+sha256sum ./artifacts/second-prerelease/plugins/PipeL4.Plugins.0.1.0-alpha.2.nupkg \
+  "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/pipel4.plugins.0.1.0-alpha.2.nupkg"
+```
+
+Record the IDE/extension and SDK versions, the observed type information, diagnostics, FSI result,
+and matching checksums. A failure or an unperformed IDE check blocks release approval. Repository
+FSI validation is separate evidence and does not complete this manual gate. **Execution pending:**
+this procedure has not itself been performed in an IDE as part of the documentation change.
+
 ### 4. Independent release audit
 
 Have a reviewer who did not create the candidate inspect the source diff, both local packages,
-nuspecs, checksums, validation output, and consumer evidence. Confirm both package IDs and versions,
-the documented dependency boundary, and release scope. The reviewer should identify the candidate
-source revision and explicitly approve moving it to `master`. Stop for an unresolved finding.
+nuspecs, checksums, validation output, consumer evidence, and the manual IDE result from step 3a.
+Confirm both package IDs and versions, the documented dependency boundary, and release scope. The
+reviewer should identify the candidate source revision and explicitly approve moving it to `master`.
+Stop for an unresolved finding.
 
 ### 5. Squash merge into `master`
 
@@ -229,6 +275,11 @@ current package owner if reservation or ownership is unclear. A public feed quer
 or missing package page alone does not prove publishing authorization or claimability. Record the
 evidence for both IDs. Any failed or inconclusive ownership, authorization, or version-availability
 check blocks tagging; stop and resolve it before continuing.
+
+Record final release approval only after the hosted checks, final source and artifact provenance,
+manual IDE result, and both publication-eligibility checks have passed. This approval applies to
+the final squash-merged revision and its downloaded Distribution artifacts, not the pre-merge
+candidate.
 
 ### 9. Create and verify the Git tag
 
@@ -322,15 +373,29 @@ dotnet tool install PipeL4 --tool-path "$public_tool_path" \
 ```
 
 Compile an independent F# consumer against the public `PipeL4.Plugins` `0.1.0-alpha.2` package in
-a clean .NET 10 environment. Run `dotnet fsi --exec examples/AsciiUppercase.fsx` so the guarded
-`#r "nuget: PipeL4.Plugins, 0.1.0-alpha.2"` resolves from NuGet.org rather than a cached local
-candidate. Repeat the TCP echo and processor check with the public tool installation. Do not
-continue while either package page, restore, consumer build, or tool check is missing or failing.
+a fresh external .NET 10 environment, restoring only from NuGet.org. Check public FSI authoring
+with an empty package and dependency-manager cache, outside the repository:
+
+```sh
+public_fsi_root="$(mktemp -d)"
+mkdir -p "$public_fsi_root/home" "$public_fsi_root/packages" "$public_fsi_root/http-cache" "$public_fsi_root/dotnet-home"
+cp examples/AsciiUppercase.fsx "$public_fsi_root/AsciiUppercase.fsx"
+HOME="$public_fsi_root/home" DOTNET_CLI_HOME="$public_fsi_root/dotnet-home" \
+  NUGET_PACKAGES="$public_fsi_root/packages" NUGET_HTTP_CACHE_PATH="$public_fsi_root/http-cache" \
+  RestoreSources=https://api.nuget.org/v3/index.json \
+  dotnet fsi --exec "$public_fsi_root/AsciiUppercase.fsx"
+```
+
+Confirm the guarded `#r "nuget: PipeL4.Plugins, 0.1.0-alpha.2"` restored the public package in the
+fresh cache. Repeat the TCP echo and processor check with the public tool installation. Do not
+continue while either package page, restore, consumer build, FSI check, or tool check is missing or
+failing.
 
 ### 12. Publish the GitHub prerelease
 
-Only after both packages are publicly available and verified, prepare reviewed release text for
-the alpha.2 changes; do not reuse the alpha.1 notes unchanged. Then manually draft a GitHub Release
+Only after both packages are publicly available and verified, review the
+[alpha.2 release notes draft](second-prerelease-notes.md) against the published artifacts. Then
+manually draft a GitHub Release
 from the `v0.1.0-alpha.2` tag. Mark it as a prerelease, link both
 NuGet packages, and verify the release page, tag target, notes, and links before publishing.
 GitHub Release creation is separate from tagging and NuGet publication. Record the public release
