@@ -11,6 +11,7 @@ open System.Threading
 open System.Threading.Tasks
 open FsUnit.Xunit
 open PipeL4.Core
+open PipeL4.PluginHost
 open PipeL4.Plugins
 open Xunit
 
@@ -21,6 +22,13 @@ module ScriptCompilerTests =
             member _.TryGet<'T>(_: string) : 'T option = None }
 
     let private bytes (text: string) = Encoding.ASCII.GetBytes text
+
+    let private examplePath =
+        Path.Combine(TestRepository.repositoryRoot, "examples", "AsciiUppercase.fsx")
+
+    let private editorReferenceLine =
+        File.ReadAllLines examplePath
+        |> Array.find (fun line -> line.TrimStart().StartsWith("#r", StringComparison.Ordinal))
 
     let private sequenceBytes (sequence: ReadOnlySequence<byte>) =
         let result = Array.zeroCreate<byte> (int sequence.Length)
@@ -418,6 +426,169 @@ module Forbidden{index}
             let plugin, _ = expectCompiledPlugin result
 
             plugin.ProcessorType.Name |> should equal "Processor"
+        }
+
+    [<Fact>]
+    let ``compiles the editor example against the runtime public API contract`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let! result = compile workspace.Compiler examplePath
+            let plugin, _ = expectCompiledPlugin result
+
+            plugin.ProcessorType.Name |> should equal "Processor"
+
+            plugin.ProcessorType.GetInterfaces()
+            |> Array.exists (fun interfaceType -> Object.ReferenceEquals(interfaceType, typeof<IByteStreamProcessor>))
+            |> should equal true
+
+            let processor = plugin.CreateProcessor(unusedConnectionState)
+            processor |> should not' (be Null)
+        }
+
+    [<Fact>]
+    let ``accepts the supported editor reference with indentation and CRLF`` () =
+        task {
+            use workspace = new TestWorkspace()
+            let indentedReference = editorReferenceLine.TrimStart()
+
+            let source =
+                [| "  #if INTERACTIVE"
+                   "\t" + indentedReference
+                   "  #endif" |]
+                |> String.concat "\r\n"
+                |> fun block -> block + "\r\n" + withIdentityProcessor "module EditorReferenceWhitespace"
+
+            let scriptPath = workspace.WriteSource("EditorReferenceWhitespace.fsx", source)
+            let! result = compile workspace.Compiler scriptPath
+            let plugin, _ = expectCompiledPlugin result
+
+            plugin.ProcessorType.Name |> should equal "Processor"
+        }
+
+    [<Fact>]
+    let ``rejects editor references outside the supported INTERACTIVE block`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let sources =
+                [| ("Active", editorReferenceLine)
+                   ("UnrelatedCondition",
+                    String.concat Environment.NewLine [ "#if OTHER"; editorReferenceLine; "#endif" ])
+                   ("InteractiveExpression",
+                    String.concat Environment.NewLine [ "#if INTERACTIVE || OTHER"; editorReferenceLine; "#endif" ])
+                   ("ElseArm",
+                    String.concat
+                        Environment.NewLine
+                        [ "#if INTERACTIVE"
+                          editorReferenceLine
+                          "#else"
+                          editorReferenceLine
+                          "#endif" ])
+                   ("Nested",
+                    String.concat
+                        Environment.NewLine
+                        [ "#if INTERACTIVE"
+                          "#if OTHER"
+                          editorReferenceLine
+                          "#endif"
+                          "#endif" ])
+                   ("ArbitraryNugetInInteractive",
+                    String.concat
+                        Environment.NewLine
+                        [ "#if INTERACTIVE"
+                          "#r \"nuget: Arbitrary.Package, 1.2.3\""
+                          "#endif" ])
+                   ("MultipleBlocks",
+                    String.concat
+                        Environment.NewLine
+                        [ "#if INTERACTIVE"
+                          editorReferenceLine
+                          "#endif"
+                          "#if INTERACTIVE"
+                          editorReferenceLine
+                          "#endif" ]) |]
+
+            for name, body in sources do
+                let scriptPath =
+                    workspace.WriteSource(
+                        $"RejectedEditorReference{name}.fsx",
+                        body + Environment.NewLine + withIdentityProcessor "module RejectedEditorReference"
+                    )
+
+                let! result = compile workspace.Compiler scriptPath
+                let diagnostics = expectFailed result
+
+                diagnostics
+                |> Array.exists (fun value ->
+                    value.Severity = ScriptDiagnosticSeverity.Error
+                    && (value.Message.Contains("not supported", StringComparison.OrdinalIgnoreCase)
+                        || value.Message.Contains("editor reference must", StringComparison.OrdinalIgnoreCase)))
+                |> should equal true
+        }
+
+    [<Fact>]
+    let ``rejects malformed or similar PipeL4 package references`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let references =
+                [| "#r \"nuget: PipeL4.Plugins\""
+                   "#r \"nuget: PipeL4.PluginsX, 0.1.0\""
+                   "#r \"PipeL4.Plugins.dll\""
+                   "#r \"nuget: PipeL4.Plugins, 0.1\""
+                   "#r \"nuget: Other.Package, 1.2.3\"" |]
+
+            for index, reference in Array.indexed references do
+                let source =
+                    String.concat
+                        Environment.NewLine
+                        [ "#if INTERACTIVE"
+                          reference
+                          "#endif" ]
+                    + Environment.NewLine
+                    + withIdentityProcessor $"module MalformedEditorReference{index}"
+
+                let scriptPath = workspace.WriteSource($"MalformedEditorReference{index}.fsx", source)
+                let! result = compile workspace.Compiler scriptPath
+                let diagnostics = expectFailed result
+
+                diagnostics
+                |> Array.exists (fun value ->
+                    value.Severity = ScriptDiagnosticSeverity.Error
+                    && value.Range |> Option.exists (fun range -> range.Start.Line = 2))
+                |> should equal true
+        }
+
+    [<Fact>]
+    let ``rejects active and inactive load and include directives`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let directives =
+                [| "#load \"Other.fsx\""
+                   "#I \"/tmp/arbitrary-assemblies\"" |]
+
+            for index, directive in Array.indexed directives do
+                for condition in [| None; Some "#if OTHER" |] do
+                    let source =
+                        match condition with
+                        | None -> directive
+                        | Some start -> String.concat Environment.NewLine [ start; directive; "#endif" ]
+
+                    let scriptPath =
+                        workspace.WriteSource(
+                            $"LoadOrInclude{index}{condition.IsSome}.fsx",
+                            source + Environment.NewLine + withIdentityProcessor "module LoadOrInclude"
+                        )
+
+                    let! result = compile workspace.Compiler scriptPath
+                    let diagnostics = expectFailed result
+
+                    diagnostics
+                    |> Array.exists (fun value ->
+                        value.Severity = ScriptDiagnosticSeverity.Error
+                        && value.Message.Contains("not supported", StringComparison.OrdinalIgnoreCase))
+                    |> should equal true
         }
 
     [<Fact>]

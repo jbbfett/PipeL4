@@ -87,7 +87,7 @@ module ScriptProcessorTests =
         ValueTask<PipeL4.Plugins.ProcessorResult>(result)
 
     let private adapt (processor: PipeL4.Plugins.IByteStreamProcessor) =
-        PipeL4.Plugins.ScriptProcessorAdapter(processor) :> IByteStreamProcessor
+        PipeL4.PluginHost.ScriptProcessorAdapter(processor) :> IByteStreamProcessor
 
     let private push (pipeline: ProcessorPipeline) (owner: TrackingOwner) cancellationToken =
         pipeline.PushAsync(owner, owner.Buffer.Length, cancellationToken)

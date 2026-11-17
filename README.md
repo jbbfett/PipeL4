@@ -131,6 +131,13 @@ Current non-goals:
 PipeL4 targets `net10.0`. Install the .NET 10 SDK to use the .NET tool commands below; it includes
 the .NET 10 runtime required to run PipeL4.
 
+`PipeL4` is the .NET tool; [`PipeL4.Plugins`](src/PipeL4.Plugins/README.md) is the standalone NuGet
+library for the public F# processor contracts. Both packages use the single
+`PipeL4PackageVersion` property and are released together. The published `0.1.0-alpha.1` release is
+the `PipeL4` tool. This checkout's matching `0.1.0-alpha.2` tool and API packages are local release
+candidates and have not been published. The tool already includes the `PipeL4.Plugins` assembly,
+so running `.fsx` plugins does not require a separate API package installation or NuGet restore.
+
 ### Public NuGet installation
 
 For ordinary use, install the published prerelease from NuGet.org at its exact version:
@@ -145,38 +152,41 @@ installs the global `pipel4` command.
 
 ### Local build and package installation
 
-Contributors and package validators can create and install a package from this checkout:
+The published NuGet.org release remains `0.1.0-alpha.1`. This checkout currently builds the local,
+unpublished `0.1.0-alpha.2` candidate. Contributors and package validators can create and install
+that candidate from this checkout:
 
 ```sh
 dotnet tool restore
 dotnet paket restore
 dotnet build PipeL4.sln
-dotnet pack src/PipeL4/PipeL4.fsproj --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false --output ./artifacts
-dotnet tool install --global PipeL4 --source ./artifacts --version 0.1.0-alpha.1
+mkdir -p ./artifacts/release-candidate
+dotnet pack src/PipeL4/PipeL4.fsproj --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false --output ./artifacts/release-candidate
+dotnet tool install --global PipeL4 --source ./artifacts/release-candidate --version 0.1.0-alpha.2
 ```
 
-`--version 0.1.0-alpha.1` selects the package version. `--source ./artifacts` replaces configured
-NuGet feeds with the local feed for this installation.
+`--version 0.1.0-alpha.2` selects the local candidate. `--source ./artifacts/release-candidate`
+replaces configured NuGet feeds with the local feed for this installation.
 
 The global command is `pipel4`. If the shell cannot find it, add the .NET global tools directory to
 `PATH` (normally `$HOME/.dotnet/tools` on Linux and macOS or `%USERPROFILE%\.dotnet\tools` on
 Windows), then open a new shell.
 
 For a repository-scoped installation, run these commands from the repository root, where
-`./artifacts` was created. If this directory does not yet have a local tool manifest, create one
-first with `dotnet new tool-manifest`. Then add PipeL4 to the manifest:
+`./artifacts/release-candidate` was created. If this directory does not yet have a local tool
+manifest, create one first with `dotnet new tool-manifest`. Then add PipeL4 to the manifest:
 
 ```sh
-dotnet tool install --local PipeL4 --source ./artifacts --version 0.1.0-alpha.1
+dotnet tool install --local PipeL4 --source ./artifacts/release-candidate --version 0.1.0-alpha.2
 dotnet pipel4 --help
 ```
 
 The manifest is discovered from the current directory or a parent directory. Run the local tool
 with `dotnet pipel4` followed by its arguments (or use `dotnet tool run pipel4 -- <arguments>`).
 
-For local package iteration, build a package into `./artifacts` and install its selected version
-using `--source ./artifacts` as shown above. This local workflow does not indicate that later
-prerelease versions are available on NuGet.org.
+For local package iteration, build a candidate into `./artifacts/release-candidate` and install its
+selected version from that directory. The `0.1.0-alpha.2` candidate is not a NuGet.org release; use
+the published `0.1.0-alpha.1` instructions above for public installation.
 
 Remove a global installation with `dotnet tool uninstall --global PipeL4`, or remove a local one
 with `dotnet tool uninstall --local PipeL4`.
@@ -210,8 +220,10 @@ Edit the extracted script and load it with `--client-to-server-plugin` as shown 
 [Quick Start](#quick-start).
 
 Scripts compiled by the PipeL4 host do not need script-level `#r` directives for PipeL4 assemblies;
-the host supplies its supported references. See the individual example descriptions below for each
-processor's behavior and limits.
+the host supplies its supported references. `AsciiUppercase.fsx` includes one narrowly supported
+`#if INTERACTIVE` package reference so F# Interactive and Ionide can resolve the public processor
+API. PipeL4 does not restore that package at runtime. See [F# script authoring](#f-script-authoring)
+for the accepted syntax and local validation command.
 
 ## Practical quickstart
 
@@ -253,8 +265,67 @@ per processor. `AsciiUppercase.fsx` is the canonical stateless example and
 `PrefixMode.fsx` demonstrates bounded prefix-based mode selection; the `.fsx` files under
 `benchmarks/` are benchmark fixtures, not user-facing examples. The example intentionally has no
 explicit F# `module` declaration: PipeL4 discovers its one public `IByteStreamProcessor`
-implementation by interface, not by module name. It also has no `#r` directive because the host
-supplies the supported assembly references.
+implementation by interface, not by module name. Its top-level `#if INTERACTIVE` block references
+the public API package for editor tooling and F# Interactive; the PipeL4 host compiles that branch
+out and supplies its own `PipeL4.Plugins` assembly reference.
+
+### F# script authoring
+
+The supported editor reference uses the exact `PipeL4.Plugins` package ID and a three-part SemVer
+version (optionally with prerelease or build metadata). It must be the only nonblank content in one
+top-level block; nested conditionals and `#else`/`#elif` arms are rejected:
+
+```fsharp
+#if INTERACTIVE
+#r "nuget: PipeL4.Plugins, 0.1.0-alpha.2"
+#endif
+```
+
+F# Interactive defines `INTERACTIVE` and restores `PipeL4.Plugins` for type checking. The PipeL4
+host does not define it, so it compiles the reference out, performs no NuGet restore, and binds the
+script to its runtime-provided public API assembly. The API package version in the example is the
+current local candidate and is not a NuGet.org release. Active `#r` directives, other packages,
+assembly paths, `#load`, and `#I` remain unsupported; arbitrary package references are rejected
+even inside inactive branches.
+
+To typecheck the example with a locally built API candidate, create the package and run the isolated
+FSI check. The validator reads the shared version from the package, creates a temporary local feed
+containing that candidate and its cached `FSharp.Core` dependency, and executes the same `.fsx` file
+used by PipeL4:
+
+Before running these FSI authoring commands, complete the restore and build steps in [Local build
+and package installation](#local-build-and-package-installation). They prepare the dependencies and
+build outputs required by the `--no-restore` pack command.
+
+```sh
+mkdir -p ./artifacts/public-api-candidate
+dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj --configuration Release --no-restore \
+  -p:PaketDisableCliTest=true -p:BuildInParallel=false \
+  --output ./artifacts/public-api-candidate
+dotnet fsi scripts/validate_fsi_authoring.fsx \
+  ./artifacts/public-api-candidate ./examples/AsciiUppercase.fsx
+```
+
+After installing the matching local `PipeL4` tool candidate as described in
+[Local build and package installation](#local-build-and-package-installation), run the same file
+through PipeL4 with `--client-to-server-plugin ./examples/AsciiUppercase.fsx` and the listener and
+backend options from the [Quick Start](#quick-start). PipeL4 uses the API assembly included with
+that tool package and does not restore the script's package reference.
+
+For an editor check, install the Ionide F# extension in VS Code, then launch VS Code from the
+repository root with `RestoreSources` set to the absolute local candidate directory and NuGet.org
+as a source for any uncached dependencies:
+
+```sh
+RestoreSources="$(realpath ./artifacts/public-api-candidate);https://api.nuget.org/v3/index.json" code .
+```
+
+Open `examples/AsciiUppercase.fsx`, wait for Ionide's type checking to finish, and check that
+`IByteStreamProcessor` and `ProcessorResult` resolve without errors. Then run
+**F#: Send File to F# Interactive** and confirm the file evaluates successfully. The candidate
+version is not available from NuGet.org, so the local feed supplies `PipeL4.Plugins`; NuGet.org is
+available for uncached dependencies such as `FSharp.Core`. Ionide editor diagnostics have not been
+automatically verified by repository checks.
 
 ### Stateful byte pattern replacement
 
@@ -336,8 +407,9 @@ pipel4 \
 ```
 
 These are PipeL4-hosted scripts: `pipel4` compiles, references, discovers, and runs the processor
-inside the proxy. Running `dotnet fsi examples/AsciiUppercase.fsx` is a different execution mode;
-the script deliberately has no assembly reference directive and is not a standalone FSI program.
+inside the proxy. `examples/AsciiUppercase.fsx` can also be opened in Ionide or run with
+`dotnet fsi` when the package version in its `#if INTERACTIVE` block is available. For the current
+unpublished candidate, use the local validation command in [F# script authoring](#f-script-authoring).
 
 ### Configure ordered processors in both directions
 

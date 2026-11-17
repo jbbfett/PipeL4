@@ -40,8 +40,8 @@ jobs:
       - name: Build Release
         run: dotnet build PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true
 
-      - name: Create and select .NET Tool package
-        id: package
+      - name: Create and select .NET Tool package candidate
+        id: package_candidate
         shell: bash
         run: |
           set -euo pipefail
@@ -58,28 +58,34 @@ jobs:
             exit 1
           fi
 
-          expected="./artifacts/ci/PipeL4.0.1.0-alpha.1.nupkg"
-          mapfile -t packages < <(find ./artifacts/ci -maxdepth 1 -type f -name '*.nupkg' -print)
+          mapfile -t packages < <(find ./artifacts/ci -maxdepth 1 -type f -name 'PipeL4.[0-9]*.nupkg' -print)
+          if [[ ${#packages[@]} -eq 0 ]]; then
+            echo "Package selection failed: no PipeL4 CLI package candidate was found in ./artifacts/ci." >&2
+            exit 1
+          fi
           if [[ ${#packages[@]} -ne 1 ]]; then
-            echo "Expected exactly one package in ./artifacts/ci, found ${#packages[@]}." >&2
+            echo "Package selection failed: expected exactly one PipeL4 CLI package candidate in ./artifacts/ci, found ${#packages[@]}." >&2
             exit 1
           fi
-          if [[ "${packages[0]}" != "$expected" || ! -f "$expected" ]]; then
-            echo "Expected package $expected; found ${packages[0]}." >&2
-            exit 1
-          fi
-          printf 'path=%s\n' "$GITHUB_WORKSPACE/artifacts/ci/PipeL4.0.1.0-alpha.1.nupkg" >> "$GITHUB_OUTPUT"
+          candidate_path="$(realpath "${packages[0]}")"
+          printf 'candidate_path=%s\n' "$candidate_path" >> "$GITHUB_OUTPUT"
 
       - name: Validate package metadata and contents
-        run: dotnet fsi scripts/validate_package.fsx "${{ steps.package.outputs.path }}"
+        id: validated_package
+        env:
+          CANDIDATE_PATH: ${{ steps.package_candidate.outputs.candidate_path }}
+        run: |
+          set -euo pipefail
+          dotnet fsi scripts/validate_package.fsx "$CANDIDATE_PATH"
+          printf 'path=%s\n' "$CANDIDATE_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Run package validation regression tests
-        run: dotnet fsi scripts/test_validate_package.fsx "${{ steps.package.outputs.path }}"
+        run: dotnet fsi scripts/test_validate_package.fsx "${{ steps.validated_package.outputs.path }}"
 
       - name: Verify package validation exit codes
-        run: dotnet fsi scripts/test_validation_exit_codes.fsx "${{ steps.package.outputs.path }}"
+        run: dotnet fsi scripts/test_validation_exit_codes.fsx "${{ steps.validated_package.outputs.path }}"
 
       - name: Run Release solution tests against the generated package
         env:
-          PIPEL4_PACKAGE_PATH: ${{ steps.package.outputs.path }}
+          PIPEL4_PACKAGE_PATH: ${{ steps.validated_package.outputs.path }}
         run: dotnet test --solution PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false

@@ -515,12 +515,18 @@ module InstalledToolIntegrationTests =
 
                 isPathWithin repository extractedPath |> should equal false
                 File.ReadAllBytes extractedPath |> should equal (File.ReadAllBytes canonicalPath)
-                scriptText.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
-                |> Array.exists (fun line ->
-                    let trimmed = line.TrimStart()
-                    trimmed.StartsWith("#r", StringComparison.Ordinal)
-                    && trimmed.Contains("PipeL4", StringComparison.OrdinalIgnoreCase))
-                |> should equal false
+                let hasEditorReference =
+                    scriptText.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                    |> Array.exists (fun line ->
+                        let trimmed = line.TrimStart()
+                        trimmed.StartsWith("#r", StringComparison.Ordinal)
+                        && trimmed.Contains("nuget: PipeL4.Plugins, ", StringComparison.Ordinal))
+
+                hasEditorReference |> should equal (name = "AsciiUppercase")
+
+                if name = "AsciiUppercase" then
+                    scriptText.Contains("#if INTERACTIVE", StringComparison.Ordinal)
+                    |> should equal true
 
                 Directory.GetFiles(destinationDirectory, $".{fileName}.*.tmp").Length |> should equal 0
 

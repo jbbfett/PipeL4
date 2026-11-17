@@ -400,6 +400,12 @@ let runTests sourceSummary injectFailure =
             rewritePackage sourcePath target (Some "tools/net10.0/any/FSharp.Compiler.Service.dll") None None
             expectError "missing runtime files" target)
 
+        run "rejects a missing plugin host runtime assembly" (fun () ->
+            let directory = scenarioDirectory "missing plugin host"
+            let target = Path.Combine(directory, Path.GetFileName sourcePath)
+            rewritePackage sourcePath target (Some "tools/net10.0/any/PipeL4.PluginHost.dll") None None
+            expectError "missing runtime files" target)
+
         run "rejects unexpected packaged files" (fun () ->
             let directory = scenarioDirectory "unexpected file"
             let target = Path.Combine(directory, Path.GetFileName sourcePath)

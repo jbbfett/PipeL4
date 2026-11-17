@@ -5,6 +5,19 @@ and [GitHub prerelease](https://github.com/jbbfett/PipeL4/releases/tag/v0.1.0-al
 commit `075a4502101cef4740c1d4496b3785bbc0771bef`, under tag `v0.1.0-alpha.1`. The [release notes](first-prerelease-notes.md)
 document this release's scope and installation instructions.
 
+## Future lockstep packages
+
+Future releases distribute both `PipeL4` (the .NET tool) and `PipeL4.Plugins` (the public API
+library) at the same NuGet version and publish them together. Set the single
+`PipeL4PackageVersion` property in [`Directory.Build.props`](../Directory.Build.props); both
+distributable projects derive their package `Version` from it. The current candidate is
+`0.1.0-alpha.2`, following the published `PipeL4 0.1.0-alpha.1` CLI release. The alpha.1 release
+was the tool package; the matching `PipeL4.Plugins` package was not published at that version. The
+matching alpha.2 tool and library are local release candidates and have not been published. Build
+the tool into `artifacts/release-candidate` and the library into `artifacts/public-api-candidate`;
+validate both and confirm their package versions match before retaining or publishing either
+package. CI validates candidates but does not publish them.
+
 The gates below preserve the first-release procedure and its checks as a historical, reproducible
 record; their approval and publication actions for `0.1.0-alpha.1` are complete. CI does not publish
 a package, tag, or GitHub Release. For a future version, adapt the recorded procedure to that

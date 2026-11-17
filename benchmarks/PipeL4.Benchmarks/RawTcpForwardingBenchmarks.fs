@@ -264,12 +264,12 @@ type RawTcpForwardingBenchmarks() =
         (fixture: ScriptFixture)
         (depth: int)
         (cancellationToken: CancellationToken)
-        : Task<PipeL4.Plugins.ScriptPipelineDefinition>
+        : Task<PipeL4.PluginHost.ScriptPipelineDefinition>
         =
         task {
             let scriptPath = materializeScript fixture
             let paths = Array.replicate depth scriptPath
-            let compiler = PipeL4.Plugins.ScriptCompiler()
+            let compiler = PipeL4.PluginHost.ScriptCompiler()
             let mutable compilationCount = 0
             let stopwatch = Stopwatch.StartNew()
 
@@ -278,7 +278,7 @@ type RawTcpForwardingBenchmarks() =
                 compiler.CompileAndLoadAsync(path, token)
 
             let! definition =
-                PipeL4.Plugins.ScriptPipelineLoader.loadWithCompilerAsync
+                PipeL4.PluginHost.ScriptPipelineLoader.loadWithCompilerAsync
                     compile
                     paths
                     paths
