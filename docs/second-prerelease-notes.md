@@ -39,8 +39,10 @@ Edit it as an ordinary F# script. Its authoring reference is:
 
 This references the matching public API package for F# Interactive and Ionide. An independent
 `net10.0` F# project can reference `PipeL4.Plugins` version `0.1.0-alpha.2` to compile against the
-same public contracts. See the [authoring guide](../README.md#f-script-authoring) for the exact
-directive rules and editor workflow.
+same public contracts. For SDKs whose implicit `FSharp.Core` version is older, set
+`FSharpCoreImplicitPackageVersion=10.1.401` before launching F# Interactive or VS Code/Ionide. See
+the [authoring guide](../README.md#f-script-authoring) for the exact directive rules and editor
+workflow.
 
 To run the copied script, start a TCP backend on `127.0.0.1:6000`, then launch the installed tool:
 
@@ -72,9 +74,10 @@ is made for later prereleases.
 
 PipeL4 targets .NET 10. The release validation targets Ubuntu 24.04 x64; Windows and macOS have
 not been verified for this prerelease. It handles TCP byte streams with a configured backend and
-separate ordered pipelines in each direction. It does not add HTTP framing, TLS, plugin routing,
-or a functional Processor API. Those are outside this release; any proposals for them are not
-release commitments.
+separate ordered pipelines in each direction. It does not add HTTP framing, TLS, or plugin routing.
+Alpha.2 provides the existing public `IByteStreamProcessor` contract, which processors can implement
+for the supported stream processing behavior. It does not introduce a separate function-first
+convenience API.
 
 Processors use the runtime-controlled `IByteStreamProcessor.ProcessAsync` model. The runtime owns
 network and pipeline memory, schedules downstream work, and supplies completion and backpressure.

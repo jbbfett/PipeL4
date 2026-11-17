@@ -52,6 +52,12 @@ host compiles the guarded reference out and uses its bundled contract assembly. 
 should use the same released version of `PipeL4.Plugins` as the tool. A NuGet package version that
 has already been published cannot be replaced.
 
+F# Interactive also resolves an implicit `FSharp.Core` package. If its SDK-selected version is
+older than the dependency declared by `PipeL4.Plugins`, restore can report `NU1605`. Set
+`FSharpCoreImplicitPackageVersion` to the package's declared dependency version before launching
+FSI or VS Code/Ionide. For alpha.2, the package declares `FSharp.Core` `10.1.401`; this setting
+does not add another script reference or change PipeL4's runtime loading path.
+
 ### 1. Local source validation
 
 Run from a clean checkout of the release branch. Record the selected SDK and source revision. The
@@ -65,7 +71,7 @@ dotnet --version
 git status --short
 git rev-parse HEAD
 dotnet tool restore
-dotnet clean PipeL4.sln --configuration Release -p:PaketDisableCliTest=true -p:BuildInParallel=false
+dotnet clean PipeL4.sln --configuration Release -m:1 -p:PaketDisableCliTest=true -p:BuildInParallel=false
 dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
 dotnet build PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true
 ```
@@ -169,7 +175,8 @@ ide_root="$(mktemp -d)"
 mkdir -p "$ide_root/workspace" "$ide_root/home" "$ide_root/packages" "$ide_root/http-cache" "$ide_root/dotnet-home"
 cp examples/AsciiUppercase.fsx "$ide_root/workspace/AsciiUppercase.fsx"
 api_feed="$(realpath ./artifacts/second-prerelease/plugins)"
-RestoreSources="$api_feed;https://api.nuget.org/v3/index.json" \
+FSharpCoreImplicitPackageVersion=10.1.401 \
+  RestoreSources="$api_feed;https://api.nuget.org/v3/index.json" \
   NUGET_PACKAGES="$ide_root/packages" NUGET_HTTP_CACHE_PATH="$ide_root/http-cache" \
   DOTNET_CLI_HOME="$ide_root/dotnet-home" HOME="$ide_root/home" \
   code --new-window --user-data-dir "$ide_root/vscode-data" \
@@ -209,6 +216,22 @@ Confirm both package IDs and versions, the documented dependency boundary, and r
 reviewer should identify the candidate source revision and explicitly approve moving it to `master`.
 Stop for an unresolved finding.
 
+### 4a. Hosted pull request validation before merge
+
+Before squash-merging, require both GitHub Actions checks to succeed for the latest pull request
+revision:
+
+- `CI / Build and test`
+- `Distribution validation / Build and validate distributable packages`
+
+Confirm each run belongs to this pull request and corresponds to its current head and base
+revisions. Both workflows use `actions/checkout@v7` without a `ref` override. For a
+`pull_request` event, that checks out GitHub's synthetic pull request merge ref; the run's tested
+`GITHUB_SHA` can therefore differ from the pull request branch's head SHA. Do not require those
+SHAs to be equal. Record both run URLs, the pull request head and base SHAs, the event, and each
+run's tested SHA. If the pull request head or base changes after validation, require both checks to
+pass again for the updated pull request state and record the new runs before merging.
+
 ### 5. Squash merge into `master`
 
 Merge the approved release pull request into `master` using the repository's squash-merge
@@ -217,7 +240,8 @@ revision from which the final release artifacts must be built.
 
 ### 6. Hosted CI and Distribution validation
 
-After the merge, verify both hosted workflows for the same `master` commit:
+After the merge, verify both hosted workflows for the same `master` commit. These runs are separate
+from the pre-merge pull request checks in step 4a:
 
 - [CI](../.github/workflows/ci.yml) restores, builds, tests, packs, and validates the `PipeL4` tool
   package. It does not validate the `PipeL4.Plugins` distribution by itself.
@@ -382,7 +406,7 @@ mkdir -p "$public_fsi_root/home" "$public_fsi_root/packages" "$public_fsi_root/h
 cp examples/AsciiUppercase.fsx "$public_fsi_root/AsciiUppercase.fsx"
 HOME="$public_fsi_root/home" DOTNET_CLI_HOME="$public_fsi_root/dotnet-home" \
   NUGET_PACKAGES="$public_fsi_root/packages" NUGET_HTTP_CACHE_PATH="$public_fsi_root/http-cache" \
-  RestoreSources=https://api.nuget.org/v3/index.json \
+  RestoreSources=https://api.nuget.org/v3/index.json FSharpCoreImplicitPackageVersion=10.1.401 \
   dotnet fsi --exec "$public_fsi_root/AsciiUppercase.fsx"
 ```
 
