@@ -167,6 +167,18 @@ let private runFsi sourcePath workingDirectory localFeed packageCache httpCache 
     startInfo.ArgumentList.Add "fsi"
     startInfo.ArgumentList.Add "--exec"
     startInfo.ArgumentList.Add sourcePath
+    let fsiHome = Path.Combine(workingDirectory, "fsi-home")
+    Directory.CreateDirectory fsiHome |> ignore
+
+    if not (OperatingSystem.IsWindows()) then
+        File.SetUnixFileMode(
+            fsiHome,
+            UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute)
+
+    startInfo.Environment["HOME"] <- fsiHome
+    startInfo.Environment["USERPROFILE"] <- fsiHome
+    startInfo.Environment["DOTNET_CLI_HOME"] <- fsiHome
+    startInfo.Environment["XDG_RUNTIME_DIR"] <- fsiHome
     startInfo.Environment["NUGET_PACKAGES"] <- packageCache
     startInfo.Environment["NUGET_HTTP_CACHE_PATH"] <- httpCache
     startInfo.Environment["RestoreSources"] <- localFeed

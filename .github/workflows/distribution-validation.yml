@@ -111,6 +111,11 @@ jobs:
           PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
         run: dotnet fsi scripts/test_public_api_consumer.fsx "$PUBLIC_API_PACKAGE_PATH"
 
+      - name: Verify FSI authoring dependency-manager cache isolation
+        env:
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
+        run: dotnet fsi scripts/test_fsi_authoring_cache.fsx "$PUBLIC_API_PACKAGE_PATH" examples/AsciiUppercase.fsx
+
       - name: Validate F# Interactive authoring with the local API candidate
         env:
           PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
