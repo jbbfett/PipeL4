@@ -97,9 +97,16 @@ The runtime owns:
 - pipeline memory;
 - buffering and backpressure;
 - memory accounting;
-- plugin loading and diagnostics.
+- plugin loading through `PipeL4.PluginHost` and diagnostics.
 
 The core is protocol-agnostic and operates on byte streams.
+
+At the project boundary, `PipeL4.Core` implements TCP forwarding, processor execution, and runtime
+memory ownership without depending on the public plugin API or script host. `PipeL4.Plugins` defines
+the public processor and connection-state contracts. `PipeL4.PluginHost` depends on Core and
+Plugins; it compiles and loads `.fsx` scripts, discovers processor implementations, and adapts the
+public API to the internal processor contract. The `PipeL4` executable composes these projects and
+supplies its referenced `PipeL4.Plugins` assembly to the script host.
 
 ## Processor model
 

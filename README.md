@@ -131,6 +131,13 @@ Current non-goals:
 PipeL4 targets `net10.0`. Install the .NET 10 SDK to use the .NET tool commands below; it includes
 the .NET 10 runtime required to run PipeL4.
 
+`PipeL4` is the .NET tool; [`PipeL4.Plugins`](src/PipeL4.Plugins/README.md) is the standalone NuGet
+library for the public F# processor contracts. Both packages use the single
+`PipeL4PackageVersion` property and are released together. The published `0.1.0-alpha.1` release is
+the `PipeL4` tool. This checkout's matching `0.1.0-alpha.2` tool and API packages are local release
+candidates and have not been published. The tool already includes the `PipeL4.Plugins` assembly,
+so running `.fsx` plugins does not require a separate API package installation or NuGet restore.
+
 ### Public NuGet installation
 
 For ordinary use, install the published prerelease from NuGet.org at its exact version:
@@ -281,9 +288,14 @@ current local candidate and is not a NuGet.org release. Active `#r` directives, 
 assembly paths, `#load`, and `#I` remain unsupported; arbitrary package references are rejected
 even inside inactive branches.
 
-To validate the example with a locally built API candidate, create the package and run the isolated
-FSI check. The validator reads the shared version from the package, uses only that package as its
-NuGet source, and executes the same `.fsx` file used by PipeL4:
+To typecheck the example with a locally built API candidate, create the package and run the isolated
+FSI check. The validator reads the shared version from the package, creates a temporary local feed
+containing that candidate and its cached `FSharp.Core` dependency, and executes the same `.fsx` file
+used by PipeL4:
+
+Before running these FSI authoring commands, complete the restore and build steps in [Local build
+and package installation](#local-build-and-package-installation). They prepare the dependencies and
+build outputs required by the `--no-restore` pack command.
 
 ```sh
 mkdir -p ./artifacts/public-api-candidate
@@ -294,17 +306,26 @@ dotnet fsi scripts/validate_fsi_authoring.fsx \
   ./artifacts/public-api-candidate ./examples/AsciiUppercase.fsx
 ```
 
-For a manual Ionide check with this unpublished candidate, launch VS Code from the repository root
-with `RestoreSources` set to the absolute local candidate directory:
+After installing the matching local `PipeL4` tool candidate as described in
+[Local build and package installation](#local-build-and-package-installation), run the same file
+through PipeL4 with `--client-to-server-plugin ./examples/AsciiUppercase.fsx` and the listener and
+backend options from the [Quick Start](#quick-start). PipeL4 uses the API assembly included with
+that tool package and does not restore the script's package reference.
+
+For an editor check, install the Ionide F# extension in VS Code, then launch VS Code from the
+repository root with `RestoreSources` set to the absolute local candidate directory and NuGet.org
+as a source for any uncached dependencies:
 
 ```sh
-RestoreSources="$(realpath ./artifacts/public-api-candidate)" code .
+RestoreSources="$(realpath ./artifacts/public-api-candidate);https://api.nuget.org/v3/index.json" code .
 ```
 
-Open `examples/AsciiUppercase.fsx`, check that `IByteStreamProcessor` and `ProcessorResult` resolve,
-then run **F#: Send File to F# Interactive**. The candidate version is not available from NuGet.org;
-the environment setting keeps this check on the local feed. Ionide editor diagnostics have not been
-automatically verified by the repository tests.
+Open `examples/AsciiUppercase.fsx`, wait for Ionide's type checking to finish, and check that
+`IByteStreamProcessor` and `ProcessorResult` resolve without errors. Then run
+**F#: Send File to F# Interactive** and confirm the file evaluates successfully. The candidate
+version is not available from NuGet.org, so the local feed supplies `PipeL4.Plugins`; NuGet.org is
+available for uncached dependencies such as `FSharp.Core`. Ionide editor diagnostics have not been
+automatically verified by repository checks.
 
 ### Stateful byte pattern replacement
 
