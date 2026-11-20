@@ -1,9 +1,4 @@
-# PipeL4 v0.1.0-alpha.2 — release notes draft
-
-**Draft for review.** The `0.1.0-alpha.2` packages are local candidates in this checkout. These
-installation instructions apply after both packages are published and verified; the manual
-VS Code/Ionide gate and final release checks remain pending. See the
-[release procedure](releasing.md#010-alpha2-release-procedure).
+# PipeL4 v0.1.0-alpha.2 — release notes
 
 PipeL4 is an experimental F#/.NET TCP byte-stream proxy for integration tests, protocol
 experiments, and runtime research. This release adds the `PipeL4.Plugins` NuGet library as a
@@ -19,14 +14,25 @@ records. These changes follow the alpha.1 tool release; they do not add a new pr
 
 ## Install and try a processor
 
-Install the .NET 10 SDK, which includes the runtime required by the tool. After publication,
-install the exact matching tool version from NuGet.org:
+Install the .NET 10 SDK, which includes the runtime required by the tool. Install the exact
+matching tool version from NuGet.org:
 
 ```sh
 dotnet tool install --global PipeL4 --version 0.1.0-alpha.2
 pipel4 --version
 pipel4 examples copy AsciiUppercase
 ```
+
+To update an existing global installation, run:
+
+```sh
+dotnet tool update --global PipeL4 --version 0.1.0-alpha.2
+```
+
+The exact-version package pages are [PipeL4 0.1.0-alpha.2](https://www.nuget.org/packages/PipeL4/0.1.0-alpha.2)
+and [`PipeL4.Plugins` 0.1.0-alpha.2](https://www.nuget.org/packages/PipeL4.Plugins/0.1.0-alpha.2).
+The tool bundles the public contract assembly for running scripts; the separate API package is for
+F# Interactive, Ionide, and .NET/F# projects that reference the processor contracts.
 
 The copied `AsciiUppercase.fsx` is a complete processor using `PipeL4.Plugins.IByteStreamProcessor`.
 Edit it as an ordinary F# script. Its authoring reference is:
@@ -67,17 +73,18 @@ NuGet restore inside PipeL4.
 
 The public processor types and signatures in `ProcessorApi.fs` are identical to those in the
 alpha.1 source. Existing `.fsx` processors that use those documented contracts do not need source
-changes to run with the alpha.2 tool. The conditional `#r` block is optional for PipeL4 execution;
-add it when authoring with F# Interactive or an editor. Alpha.1 published only the `PipeL4` tool,
-so there is no alpha.1 public `PipeL4.Plugins` package to upgrade from. No compatibility guarantee
-is made for later prereleases.
+changes to run with the alpha.2 tool; this is source compatibility and does not promise binary
+compatibility for consumers compiled against an alpha.1 assembly. The conditional `#r` block is
+optional for PipeL4 execution; add it when authoring with F# Interactive or an editor. Alpha.1
+published only the `PipeL4` tool, so there is no alpha.1 public `PipeL4.Plugins` package to upgrade
+from. No compatibility guarantee is made for later prereleases.
 
 PipeL4 targets .NET 10. The release validation targets Ubuntu 24.04 x64; Windows and macOS have
 not been verified for this prerelease. It handles TCP byte streams with a configured backend and
 separate ordered pipelines in each direction. It does not add HTTP framing, TLS, or plugin routing.
-Alpha.2 provides the existing public `IByteStreamProcessor` contract, which processors can implement
-for the supported stream processing behavior. It does not introduce a separate function-first
-convenience API.
+The public processor API in alpha.2 is the existing `IByteStreamProcessor` contract, which
+processors implement for the supported stream processing behavior. A function-first convenience
+API has been proposed separately and is not included in this release.
 
 Processors use the runtime-controlled `IByteStreamProcessor.ProcessAsync` model. The runtime owns
 network and pipeline memory, schedules downstream work, and supplies completion and backpressure.

@@ -418,7 +418,7 @@ failing.
 ### 12. Publish the GitHub prerelease
 
 Only after both packages are publicly available and verified, review the
-[alpha.2 release notes draft](second-prerelease-notes.md) against the published artifacts. Then
+[alpha.2 release notes](second-prerelease-notes.md) against the published artifacts. Then
 manually draft a GitHub Release
 from the `v0.1.0-alpha.2` tag. Mark it as a prerelease, link both
 NuGet packages, and verify the release page, tag target, notes, and links before publishing.
