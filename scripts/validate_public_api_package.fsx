@@ -3,6 +3,7 @@ open System.Diagnostics
 open System.IO
 open System.IO.Compression
 open System.Reflection
+open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Xml.Linq
@@ -32,6 +33,8 @@ let private runProcess reportOutput (workingDirectory: string) (fileName: string
     startInfo.UseShellExecute <- false
     startInfo.RedirectStandardOutput <- true
     startInfo.RedirectStandardError <- true
+    startInfo.Environment.Remove "FSharpCoreImplicitPackageVersion" |> ignore
+    startInfo.Environment.Remove "NoWarn" |> ignore
     for argument in arguments do
         startInfo.ArgumentList.Add argument
 
@@ -295,7 +298,7 @@ let private validatePackageFile packagePath =
       Dependencies = dependencies |> Array.distinct |> Array.toList }
     , fsharpVersion
 
-let private validateIndependentConsumer packagePath version fsharpVersion useInvalidConsumerSource =
+let private validateIndependentConsumer (packagePath: string) (version: string) minimumFsharpVersion (fsharpVersionOverride: string option) useInvalidConsumerSource =
     let root = Path.Combine(Path.GetTempPath(), $"PipeL4 public API consumer {Guid.NewGuid():N}")
     let feed = Path.Combine(root, "feed")
     let project = Path.Combine(root, "consumer")
@@ -305,9 +308,6 @@ let private validateIndependentConsumer packagePath version fsharpVersion useInv
 
     try
         File.Copy(packagePath, Path.Combine(feed, Path.GetFileName packagePath))
-        let fsharpPackage = locateCachedPackage "FSharp.Core" fsharpVersion
-        File.Copy(fsharpPackage, Path.Combine(feed, Path.GetFileName fsharpPackage))
-
         let config =
             XDocument(
                 XElement(
@@ -320,15 +320,20 @@ let private validateIndependentConsumer packagePath version fsharpVersion useInv
             )
         config.Save(Path.Combine(project, "NuGet.Config"))
 
+        let properties =
+            XElement(
+                "PropertyGroup",
+                XElement("TargetFramework", "net10.0"),
+                XElement("RestorePackagesWithLockFile", "false"))
+        match fsharpVersionOverride with
+        | Some fsharpVersion -> properties.Add(XElement("FSharpCoreImplicitPackageVersion", fsharpVersion))
+        | None -> ()
+
         let projectFile =
             XElement(
                 "Project",
                 XAttribute("Sdk", "Microsoft.NET.Sdk"),
-                XElement(
-                    "PropertyGroup",
-                    XElement("TargetFramework", "net10.0"),
-                    XElement("FSharpCoreImplicitPackageVersion", fsharpVersion),
-                    XElement("RestorePackagesWithLockFile", "false")),
+                properties,
                 XElement(
                     "ItemGroup",
                     XElement(
@@ -340,6 +345,24 @@ let private validateIndependentConsumer packagePath version fsharpVersion useInv
                     XElement("Compile", XAttribute("Include", "Consumer.fs")))
             )
         projectFile.Save(Path.Combine(project, "Consumer.fsproj"))
+
+        let selectedFsharpVersion, _ =
+            runProcess false project "dotnet"
+                [ "msbuild"
+                  Path.Combine(project, "Consumer.fsproj")
+                  (if fsharpVersionOverride.IsSome then
+                       "-getProperty:FSharpCoreImplicitPackageVersion"
+                   else
+                       "-getProperty:FSCorePackageVersion") ]
+        let selectedFsharpVersion = selectedFsharpVersion.Trim()
+        if String.IsNullOrWhiteSpace selectedFsharpVersion then
+            fail "Could not determine the consumer's selected FSharp.Core version."
+        let expectedFsharpVersion = fsharpVersionOverride |> Option.defaultValue selectedFsharpVersion
+        if selectedFsharpVersion <> expectedFsharpVersion then
+            fail $"Consumer selected FSharp.Core {selectedFsharpVersion}; expected {expectedFsharpVersion}."
+        for fsharpVersion in [ minimumFsharpVersion; expectedFsharpVersion ] |> List.distinct do
+            let fsharpPackage = locateCachedPackage "FSharp.Core" fsharpVersion
+            File.Copy(fsharpPackage, Path.Combine(feed, Path.GetFileName fsharpPackage))
 
         let source =
             if useInvalidConsumerSource then
@@ -376,7 +399,10 @@ type Processor(_connectionState: IConnectionState) =
                   packageCache
                   "--verbosity"
                   "minimal"
-                  "-p:NuGetAudit=false" ]
+                  "-p:NuGetAudit=false"
+                  "-p:NoWarn="
+                  "-p:RestoreNoWarn="
+                  "-p:WarningsAsErrors=NU1605" ]
         if (restoreOutput + restoreError).Contains("NU1605", StringComparison.Ordinal) then
             fail "Independent consumer restore reported NuGet downgrade warning NU1605."
 
@@ -392,11 +418,17 @@ type Processor(_connectionState: IConnectionState) =
                 else
                     None)
             |> Seq.toArray
-        if resolvedFSharpVersions <> [| fsharpVersion |] then
+        if resolvedFSharpVersions <> [| expectedFsharpVersion |] then
             let displayedVersions = String.Join(", ", resolvedFSharpVersions)
             fail
-                $"Independent consumer resolved FSharp.Core {displayedVersions}; expected the package minimum {fsharpVersion}."
-        printfn "Independent consumer resolved FSharp.Core %s from the isolated local feed." fsharpVersion
+                $"Independent consumer resolved FSharp.Core {displayedVersions}; expected {expectedFsharpVersion}."
+
+        let restoredPackage =
+            Path.Combine(packageCache, "pipel4.plugins", version.ToLowerInvariant(), $"pipel4.plugins.{version.ToLowerInvariant()}.nupkg")
+        if not (File.Exists restoredPackage)
+           || not (SHA256.HashData(File.ReadAllBytes restoredPackage).AsSpan().SequenceEqual(SHA256.HashData(File.ReadAllBytes packagePath))) then
+            fail "Independent consumer did not restore the supplied local PipeL4.Plugins candidate."
+        printfn "Independent consumer resolved FSharp.Core %s and the supplied local PipeL4.Plugins candidate." expectedFsharpVersion
 
         let buildOutput, buildError =
             runProcess true project "dotnet"
@@ -405,6 +437,8 @@ type Processor(_connectionState: IConnectionState) =
                   "--configuration"
                   "Release"
                   "--no-restore"
+                  "-p:NoWarn="
+                  "-p:WarningsAsErrors=NU1605"
                   "--verbosity"
                   "minimal" ]
         if (buildOutput + buildError).Contains("NU1605", StringComparison.Ordinal) then
@@ -415,7 +449,11 @@ type Processor(_connectionState: IConnectionState) =
 
 let private validatePackage packagePath useInvalidConsumerSource =
     let summary, fsharpVersion = validatePackageFile packagePath
-    validateIndependentConsumer summary.PackagePath summary.Version fsharpVersion useInvalidConsumerSource
+    if fsharpVersion <> "10.0.100" then
+        fail $"Public API package declares FSharp.Core minimum {fsharpVersion}; expected 10.0.100."
+    validateIndependentConsumer summary.PackagePath summary.Version fsharpVersion None useInvalidConsumerSource
+    if not useInvalidConsumerSource then
+        validateIndependentConsumer summary.PackagePath summary.Version fsharpVersion (Some "10.0.100") false
     summary
 
 let arguments = fsi.CommandLineArgs |> Array.skip 1
@@ -436,7 +474,7 @@ let exitStatus =
             match validatePackage packagePath useInvalidConsumerSource with
             | summary ->
                 printfn
-                    "Validated public API package: PackageId=%s, version=%s, target=%s, assembly=%s (%s), dependencies=%s; independent F# consumer compiled."
+                    "Validated public API package: PackageId=%s, version=%s, target=%s, assembly=%s (%s), dependencies=%s; SDK-default and minimum-version F# consumers compiled."
                     summary.PackageId
                     summary.Version
                     summary.TargetFramework

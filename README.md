@@ -293,7 +293,7 @@ unsupported; arbitrary package references are rejected even inside inactive bran
 F# Interactive also restores its implicit `FSharp.Core` package. If the SDK's implicit version is
 older than the one required by `PipeL4.Plugins`, restore can report `NU1605`. Set
 `FSharpCoreImplicitPackageVersion` to the `FSharp.Core` version declared by the API package before
-starting F# Interactive or VS Code/Ionide. For `0.1.0-alpha.2` that version is `10.1.401`:
+starting F# Interactive or VS Code/Ionide. The published `0.1.0-alpha.2` package requires `10.1.401`:
 
 Once the matching API package is available from the configured package sources, run F# Interactive
 with:
@@ -304,7 +304,7 @@ FSharpCoreImplicitPackageVersion=10.1.401 dotnet fsi --exec ./examples/AsciiUppe
 
 The variable aligns F# Interactive's implicit package selection; it does not add another script
 reference. To validate against a locally built API package, use the isolated validation command
-below; it reads the dependency version from that package and sets this variable. PipeL4's host still
+below; it checks the candidate against the SDK default without this variable. PipeL4's host still
 compiles the guarded `#r` out and uses its bundled API assembly.
 
 To typecheck the example with a locally built API candidate, create the package and run the isolated
@@ -317,13 +317,20 @@ and package installation](#local-build-and-package-installation). They prepare t
 build outputs required by the `--no-restore` pack command.
 
 ```sh
-mkdir -p ./artifacts/public-api-candidate
+set -euo pipefail
+candidate_dir="$(mktemp -d)"
+api_package="$candidate_dir/PipeL4.Plugins.0.1.0-alpha.2.nupkg"
 dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj --configuration Release --no-restore \
   -p:PaketDisableCliTest=true -p:BuildInParallel=false \
-  --output ./artifacts/public-api-candidate
+  --output "$candidate_dir"
+test -f "$api_package"
 dotnet fsi scripts/validate_fsi_authoring.fsx \
-  ./artifacts/public-api-candidate ./examples/AsciiUppercase.fsx
+  "$api_package" ./examples/AsciiUppercase.fsx
 ```
+
+Run the block as one shell sequence. `mktemp -d` gives each run an empty output directory, and
+`set -e` stops before validation if packing fails. Keep `candidate_dir` until its validation is
+reviewed; the editor procedure below creates and retains its own fresh candidate.
 
 After installing the local `PipeL4` build as described in
 [Local build and package installation](#local-build-and-package-installation), run the same file
@@ -331,25 +338,13 @@ through PipeL4 with `--client-to-server-plugin ./examples/AsciiUppercase.fsx` an
 backend options from the [Quick Start](#quick-start). PipeL4 uses the API assembly included with
 that tool package and does not restore the script's package reference.
 
-For an editor check, install the Ionide F# extension in VS Code, then launch VS Code from the
-repository root with `RestoreSources` set to the absolute local candidate directory and NuGet.org
-as a source for any uncached dependencies. Also pass the matching API package's `FSharp.Core`
-dependency version to F# Interactive:
-
-```sh
-FSharpCoreImplicitPackageVersion=10.1.401 \
-  RestoreSources="$(realpath ./artifacts/public-api-candidate);https://api.nuget.org/v3/index.json" \
-  code .
-```
-
-Open `examples/AsciiUppercase.fsx`, wait for Ionide's type checking to finish, and check that
-`IByteStreamProcessor` and `ProcessorResult` resolve without errors. Then run
-**F#: Send File to F# Interactive** and confirm the file evaluates successfully. For local package
-validation, the local feed supplies `PipeL4.Plugins`; NuGet.org supplies uncached dependencies such
-as `FSharp.Core`. Repository checks do not automatically verify Ionide editor diagnostics. For
-release approval, use the
-[manual IDE gate](docs/releasing.md#3a-manual-vs-codeionide-authoring-gate), which checks an external
-workspace with isolated caches and records the actual IDE result.
+For an editor check of the local candidate, use the
+[isolated VS Code/Ionide procedure](docs/releasing.md#3a-manual-vs-codeionide-authoring-gate).
+That procedure packs a fresh candidate for its editor session.
+Its workspace uses a dedicated local feed as its sole restore source and starts Ionide and FSI
+with fresh caches and the exact SDK selected in the repository. It checks the SDK-default
+`FSharp.Core` package and compares the restored and loaded `PipeL4.Plugins` bits with the candidate.
+Repository checks do not automatically verify Ionide editor diagnostics.
 
 ### Stateful byte pattern replacement
 
