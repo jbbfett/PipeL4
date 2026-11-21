@@ -8,8 +8,8 @@ package's MIT license expression and the repository's `LICENSE` file.
 
 | NuGet package | Version | Distributed binaries |
 | --- | --- | --- |
-| FSharp.Compiler.Service | 43.12.401 | `FSharp.Compiler.Service.dll`, `FSharp.DependencyManager.Nuget.dll`, and their satellite resource assemblies |
-| FSharp.Core | 10.1.401 | `FSharp.Core.dll` and its satellite resource assemblies |
+| FSharp.Compiler.Service | 43.10.100 | `FSharp.Compiler.Service.dll`, `FSharp.DependencyManager.Nuget.dll`, and their satellite resource assemblies |
+| FSharp.Core | 10.0.100 | `FSharp.Core.dll` and its satellite resource assemblies |
 
 The satellite resource assemblies for each of these three binaries are included in the `cs`, `de`,
 `es`, `fr`, `it`, `ja`, `ko`, `pl`, `pt-BR`, `ru`, `tr`, `zh-Hans`, and `zh-Hant` directories.
@@ -18,7 +18,7 @@ The [F# MIT license](notices/FSharp.LICENSE.txt) applies to these binaries. Its 
 "Copyright (c) Microsoft Corporation. All rights reserved." Both package nuspecs also state:
 "Contains code from the F# Software Foundation."
 
-Source: the [F# license at the source commit recorded in both package nuspecs](https://github.com/dotnet/dotnet/blob/e34a38d2ae1fc26406a317517196e55c68ff83ab/src/fsharp/License.txt).
+Source: the [F# license at the source commit recorded in both package nuspecs](https://github.com/dotnet/dotnet/blob/b0f34d51fccc69fd334253924abd8d6853fad7aa/src/fsharp/License.txt).
 The exact `FSharp.Compiler.Service` and `FSharp.Core` NuGet packages contain no separate license or
 third-party notice file; they declare the MIT license expression.
 

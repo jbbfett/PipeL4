@@ -52,11 +52,11 @@ host compiles the guarded reference out and uses its bundled contract assembly. 
 should use the same released version of `PipeL4.Plugins` as the tool. A NuGet package version that
 has already been published cannot be replaced.
 
-F# Interactive also resolves an implicit `FSharp.Core` package. If its SDK-selected version is
-older than the dependency declared by `PipeL4.Plugins`, restore can report `NU1605`. Set
-`FSharpCoreImplicitPackageVersion` to the package's declared dependency version before launching
-FSI or VS Code/Ionide. For alpha.2, the package declares `FSharp.Core` `10.1.401`; this setting
-does not add another script reference or change PipeL4's runtime loading path.
+F# Interactive also resolves an implicit `FSharp.Core` package. The published alpha.2 package
+requires `FSharp.Core` `10.1.401`; set `FSharpCoreImplicitPackageVersion=10.1.401` when authoring
+against that published package with an older SDK default, as described in the README. The local
+candidate built from this checkout declares `10.0.100` and must be checked with the SDK default,
+without that override. The setting does not change PipeL4's runtime loading path.
 
 ### 1. Local source validation
 
@@ -166,47 +166,105 @@ Repeat checks affected by changes to source, package metadata, or package conten
 
 Before approving the pre-merge candidate, a reviewer must perform this check in VS Code with the
 Ionide F# extension and the .NET 10 SDK installed. Start with the
-[README authoring instructions](../README.md#f-script-authoring). Build the local
-`PipeL4.Plugins.0.1.0-alpha.2.nupkg` in step 2 first. On a Unix-like workstation, launch a fresh
-VS Code window with a disposable external workspace and isolated NuGet and FSI caches:
+[README authoring instructions](../README.md#f-script-authoring). Complete the build in step 1
+first. Run the following block from the repository root as one fail-fast shell sequence. It packs
+a fresh candidate into a new, empty directory, validates that exact file, and keeps it in place
+through the manual editor check. The external workspace pins the SDK actually selected in the
+repository, with roll-forward disabled. Stage that SDK's default `FSharp.Core` package in the
+local feed; if it is absent from the normal package cache, a disposable F# project fetches it
+from NuGet.org first:
 
 ```sh
+set -euo pipefail
+repo_root="$(pwd)"
+repo_sdk="$(dotnet --version)"
 ide_root="$(mktemp -d)"
-mkdir -p "$ide_root/workspace" "$ide_root/home" "$ide_root/packages" "$ide_root/http-cache" "$ide_root/dotnet-home"
+candidate_dir="$ide_root/candidate"
+api_package="$candidate_dir/PipeL4.Plugins.0.1.0-alpha.2.nupkg"
+api_feed="$ide_root/feed"
+extensions_dir="$HOME/.vscode/extensions"
+sdk_fsharp_version="$(dotnet msbuild src/PipeL4.Plugins/PipeL4.Plugins.fsproj -getProperty:FSCorePackageVersion)"
+global_packages="$(dotnet nuget locals global-packages --list | sed -n 's/^global-packages: //p')"
+fsharp_package="$global_packages/fsharp.core/$sdk_fsharp_version/fsharp.core.$sdk_fsharp_version.nupkg"
+mkdir -p "$candidate_dir" "$ide_root/workspace" "$api_feed" "$ide_root/home" "$ide_root/packages" "$ide_root/http-cache" "$ide_root/dotnet-home" "$ide_root/runtime"
+dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj --configuration Release --no-restore \
+  -p:PaketDisableCliTest=true -p:BuildInParallel=false --output "$candidate_dir"
+test -f "$api_package"
+dotnet fsi scripts/validate_fsi_authoring.fsx "$api_package" examples/AsciiUppercase.fsx
 cp examples/AsciiUppercase.fsx "$ide_root/workspace/AsciiUppercase.fsx"
-api_feed="$(realpath ./artifacts/second-prerelease/plugins)"
-FSharpCoreImplicitPackageVersion=10.1.401 \
-  RestoreSources="$api_feed;https://api.nuget.org/v3/index.json" \
-  NUGET_PACKAGES="$ide_root/packages" NUGET_HTTP_CACHE_PATH="$ide_root/http-cache" \
-  DOTNET_CLI_HOME="$ide_root/dotnet-home" HOME="$ide_root/home" \
+cat > "$ide_root/workspace/global.json" <<EOF
+{"sdk":{"version":"$repo_sdk","rollForward":"disable"}}
+EOF
+if ! test -f "$fsharp_package"; then
+  dotnet new classlib --language F# --framework net10.0 --output "$ide_root/core-stage" --no-restore
+  dotnet restore "$ide_root/core-stage/core-stage.fsproj" --source https://api.nuget.org/v3/index.json
+fi
+cp "$api_package" "$api_feed/"
+cp "$fsharp_package" "$api_feed/"
+cat > "$ide_root/workspace/NuGet.Config" <<EOF
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="candidate" value="$api_feed" />
+  </packageSources>
+</configuration>
+EOF
+(
+  cd "$ide_root/workspace"
+  unset FSharpCoreImplicitPackageVersion NoWarn
+  export RestoreSources="$api_feed" NUGET_PACKAGES="$ide_root/packages" NUGET_HTTP_CACHE_PATH="$ide_root/http-cache"
+  export DOTNET_CLI_HOME="$ide_root/dotnet-home" HOME="$ide_root/home" XDG_RUNTIME_DIR="$ide_root/runtime"
+  workspace_sdk="$(dotnet --version)"
+  printf 'Workspace SDK: %s\n' "$workspace_sdk"
+  test "$workspace_sdk" = "$repo_sdk"
+  test "$(dotnet msbuild "$repo_root/src/PipeL4.Plugins/PipeL4.Plugins.fsproj" -getProperty:FSCorePackageVersion)" = "$sdk_fsharp_version"
+  dotnet fsi --exec ./AsciiUppercase.fsx
+  cmp "$api_package" "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/pipel4.plugins.0.1.0-alpha.2.nupkg"
   code --new-window --user-data-dir "$ide_root/vscode-data" \
-    --extensions-dir "$HOME/.vscode/extensions" "$ide_root/workspace"
+    --extensions-dir "$extensions_dir" "$ide_root/workspace"
+)
 ```
 
 The `--extensions-dir` path assumes the normal VS Code extension directory on Linux; adjust it to
 the actual directory containing Ionide. Keep this window separate from an existing VS Code process
-so the environment reaches Ionide and FSI. The local feed supplies the unpublished API candidate;
-NuGet.org supplies dependencies such as `FSharp.Core`. The empty cache and home prevent an older
-package or a previous FSI dependency-manager result from satisfying the check. Inspect the
-`#if INTERACTIVE` reference in the copied file and confirm that it names
-`PipeL4.Plugins, 0.1.0-alpha.2`.
+so the environment reaches Ionide and FSI. FSI's script dependency restore did not honor Package
+Source Mapping in this workflow: with an empty candidate feed, it loaded the published alpha.2
+package from another configured source. The sole restore source makes that impossible while the
+staged `FSharp.Core` package supplies the SDK default. NuGet.org is used only during setup if that
+package is not cached. The empty package cache and home prevent an older package or a previous FSI
+dependency-manager result from satisfying the check. The workspace-local `global.json` requires
+the exact repository-selected SDK; a missing SDK stops the workflow instead of selecting another
+feature band. Keep `ide_root` until the manual check is complete. Inspect the `#if INTERACTIVE`
+reference in the copied file and confirm that it names `PipeL4.Plugins, 0.1.0-alpha.2`.
 
 In that external workspace, open `AsciiUppercase.fsx`. Wait for Ionide to finish, then confirm
 `IByteStreamProcessor` and `ProcessorResult` resolve, hover shows their F# types, and diagnostics
 appear for a temporary `let intentionalError: int = "wrong type"` line and clear when it is
-removed. Use **F#: Send File to F# Interactive** and confirm successful evaluation. Confirm that no
-PipeL4 source project or project reference is present in the workspace. After FSI restore, compare
-the cached candidate with the reviewed package:
+removed. Use **F#: Send File to F# Interactive** and confirm successful evaluation. In that FSI
+session, evaluate `typeof<IByteStreamProcessor>.Assembly.Location` and record the returned path.
+In VS Code's integrated terminal at the workspace root, run `dotnet --version` and
+`dotnet fsi --version`; confirm the SDK matches `repo_sdk` and inspect Ionide's F# output for the
+SDK/toolchain path it selected. Stop if Ionide reports a different SDK or cannot resolve the script.
+Confirm that no PipeL4 source project or project reference is present in the workspace. After FSI
+restore, check the selected SDK-default package (currently `10.0.115`), compare the cached package
+with the candidate, and compare the DLL loaded by FSI with the DLL inside that candidate:
 
 ```sh
-sha256sum ./artifacts/second-prerelease/plugins/PipeL4.Plugins.0.1.0-alpha.2.nupkg \
-  "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/pipel4.plugins.0.1.0-alpha.2.nupkg"
+test "$sdk_fsharp_version" = 10.0.115 # expected for the currently installed SDK
+test -f "$ide_root/packages/fsharp.core/$sdk_fsharp_version/fsharp.core.$sdk_fsharp_version.nupkg"
+cmp "$api_package" "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/pipel4.plugins.0.1.0-alpha.2.nupkg"
+test "$fsi_dll" = "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/lib/net10.0/PipeL4.Plugins.dll"
+unzip -p "$api_package" lib/net10.0/PipeL4.Plugins.dll | sha256sum
+sha256sum "$fsi_dll"
 ```
 
-Record the IDE/extension and SDK versions, the observed type information, diagnostics, FSI result,
-and matching checksums. A failure or an unperformed IDE check blocks release approval. Repository
-FSI validation is separate evidence and does not complete this manual gate. **Execution pending:**
-this procedure has not itself been performed in an IDE as part of the documentation change.
+Set `fsi_dll` to the exact path printed by FSI before running the last three commands. If the
+installed SDK default changes, record the observed version instead of using the `10.0.115` check.
+The two DLL hashes must match. Record the IDE/extension and SDK versions, the
+observed type information, diagnostics, FSI result, and matching hashes. A failure or an unperformed
+IDE check blocks release approval. Repository FSI validation is separate evidence and does not
+complete this manual gate. **Execution pending:** this procedure has not itself been performed in an
+IDE as part of the documentation change.
 
 ### 4. Independent release audit
 

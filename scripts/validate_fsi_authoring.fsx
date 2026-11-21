@@ -158,7 +158,7 @@ let private writeNuGetConfig (path: string) (localFeed: string) =
 
     config.Save path
 
-let private runFsi sourcePath workingDirectory localFeed packageCache httpCache fsharpCoreVersion =
+let private runFsi sourcePath workingDirectory localFeed packageCache httpCache =
     let startInfo = ProcessStartInfo("dotnet")
     startInfo.WorkingDirectory <- workingDirectory
     startInfo.UseShellExecute <- false
@@ -183,7 +183,8 @@ let private runFsi sourcePath workingDirectory localFeed packageCache httpCache 
     startInfo.Environment["NUGET_HTTP_CACHE_PATH"] <- httpCache
     startInfo.Environment["RestoreSources"] <- localFeed
     startInfo.Environment["NuGetAudit"] <- "false"
-    startInfo.Environment["FSharpCoreImplicitPackageVersion"] <- fsharpCoreVersion
+    startInfo.Environment.Remove "FSharpCoreImplicitPackageVersion" |> ignore
+    startInfo.Environment.Remove "NoWarn" |> ignore
 
     use child = new Process(StartInfo = startInfo)
 
@@ -272,7 +273,7 @@ let private validate packageArgument sourceArgument =
         File.Copy(fsharpCorePackage, Path.Combine(feed, Path.GetFileName fsharpCorePackage))
         writeNuGetConfig (Path.Combine(root, "NuGet.Config")) feed
 
-        runFsi sourcePath root feed packageCache httpCache fsharpCoreVersion
+        runFsi sourcePath root feed packageCache httpCache
         verifyRestoredPackage packageCache feed packageId version
         printfn "Validated FSI authoring: %s %s restored only from the local candidate feed." packageId version
     finally
