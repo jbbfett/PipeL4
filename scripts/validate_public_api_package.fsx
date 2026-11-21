@@ -6,6 +6,7 @@ open System.Reflection
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json
+open System.Text.RegularExpressions
 open System.Xml.Linq
 
 type PackageSummary =
@@ -34,7 +35,6 @@ let private runProcess reportOutput (workingDirectory: string) (fileName: string
     startInfo.RedirectStandardOutput <- true
     startInfo.RedirectStandardError <- true
     startInfo.Environment.Remove "FSharpCoreImplicitPackageVersion" |> ignore
-    startInfo.Environment.Remove "NoWarn" |> ignore
     for argument in arguments do
         startInfo.ArgumentList.Add argument
 
@@ -95,13 +95,50 @@ let private packageFrameworkGroup (namespaceName: string) (metadata: XElement) =
             |> Array.collect (fun group -> group.Elements(XName.Get("dependency", namespaceName)) |> Seq.toArray)
     | _ -> fail "Package dependencies metadata is ambiguous."
 
+let private versioning =
+    Assembly.LoadFrom(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "NuGet.Versioning.dll")))
+let private rangeType = versioning.GetType("NuGet.Versioning.VersionRange", true)
+let private versionType = versioning.GetType("NuGet.Versioning.NuGetVersion", true)
+
+let private versionRangeIncludes (range: obj) (version: string) =
+    let parsedVersion = versionType.GetMethod("Parse", [| typeof<string> |]).Invoke(null, [| box version |])
+    rangeType.GetMethod("Satisfies", [| versionType |]).Invoke(range, [| parsedVersion |]) :?> bool
+
 let private parsePackageVersionRange (value: string) =
-    let normalized = value.Trim().TrimStart('[', '(').TrimEnd(']', ')')
-    let bounds = normalized.Split([| ',' |], StringSplitOptions.None)
-    let lowerBound = bounds[0].Trim()
-    if String.IsNullOrWhiteSpace lowerBound then
-        fail $"FSharp.Core dependency must have a usable version range; found '{value}'."
-    lowerBound
+    // Use the running FSI SDK's NuGet parser without adding a package restore or dependency graph.
+    let parsed = [| box value; null |]
+    let tryParse = rangeType.GetMethod("TryParse", [| typeof<string>; rangeType.MakeByRefType() |])
+    if not (tryParse.Invoke(null, parsed) :?> bool) then
+        fail $"FSharp.Core dependency has an invalid NuGet version range: '{value}'."
+    let range = parsed[1]
+    let minimum = versionType.GetMethod("Parse", [| typeof<string> |]).Invoke(null, [| box "10.0.100" |])
+    let lowerBound = rangeType.GetProperty("MinVersion").GetValue range
+    let inclusive = rangeType.GetProperty("IsMinInclusive").GetValue range :?> bool
+    let satisfies = versionRangeIncludes range "10.0.100"
+    if isNull lowerBound || not (lowerBound.Equals minimum) || not inclusive || not satisfies then
+        fail $"FSharp.Core dependency must have inclusive minimum 10.0.100 and include that version; found '{value}'."
+    range
+
+let private requireVersionInRange (range: obj) version =
+    if not (versionRangeIncludes range version) then
+        fail $"FSharp.Core dependency range does not include selected version {version}."
+
+let private hasDowngradeDiagnostic (output: string) =
+    Regex.IsMatch(output, @"(?im)^.*\b(?:error|warning)\s+NU1605\s*:")
+
+let private warningListWithoutDowngrade (value: string) =
+    value.Split([| ';'; ',' |], StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+    |> Array.filter (fun code -> not (code.Equals("NU1605", StringComparison.OrdinalIgnoreCase)))
+    |> String.concat ";"
+
+let private warningListWithDowngrade (value: string) =
+    let entries = value.Split([| ';'; ',' |], StringSplitOptions.RemoveEmptyEntries ||| StringSplitOptions.TrimEntries)
+    if entries |> Array.exists (fun code -> code.Equals("NU1605", StringComparison.OrdinalIgnoreCase)) then value
+    else value + ";NU1605"
+
+let private msbuildProperty name (value: string) =
+    // MSBuild treats unescaped semicolons as property separators on the command line.
+    "-p:" + name + "=" + value.Replace("%", "%25").Replace(";", "%3B")
 
 let private locateCachedPackage (packageId: string) (version: string) =
     let globalPackagesOutput, _ =
@@ -264,7 +301,7 @@ let private validatePackageFile packagePath =
             |> Option.ofObj
             |> Option.exists (fun attribute -> attribute.Value = "FSharp.Core"))
         |> Option.defaultWith (fun () -> fail "Package is missing its FSharp.Core dependency.")
-    let fsharpVersion =
+    let fsharpRange =
         fsharpDependency.Attribute(XName.Get "version")
         |> Option.ofObj
         |> Option.map (fun attribute -> parsePackageVersionRange attribute.Value)
@@ -296,9 +333,9 @@ let private validatePackageFile packagePath =
       AssemblyName = assemblyIdentity.Name
       AssemblyVersion = assemblyIdentity.Version.ToString()
       Dependencies = dependencies |> Array.distinct |> Array.toList }
-    , fsharpVersion
+    , fsharpRange
 
-let private validateIndependentConsumer (packagePath: string) (version: string) minimumFsharpVersion (fsharpVersionOverride: string option) useInvalidConsumerSource =
+let private validateIndependentConsumer (packagePath: string) (version: string) (fsharpRange: obj) (fsharpVersionOverride: string option) useInvalidConsumerSource =
     let root = Path.Combine(Path.GetTempPath(), $"PipeL4 public API consumer {Guid.NewGuid():N}")
     let feed = Path.Combine(root, "feed")
     let project = Path.Combine(root, "consumer")
@@ -324,7 +361,9 @@ let private validateIndependentConsumer (packagePath: string) (version: string) 
             XElement(
                 "PropertyGroup",
                 XElement("TargetFramework", "net10.0"),
-                XElement("RestorePackagesWithLockFile", "false"))
+                XElement("RestorePackagesWithLockFile", "false"),
+                XElement("DisableImplicitLibraryPacksFolder", "true"),
+                XElement("WarningsAsErrors", "$(WarningsAsErrors);NU1605"))
         match fsharpVersionOverride with
         | Some fsharpVersion -> properties.Add(XElement("FSharpCoreImplicitPackageVersion", fsharpVersion))
         | None -> ()
@@ -346,21 +385,33 @@ let private validateIndependentConsumer (packagePath: string) (version: string) 
             )
         projectFile.Save(Path.Combine(project, "Consumer.fsproj"))
 
-        let selectedFsharpVersion, _ =
+        // Evaluate after all project imports, including Directory.Build.targets. Global
+        // properties then hold the effective warning policy through restore and build.
+        let evaluated, _ =
             runProcess false project "dotnet"
                 [ "msbuild"
                   Path.Combine(project, "Consumer.fsproj")
-                  (if fsharpVersionOverride.IsSome then
-                       "-getProperty:FSharpCoreImplicitPackageVersion"
-                   else
-                       "-getProperty:FSCorePackageVersion") ]
-        let selectedFsharpVersion = selectedFsharpVersion.Trim()
+                  "-getProperty:FSCorePackageVersion"
+                  "-getProperty:FSharpCoreImplicitPackageVersion"
+                  "-getProperty:NoWarn"
+                  "-getProperty:RestoreNoWarn"
+                  "-getProperty:WarningsAsErrors" ]
+        use evaluatedProperties = JsonDocument.Parse evaluated
+        let property (name: string) = evaluatedProperties.RootElement.GetProperty("Properties").GetProperty(name).GetString()
+        let selectedFsharpVersion =
+            if fsharpVersionOverride.IsSome then property "FSharpCoreImplicitPackageVersion"
+            else property "FSCorePackageVersion"
         if String.IsNullOrWhiteSpace selectedFsharpVersion then
             fail "Could not determine the consumer's selected FSharp.Core version."
         let expectedFsharpVersion = fsharpVersionOverride |> Option.defaultValue selectedFsharpVersion
         if selectedFsharpVersion <> expectedFsharpVersion then
             fail $"Consumer selected FSharp.Core {selectedFsharpVersion}; expected {expectedFsharpVersion}."
-        for fsharpVersion in [ minimumFsharpVersion; expectedFsharpVersion ] |> List.distinct do
+        requireVersionInRange fsharpRange selectedFsharpVersion
+        let warningPolicy =
+            [ msbuildProperty "NoWarn" (warningListWithoutDowngrade (property "NoWarn"))
+              msbuildProperty "RestoreNoWarn" (warningListWithoutDowngrade (property "RestoreNoWarn"))
+              msbuildProperty "WarningsAsErrors" (warningListWithDowngrade (property "WarningsAsErrors")) ]
+        for fsharpVersion in [ "10.0.100"; expectedFsharpVersion ] |> List.distinct do
             let fsharpPackage = locateCachedPackage "FSharp.Core" fsharpVersion
             File.Copy(fsharpPackage, Path.Combine(feed, Path.GetFileName fsharpPackage))
 
@@ -387,23 +438,20 @@ type Processor(_connectionState: IConnectionState) =
 """
         File.WriteAllText(Path.Combine(project, "Consumer.fs"), source)
 
-        let restoreOutput, restoreError =
-            runProcess true project "dotnet"
-                [ "restore"
-                  Path.Combine(project, "Consumer.fsproj")
-                  "--configfile"
-                  Path.Combine(project, "NuGet.Config")
-                  "--source"
-                  feed
-                  "--packages"
-                  packageCache
-                  "--verbosity"
-                  "minimal"
-                  "-p:NuGetAudit=false"
-                  "-p:NoWarn="
-                  "-p:RestoreNoWarn="
-                  "-p:WarningsAsErrors=NU1605" ]
-        if (restoreOutput + restoreError).Contains("NU1605", StringComparison.Ordinal) then
+        let restoreArguments =
+            [ "restore"
+              Path.Combine(project, "Consumer.fsproj")
+              "--configfile"
+              Path.Combine(project, "NuGet.Config")
+              "--source"
+              feed
+              "--packages"
+              packageCache
+              "--verbosity"
+              "minimal"
+              "-p:NuGetAudit=false" ] @ warningPolicy
+        let restoreOutput, restoreError = runProcess true project "dotnet" restoreArguments
+        if hasDowngradeDiagnostic (restoreOutput + restoreError) then
             fail "Independent consumer restore reported NuGet downgrade warning NU1605."
 
         let assetsPath = Path.Combine(project, "obj", "project.assets.json")
@@ -422,6 +470,7 @@ type Processor(_connectionState: IConnectionState) =
             let displayedVersions = String.Join(", ", resolvedFSharpVersions)
             fail
                 $"Independent consumer resolved FSharp.Core {displayedVersions}; expected {expectedFsharpVersion}."
+        requireVersionInRange fsharpRange resolvedFSharpVersions[0]
 
         let restoredPackage =
             Path.Combine(packageCache, "pipel4.plugins", version.ToLowerInvariant(), $"pipel4.plugins.{version.ToLowerInvariant()}.nupkg")
@@ -430,30 +479,26 @@ type Processor(_connectionState: IConnectionState) =
             fail "Independent consumer did not restore the supplied local PipeL4.Plugins candidate."
         printfn "Independent consumer resolved FSharp.Core %s and the supplied local PipeL4.Plugins candidate." expectedFsharpVersion
 
-        let buildOutput, buildError =
-            runProcess true project "dotnet"
-                [ "build"
-                  Path.Combine(project, "Consumer.fsproj")
-                  "--configuration"
-                  "Release"
-                  "--no-restore"
-                  "-p:NoWarn="
-                  "-p:WarningsAsErrors=NU1605"
-                  "--verbosity"
-                  "minimal" ]
-        if (buildOutput + buildError).Contains("NU1605", StringComparison.Ordinal) then
+        let buildArguments =
+            [ "build"
+              Path.Combine(project, "Consumer.fsproj")
+              "--configuration"
+              "Release"
+              "--no-restore"
+              "--verbosity"
+              "minimal" ] @ warningPolicy
+        let buildOutput, buildError = runProcess true project "dotnet" buildArguments
+        if hasDowngradeDiagnostic (buildOutput + buildError) then
             fail "Independent consumer build reported NuGet downgrade warning NU1605."
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
 
 let private validatePackage packagePath useInvalidConsumerSource =
-    let summary, fsharpVersion = validatePackageFile packagePath
-    if fsharpVersion <> "10.0.100" then
-        fail $"Public API package declares FSharp.Core minimum {fsharpVersion}; expected 10.0.100."
-    validateIndependentConsumer summary.PackagePath summary.Version fsharpVersion None useInvalidConsumerSource
+    let summary, fsharpRange = validatePackageFile packagePath
+    validateIndependentConsumer summary.PackagePath summary.Version fsharpRange None useInvalidConsumerSource
     if not useInvalidConsumerSource then
-        validateIndependentConsumer summary.PackagePath summary.Version fsharpVersion (Some "10.0.100") false
+        validateIndependentConsumer summary.PackagePath summary.Version fsharpRange (Some "10.0.100") false
     summary
 
 let arguments = fsi.CommandLineArgs |> Array.skip 1
