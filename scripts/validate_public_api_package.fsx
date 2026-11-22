@@ -6,6 +6,7 @@ open System.Reflection
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json
+open System.Text.Json.Nodes
 open System.Text.RegularExpressions
 open System.Xml.Linq
 
@@ -141,26 +142,332 @@ let private msbuildProperty name (value: string) =
     "-p:" + name + "=" + value.Replace("%", "%25").Replace(";", "%3B")
 
 let private locateCachedPackage (packageId: string) (version: string) =
-    let globalPackagesOutput, _ =
-        runProcess false Environment.CurrentDirectory "dotnet" [ "nuget"; "locals"; "global-packages"; "--list" ]
     let globalPackages =
-        globalPackagesOutput.Split([| Environment.NewLine; "\n" |], StringSplitOptions.RemoveEmptyEntries)
-        |> Array.tryPick (fun line ->
-            let separator = line.IndexOf(':')
-            if separator >= 0 then
-                Some(line.Substring(separator + 1).Trim())
-            else
-                None)
-        |> Option.defaultWith (fun () -> fail "Could not locate NuGet's global package cache.")
+        match Environment.GetEnvironmentVariable("NUGET_PACKAGES") |> Option.ofObj |> Option.filter (String.IsNullOrWhiteSpace >> not) with
+        | Some path -> Path.GetFullPath path
+        | None ->
+            let globalPackagesOutput =
+                try
+                    runProcess false Environment.CurrentDirectory "dotnet" [ "nuget"; "locals"; "global-packages"; "--list" ] |> fst
+                with _ -> ""
+            let fromDotnet =
+                globalPackagesOutput.Split([| Environment.NewLine; "\n" |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.tryPick (fun line ->
+                    let separator = line.IndexOf(':')
+                    if separator >= 0 then Some(line.Substring(separator + 1).Trim()) else None)
+            match fromDotnet with
+            | Some path when not (String.IsNullOrWhiteSpace path) -> Path.GetFullPath path
+            | _ ->
+                let profile = Environment.GetFolderPath Environment.SpecialFolder.UserProfile
+                if String.IsNullOrWhiteSpace profile then fail "Could not locate NuGet's global package cache."
+                Path.Combine(profile, ".nuget", "packages")
 
     let normalizedId = packageId.ToLowerInvariant()
-    let packageDirectory = Path.Combine(globalPackages, normalizedId, version.ToLowerInvariant())
-    let expectedFile = Path.Combine(packageDirectory, $"{normalizedId}.{version.ToLowerInvariant()}.nupkg")
-    if File.Exists expectedFile then
-        expectedFile
-    else
-        fail
-            $"Could not stage dependency {packageId} {version} from the NuGet package cache at '{expectedFile}'. Restore the repository with Paket before validating the consumer."
+    let expectedFile = Path.Combine(globalPackages, normalizedId, version.ToLowerInvariant(), $"{normalizedId}.{version.ToLowerInvariant()}.nupkg")
+    if File.Exists expectedFile then expectedFile else ""
+
+let private verifyPackageIdentity (packagePath: string) (packageId: string) (version: string) =
+    try
+        use archive = ZipFile.OpenRead packagePath
+        let nuspecs = archive.Entries |> Seq.filter (fun entry -> entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase)) |> Seq.toArray
+        if nuspecs.Length <> 1 then false
+        else
+            use stream = nuspecs[0].Open()
+            let document = XDocument.Load stream
+            let metadata = document.Descendants() |> Seq.tryFind (fun element -> localName element = "metadata")
+            match metadata with
+            | None -> false
+            | Some value ->
+                let id = value.Elements() |> Seq.tryFind (fun element -> localName element = "id") |> Option.map (fun element -> element.Value.Trim())
+                let packageVersion = value.Elements() |> Seq.tryFind (fun element -> localName element = "version") |> Option.map (fun element -> element.Value.Trim())
+                id = Some packageId && packageVersion = Some version
+    with _ -> false
+
+type private SdkPolicy =
+    { GlobalJsonPath: string option
+      HasSdkSettings: bool
+      Version: string option
+      RollForward: string option
+      ErrorMessage: string option
+      AllowPrerelease: bool option
+      Paths: string list option }
+
+let private fsiSdkDetails () =
+    let compilerService =
+        AppDomain.CurrentDomain.GetAssemblies()
+        |> Array.tryFind (fun assembly -> assembly.GetName().Name = "FSharp.Compiler.Service")
+        |> Option.defaultWith (fun () -> fail "Could not identify the running FSI SDK: FSharp.Compiler.Service is not loaded.")
+    let compilerPath = compilerService.Location
+    if String.IsNullOrWhiteSpace compilerPath then
+        fail "Could not identify the running FSI SDK: FSharp.Compiler.Service has no physical assembly path."
+    let fsharpDirectory = Path.GetDirectoryName(Path.GetFullPath compilerPath)
+    if Path.GetFileName fsharpDirectory <> "FSharp" then
+        fail $"Could not identify the running FSI SDK from compiler assembly '{compilerPath}'."
+    let sdkPath = Directory.GetParent(fsharpDirectory).FullName |> Path.GetFullPath
+    let sdkVersion = Path.GetFileName(Path.TrimEndingDirectorySeparator sdkPath)
+    if not (File.Exists(Path.Combine(fsharpDirectory, "fsi.dll"))) then
+        fail $"The running FSI compiler assembly is not beside fsi.dll: '{compilerPath}'."
+    sdkVersion, sdkPath
+
+let private sdkPolicy () =
+    let jsonOptions = JsonDocumentOptions(CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true)
+    let mutable current = DirectoryInfo(Path.GetFullPath Environment.CurrentDirectory)
+    let globalJson =
+        let mutable found = None
+        while found.IsNone && not (isNull current) do
+            let candidate = Path.Combine(current.FullName, "global.json")
+            if File.Exists candidate then found <- Some candidate
+            else current <- current.Parent
+        found
+    match globalJson with
+    | None -> { GlobalJsonPath = None; HasSdkSettings = false; Version = None; RollForward = None; ErrorMessage = None; AllowPrerelease = None; Paths = None }
+    | Some path ->
+        let document =
+            try JsonDocument.Parse(File.ReadAllText path, jsonOptions)
+            with error -> fail $"Could not parse effective global.json '{path}': {error.Message}"
+        use document = document
+        let root = document.RootElement
+        if root.ValueKind <> JsonValueKind.Object then
+            fail $"Effective global.json '{path}' must have a JSON object root."
+        let mutable sdk = Unchecked.defaultof<JsonElement>
+        if not (root.TryGetProperty("sdk", &sdk)) then
+            { GlobalJsonPath = Some path; HasSdkSettings = false; Version = None; RollForward = None; ErrorMessage = None; AllowPrerelease = None; Paths = None }
+        elif sdk.ValueKind <> JsonValueKind.Object then
+            fail $"The sdk setting in effective global.json '{path}' must be an object."
+        else
+            let supported = set [ "version"; "rollForward"; "allowPrerelease"; "paths"; "errorMessage" ]
+            for setting in sdk.EnumerateObject() do
+                if not (supported.Contains setting.Name) then
+                    fail $"Cannot safely preserve unrecognized SDK setting '{setting.Name}' in '{path}'."
+            let readString (settingName: string) =
+                let mutable value = Unchecked.defaultof<JsonElement>
+                if sdk.TryGetProperty(settingName, &value) then
+                    if value.ValueKind <> JsonValueKind.String || String.IsNullOrWhiteSpace(value.GetString()) then
+                        fail $"The {settingName} setting in '{path}' must be a non-empty string."
+                    Some(value.GetString())
+                else None
+            let version = readString "version"
+            let rollForward = readString "rollForward"
+            let errorMessage = readString "errorMessage"
+            let allowPrerelease =
+                let mutable value = Unchecked.defaultof<JsonElement>
+                if sdk.TryGetProperty("allowPrerelease", &value) then
+                    match value.ValueKind with
+                    | JsonValueKind.True -> Some true
+                    | JsonValueKind.False -> Some false
+                    | _ -> fail $"The allowPrerelease setting in '{path}' must be true or false."
+                else None
+            let paths =
+                let mutable value = Unchecked.defaultof<JsonElement>
+                if sdk.TryGetProperty("paths", &value) then
+                    if value.ValueKind <> JsonValueKind.Array then
+                        fail $"The paths setting in '{path}' must be an array of strings."
+                    value.EnumerateArray()
+                    |> Seq.map (fun item ->
+                        if item.ValueKind <> JsonValueKind.String || String.IsNullOrWhiteSpace(item.GetString()) then
+                            fail $"The paths setting in '{path}' must contain only non-empty strings."
+                        let itemPath = item.GetString()
+                        if itemPath = "$host$" then itemPath
+                        elif Path.IsPathRooted itemPath then Path.GetFullPath itemPath
+                        else Path.GetFullPath(Path.Combine(Path.GetDirectoryName path, itemPath)))
+                    |> Seq.toList
+                    |> Some
+                else None
+            { GlobalJsonPath = Some path
+              HasSdkSettings = true
+              Version = version
+              RollForward = rollForward
+              ErrorMessage = errorMessage
+              AllowPrerelease = allowPrerelease
+              Paths = paths }
+
+let private sdkDetails () =
+    let fsiVersion, fsiPath = fsiSdkDetails ()
+    let policy = sdkPolicy ()
+    let selectionDirectory =
+        if policy.GlobalJsonPath.IsNone then Environment.CurrentDirectory, None
+        else
+            let directory = Path.Combine(Path.GetTempPath(), $"PipeL4 SDK selection {Guid.NewGuid():N}")
+            Directory.CreateDirectory directory |> ignore
+            let sdkSettings = JsonObject()
+            match policy.Version with
+            | Some value -> sdkSettings["version"] <- JsonValue.Create value
+            | None -> ()
+            match policy.RollForward with
+            | Some value -> sdkSettings["rollForward"] <- JsonValue.Create value
+            | None -> ()
+            match policy.ErrorMessage with
+            | Some value -> sdkSettings["errorMessage"] <- JsonValue.Create value
+            | None -> ()
+            match policy.AllowPrerelease with
+            | Some value -> sdkSettings["allowPrerelease"] <- JsonValue.Create value
+            | None -> ()
+            match policy.Paths with
+            | Some paths ->
+                let pathValues = JsonArray()
+                for path in paths do pathValues.Add(JsonValue.Create path)
+                sdkSettings["paths"] <- pathValues
+            | None -> ()
+            let root = JsonObject()
+            if policy.HasSdkSettings then root["sdk"] <- sdkSettings
+            File.WriteAllText(Path.Combine(directory, "global.json"), root.ToJsonString())
+            directory, Some directory
+    let sdkVersion, sdkPath =
+        try
+            let versionOutput, _ = runProcess false (fst selectionDirectory) "dotnet" [ "--version" ]
+            let selectedVersion = versionOutput.Trim()
+            if String.IsNullOrWhiteSpace selectedVersion then fail "Could not determine the SDK selected for the workspace."
+            let sdkInfo, _ = runProcess false (fst selectionDirectory) "dotnet" [ "--info" ]
+            let selectedPath =
+                Regex.Match(sdkInfo, @"(?m)^\s*Base Path:\s*(.+?)\s*$")
+                |> fun matchResult ->
+                    if matchResult.Success then Path.GetFullPath(matchResult.Groups[1].Value.Trim())
+                    else fail $"Could not locate the workspace-selected SDK {selectedVersion} from 'dotnet --info'."
+            if Path.GetFileName(Path.TrimEndingDirectorySeparator selectedPath) <> selectedVersion then
+                fail $"'dotnet --info' reports SDK path '{selectedPath}', which does not match selected version {selectedVersion}."
+            selectedVersion, selectedPath
+        finally
+            match snd selectionDirectory with
+            | Some directory when Directory.Exists directory -> Directory.Delete(directory, true)
+            | _ -> ()
+    let comparison = if OperatingSystem.IsWindows() then StringComparison.OrdinalIgnoreCase else StringComparison.Ordinal
+    let normalizedFsiPath = Path.TrimEndingDirectorySeparator fsiPath
+    let normalizedSdkPath = Path.TrimEndingDirectorySeparator sdkPath
+    if fsiVersion <> sdkVersion || not (String.Equals(normalizedFsiPath, normalizedSdkPath, comparison)) then
+        fail $"Running FSI SDK {fsiVersion} at '{fsiPath}' does not match workspace-selected SDK {sdkVersion} at '{sdkPath}'."
+    printfn "Running FSI SDK %s matches workspace-selected SDK %s." fsiVersion sdkVersion
+    match policy.GlobalJsonPath with
+    | Some path -> printfn "Effective global.json: %s." path
+    | None -> printfn "Effective global.json: none."
+    sdkVersion, sdkPath, policy
+
+let private packageEntryHash (packagePath: string) (assetPath: string) =
+    use archive = ZipFile.OpenRead packagePath
+    let entry =
+        archive.GetEntry(assetPath)
+        |> Option.ofObj
+        |> Option.defaultWith (fun () -> fail $"Package '{packagePath}' is missing FSharp.Core asset '{assetPath}'.")
+    use stream = entry.Open()
+    Convert.ToHexString(SHA256.HashData stream)
+
+// NuGet.org's signed FSharp.Core 10.0.100 package. The package was verified with
+// `dotnet nuget verify --all`; pinning its SHA-512 keeps ordinary validation offline.
+let private fsharpCore100OfficialPackageSha512 =
+    "AeCswCd28W5ewTOgsg+y9Ri4l6cjwiOKBh7Qb+73Iu8fGRFdmIVU3R/U0Kb3e8yW/Up0Le/4CItCh1GqtXuLRA=="
+
+let private fsharpCore100OfficialAssetSha256 =
+    Map.ofList
+        [ "lib/netstandard2.0/FSharp.Core.dll", "B907C420D77CA09731659EFBB43B7F55477EBC2068CAA80ED7E581B66E508F88"
+          "lib/netstandard2.1/FSharp.Core.dll", "09730E5BA269E2A255588DA8839FB5CFF43899DFAFBED0D64E905A6F4171EC5B" ]
+
+let private expectedFSharpCore100AssetHash assetPath =
+    fsharpCore100OfficialAssetSha256
+    |> Map.tryFind assetPath
+    |> Option.defaultWith (fun () -> fail $"No trusted FSharp.Core 10.0.100 fingerprint is available for asset '{assetPath}'.")
+
+let private verifyFSharpCore100Package packagePath =
+    let actualHash = Convert.ToBase64String(SHA512.HashData(File.ReadAllBytes packagePath))
+    if not (String.Equals(actualHash, fsharpCore100OfficialPackageSha512, StringComparison.Ordinal)) then
+        fail $"FSharp.Core 10.0.100 package SHA-512 does not match the trusted NuGet.org package fingerprint: {actualHash}."
+    for asset in fsharpCore100OfficialAssetSha256 do
+        let assetPath = asset.Key
+        let expectedHash = asset.Value
+        let actualAssetHash = packageEntryHash packagePath assetPath
+        if not (String.Equals(actualAssetHash, expectedHash, StringComparison.Ordinal)) then
+            fail $"FSharp.Core 10.0.100 asset '{assetPath}' does not match the trusted NuGet.org DLL fingerprint."
+
+let private fscReferenceArguments (compilerWorkingDirectory: string) (arguments: string array) =
+    let compilerWorkingDirectory =
+        try
+            if not (Path.IsPathRooted compilerWorkingDirectory) then
+                fail $"Fsc compiler working directory must be absolute: '{compilerWorkingDirectory}'."
+            Path.GetFullPath compilerWorkingDirectory
+        with
+        | ValidationException message -> fail message
+        | error -> fail $"Could not resolve Fsc compiler working directory '{compilerWorkingDirectory}': {error.Message}"
+    if not (Directory.Exists compilerWorkingDirectory) then
+        fail $"Fsc compiler working directory does not exist: '{compilerWorkingDirectory}'."
+    let references = ResizeArray<string>()
+    let mutable index = 0
+    while index < arguments.Length do
+        let argument = arguments[index].Trim().Trim('"')
+        let referenceValue =
+            if argument.StartsWith("--reference:", StringComparison.OrdinalIgnoreCase) then Some(argument.Substring("--reference:".Length))
+            elif argument.StartsWith("-r:", StringComparison.OrdinalIgnoreCase) then Some(argument.Substring(3))
+            elif argument.StartsWith("--reference=", StringComparison.OrdinalIgnoreCase) then Some(argument.Substring("--reference=".Length))
+            elif argument.StartsWith("-r=", StringComparison.OrdinalIgnoreCase) then Some(argument.Substring(3))
+            elif (argument.Equals("--reference", StringComparison.OrdinalIgnoreCase) || argument.Equals("-r", StringComparison.OrdinalIgnoreCase))
+                 && index + 1 < arguments.Length then
+                index <- index + 1
+                Some(arguments[index].Trim().Trim('"'))
+            else None
+        match referenceValue with
+        | Some value when not (String.IsNullOrWhiteSpace value) ->
+            let reference = value.Trim().Trim('"')
+            try references.Add(Path.GetFullPath(reference, compilerWorkingDirectory))
+            with error -> fail $"Could not resolve Fsc reference '{reference}' against compiler working directory '{compilerWorkingDirectory}': {error.Message}"
+        | _ -> ()
+        index <- index + 1
+    references.ToArray()
+
+let private fsharpCoreAssets (assetsPath: string) (version: string) =
+    use assets = JsonDocument.Parse(File.ReadAllText assetsPath)
+    let targets = assets.RootElement.GetProperty("targets")
+    let targetGroups =
+        targets.EnumerateObject()
+        |> Seq.filter (fun target ->
+            target.Name = "net10.0" || target.Name.StartsWith("net10.0/", StringComparison.OrdinalIgnoreCase))
+        |> Seq.toArray
+    if targetGroups.Length <> 1 then
+        fail $"Expected one restored net10.0 target for FSharp.Core {version}, found {targetGroups.Length}."
+    let libraryName = "FSharp.Core/" + version
+    let library =
+        targetGroups[0].Value.EnumerateObject()
+        |> Seq.tryFind (fun item -> item.Name.Equals(libraryName, StringComparison.OrdinalIgnoreCase))
+        |> Option.defaultWith (fun () -> fail $"Restored target does not contain {libraryName}.")
+    let readAssets (sectionName: string) =
+        let mutable section = Unchecked.defaultof<JsonElement>
+        if library.Value.TryGetProperty(sectionName, &section) && section.ValueKind = JsonValueKind.Object then
+            section.EnumerateObject()
+            |> Seq.map (fun asset -> asset.Name.Replace('\\', '/'))
+            |> Seq.filter (fun path -> Path.GetFileName(path).Equals("FSharp.Core.dll", StringComparison.OrdinalIgnoreCase))
+            |> Seq.distinct
+            |> Seq.toList
+        else []
+    let compileAssets = readAssets "compile"
+    let runtimeAssets = readAssets "runtime"
+    if compileAssets.Length <> 1 then
+        fail $"Expected one net10.0 FSharp.Core compile DLL asset for {version}, found {compileAssets.Length}."
+    compileAssets, runtimeAssets
+
+let private stagePackage (packageId: string) (version: string) (consumerCache: string) (sdkPath: string) (feed: string) (preferSdkPack: bool) =
+    let normalizedId = packageId.ToLowerInvariant()
+    let fileName = $"{normalizedId}.{version.ToLowerInvariant()}.nupkg"
+    let cacheCandidates =
+        [ Path.Combine(consumerCache, normalizedId, version.ToLowerInvariant(), fileName)
+          locateCachedPackage packageId version ]
+        |> List.filter (String.IsNullOrWhiteSpace >> not)
+    let sdkPack = Path.Combine(sdkPath, "FSharp", "library-packs", $"FSharp.Core.{version}.nupkg")
+    let validSdkPack = if File.Exists sdkPack && verifyPackageIdentity sdkPack packageId version then Some sdkPack else None
+    let source =
+        if preferSdkPack then validSdkPack
+        else
+            cacheCandidates
+            |> List.tryFind (fun path -> File.Exists path && verifyPackageIdentity path packageId version)
+            |> Option.orElse validSdkPack
+        |> Option.defaultWith (fun () ->
+            fail $"Could not obtain verified {packageId} {version}. Checked exact package cache entries and selected SDK library-pack '{sdkPack}'.")
+    let destination = Path.Combine(feed, fileName)
+    File.Copy(source, destination, true)
+    if not (verifyPackageIdentity destination packageId version) then
+        fail $"Staged package '{destination}' does not contain {packageId} {version}."
+    if packageId.Equals("FSharp.Core", StringComparison.OrdinalIgnoreCase)
+       && version = "10.0.100"
+       && not preferSdkPack then
+        verifyFSharpCore100Package destination
+    let sourceKind = if Path.GetFullPath(source) = Path.GetFullPath(sdkPack) then "selected SDK library-pack" else "exact package cache entry"
+    printfn "Staged %s %s from %s." packageId version sourceKind
+    destination
 
 let private validatePackageFile packagePath =
     let fullPath = Path.GetFullPath packagePath
@@ -335,7 +642,7 @@ let private validatePackageFile packagePath =
       Dependencies = dependencies |> Array.distinct |> Array.toList }
     , fsharpRange
 
-let private validateIndependentConsumer (packagePath: string) (version: string) (fsharpRange: obj) (fsharpVersionOverride: string option) useInvalidConsumerSource =
+let private validateIndependentConsumer (packagePath: string) (version: string) (fsharpRange: obj) (fsharpVersionOverride: string option) useInvalidConsumerSource (sdkVersion: string) (sdkPath: string) (sdkPolicy: SdkPolicy) =
     let root = Path.Combine(Path.GetTempPath(), $"PipeL4 public API consumer {Guid.NewGuid():N}")
     let feed = Path.Combine(root, "feed")
     let project = Path.Combine(root, "consumer")
@@ -344,6 +651,31 @@ let private validateIndependentConsumer (packagePath: string) (version: string) 
     Directory.CreateDirectory project |> ignore
 
     try
+        let sdkSettings = JsonObject()
+        sdkSettings["version"] <- JsonValue.Create sdkVersion
+        sdkSettings["rollForward"] <- JsonValue.Create "disable"
+        match sdkPolicy.ErrorMessage with
+        | Some value -> sdkSettings["errorMessage"] <- JsonValue.Create value
+        | None -> ()
+        match sdkPolicy.AllowPrerelease with
+        | Some value -> sdkSettings["allowPrerelease"] <- JsonValue.Create value
+        | None -> ()
+        match sdkPolicy.Paths with
+        | Some paths ->
+            let pathValues = JsonArray()
+            for path in paths do pathValues.Add(JsonValue.Create path)
+            sdkSettings["paths"] <- pathValues
+        | None -> ()
+        let sdkConfiguration = JsonObject()
+        sdkConfiguration["sdk"] <- sdkSettings
+        File.WriteAllText(Path.Combine(project, "global.json"), sdkConfiguration.ToJsonString(JsonSerializerOptions(WriteIndented = true)) + Environment.NewLine)
+        let childSdkVersion =
+            try runProcess false project "dotnet" [ "--version" ] |> fst
+            with ValidationException message -> fail $"Temporary consumer could not select validator SDK {sdkVersion}: {message}"
+        if childSdkVersion.Trim() <> sdkVersion then
+            fail $"Temporary consumer selected SDK {childSdkVersion.Trim()}; expected validator SDK {sdkVersion}."
+        printfn "Temporary consumer selected .NET SDK %s." sdkVersion
+
         File.Copy(packagePath, Path.Combine(feed, Path.GetFileName packagePath))
         let config =
             XDocument(
@@ -363,7 +695,8 @@ let private validateIndependentConsumer (packagePath: string) (version: string) 
                 XElement("TargetFramework", "net10.0"),
                 XElement("RestorePackagesWithLockFile", "false"),
                 XElement("DisableImplicitLibraryPacksFolder", "true"),
-                XElement("WarningsAsErrors", "$(WarningsAsErrors);NU1605"))
+                XElement("WarningsAsErrors", "$(WarningsAsErrors);NU1605"),
+                XElement("ProvideCommandLineArgs", "true"))
         match fsharpVersionOverride with
         | Some fsharpVersion -> properties.Add(XElement("FSharpCoreImplicitPackageVersion", fsharpVersion))
         | None -> ()
@@ -404,16 +737,16 @@ let private validateIndependentConsumer (packagePath: string) (version: string) 
         if String.IsNullOrWhiteSpace selectedFsharpVersion then
             fail "Could not determine the consumer's selected FSharp.Core version."
         let expectedFsharpVersion = fsharpVersionOverride |> Option.defaultValue selectedFsharpVersion
+        let isSdkDefaultConsumer = fsharpVersionOverride.IsNone
         if selectedFsharpVersion <> expectedFsharpVersion then
             fail $"Consumer selected FSharp.Core {selectedFsharpVersion}; expected {expectedFsharpVersion}."
         requireVersionInRange fsharpRange selectedFsharpVersion
+        printfn "Consumer scenario requires FSharp.Core %s." selectedFsharpVersion
         let warningPolicy =
             [ msbuildProperty "NoWarn" (warningListWithoutDowngrade (property "NoWarn"))
               msbuildProperty "RestoreNoWarn" (warningListWithoutDowngrade (property "RestoreNoWarn"))
               msbuildProperty "WarningsAsErrors" (warningListWithDowngrade (property "WarningsAsErrors")) ]
-        for fsharpVersion in [ "10.0.100"; expectedFsharpVersion ] |> List.distinct do
-            let fsharpPackage = locateCachedPackage "FSharp.Core" fsharpVersion
-            File.Copy(fsharpPackage, Path.Combine(feed, Path.GetFileName fsharpPackage))
+        stagePackage "FSharp.Core" expectedFsharpVersion packageCache sdkPath feed isSdkDefaultConsumer |> ignore
 
         let source =
             if useInvalidConsumerSource then
@@ -472,12 +805,62 @@ type Processor(_connectionState: IConnectionState) =
                 $"Independent consumer resolved FSharp.Core {displayedVersions}; expected {expectedFsharpVersion}."
         requireVersionInRange fsharpRange resolvedFSharpVersions[0]
 
+        let fsharpAssetsPath = Path.Combine(project, "obj", "project.assets.json")
+        let compileAssets, runtimeAssets = fsharpCoreAssets fsharpAssetsPath expectedFsharpVersion
+        let stagedFSharpPackage = Path.Combine(feed, $"fsharp.core.{expectedFsharpVersion}.nupkg")
+        let sdkFSharpPackage = Path.Combine(sdkPath, "FSharp", "library-packs", $"FSharp.Core.{expectedFsharpVersion}.nupkg")
+        let isCanonicalMinimum = not isSdkDefaultConsumer && expectedFsharpVersion = "10.0.100"
+        if isCanonicalMinimum then verifyFSharpCore100Package stagedFSharpPackage
+        for assetPath in List.distinct (compileAssets @ runtimeAssets) do
+            let stagedHash = packageEntryHash stagedFSharpPackage assetPath
+            if isSdkDefaultConsumer then
+                let sdkHash = packageEntryHash sdkFSharpPackage assetPath
+                if not (String.Equals(stagedHash, sdkHash, StringComparison.Ordinal)) then
+                    fail $"Staged FSharp.Core asset '{assetPath}' differs from the selected SDK library-pack."
+            elif isCanonicalMinimum then
+                let expectedHash = expectedFSharpCore100AssetHash assetPath
+                if not (String.Equals(stagedHash, expectedHash, StringComparison.Ordinal)) then
+                    fail $"Staged FSharp.Core 10.0.100 asset '{assetPath}' differs from the trusted NuGet.org package."
+            let extractedPath = Path.Combine(packageCache, "fsharp.core", expectedFsharpVersion.ToLowerInvariant(), assetPath.Replace('/', Path.DirectorySeparatorChar))
+            if not (File.Exists extractedPath) then
+                fail $"Restored FSharp.Core asset '{assetPath}' is missing from the isolated consumer cache."
+            let extractedHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes extractedPath))
+            if not (String.Equals(stagedHash, extractedHash, StringComparison.Ordinal)) then
+                fail $"Restored FSharp.Core asset '{assetPath}' differs from the staged package."
+        if isSdkDefaultConsumer then
+            printfn "Verified staged FSharp.Core compile/runtime assets for net10.0 against selected SDK library-pack."
+        elif isCanonicalMinimum then
+            printfn "Verified staged FSharp.Core compile/runtime assets for net10.0 against the signed NuGet.org FSharp.Core 10.0.100 package."
+        else
+            fail $"No independent FSharp.Core payload reference exists for minimum consumer version {expectedFsharpVersion}."
+
         let restoredPackage =
             Path.Combine(packageCache, "pipel4.plugins", version.ToLowerInvariant(), $"pipel4.plugins.{version.ToLowerInvariant()}.nupkg")
         if not (File.Exists restoredPackage)
            || not (SHA256.HashData(File.ReadAllBytes restoredPackage).AsSpan().SequenceEqual(SHA256.HashData(File.ReadAllBytes packagePath))) then
             fail "Independent consumer did not restore the supplied local PipeL4.Plugins candidate."
         printfn "Independent consumer resolved FSharp.Core %s and the supplied local PipeL4.Plugins candidate." expectedFsharpVersion
+
+        let referenceCapturePath = Path.Combine(project, "capture-fsharp-core.targets")
+        let referencePathFile = Path.Combine(project, "reference-path-fsharp-core.txt")
+        let fscArgumentsFile = Path.Combine(project, "fsc-command-line-args.txt")
+        let captureProject = XElement("Project")
+        let inheritedTargets = Environment.GetEnvironmentVariable("CustomAfterMicrosoftCommonTargets")
+        if not (String.IsNullOrWhiteSpace inheritedTargets) then
+            for inheritedTarget in inheritedTargets.Split([| ';' |], StringSplitOptions.RemoveEmptyEntries) do
+                captureProject.Add(XElement("Import", XAttribute("Project", inheritedTarget)))
+        captureProject.Add(
+            XElement("Target", XAttribute("Name", "CaptureActualFscInputs"), XAttribute("AfterTargets", "CoreCompile"),
+                XElement("ItemGroup",
+                    XElement("_PipeL4ReferencePathFSharpCore", XAttribute("Include", "@(ReferencePath)"),
+                        XAttribute("Condition", "'%(ReferencePath.Filename)' == 'FSharp.Core'"))),
+                XElement("WriteLinesToFile", XAttribute("File", referencePathFile),
+                    XAttribute("Lines", "@(_PipeL4ReferencePathFSharpCore->'%(FullPath)')"),
+                    XAttribute("Overwrite", "true")),
+                XElement("WriteLinesToFile", XAttribute("File", fscArgumentsFile),
+                    XAttribute("Lines", "@(FscCommandLineArgs)"),
+                    XAttribute("Overwrite", "true"))))
+        captureProject.Save referenceCapturePath
 
         let buildArguments =
             [ "build"
@@ -486,19 +869,62 @@ type Processor(_connectionState: IConnectionState) =
               "Release"
               "--no-restore"
               "--verbosity"
-              "minimal" ] @ warningPolicy
+              "minimal"
+              msbuildProperty "CustomAfterMicrosoftCommonTargets" referenceCapturePath ] @ warningPolicy
         let buildOutput, buildError = runProcess true project "dotnet" buildArguments
         if hasDowngradeDiagnostic (buildOutput + buildError) then
             fail "Independent consumer build reported NuGet downgrade warning NU1605."
+        if not (File.Exists referencePathFile) || not (File.Exists fscArgumentsFile) then
+            fail "The consumer build did not expose its FSharp.Core Fsc command-line reference."
+        let referencePaths = File.ReadAllLines referencePathFile |> Array.filter (String.IsNullOrWhiteSpace >> not)
+        if referencePaths.Length <> 1 then
+            fail $"Expected one FSharp.Core item in ReferencePath, found {referencePaths.Length}."
+        let referencePath = Path.GetFullPath referencePaths[0]
+        let commandLineArguments = File.ReadAllLines fscArgumentsFile
+        // dotnet build is launched with the consumer project as its working directory; Fsc inherits it.
+        let compilerWorkingDirectory = Path.GetFullPath project
+        printfn "Using Fsc compiler working directory '%s'." compilerWorkingDirectory
+        let fsharpCoreReferences =
+            fscReferenceArguments compilerWorkingDirectory commandLineArguments
+            |> Array.filter (fun path -> Path.GetFileName(path).Equals("FSharp.Core.dll", StringComparison.OrdinalIgnoreCase))
+        if fsharpCoreReferences.Length <> 1 then
+            fail $"Expected one actual FSharp.Core compiler reference in Fsc command-line arguments, found {fsharpCoreReferences.Length}."
+        let actualCompilerReference = fsharpCoreReferences[0]
+        printfn "Captured ReferencePath FSharp.Core '%s'." referencePath
+        printfn "Captured Fsc command-line FSharp.Core reference '%s'." actualCompilerReference
+        if not (File.Exists actualCompilerReference) then
+            fail $"Fsc's actual FSharp.Core compiler reference does not exist: '{actualCompilerReference}'."
+        let relativeAsset =
+            match compileAssets with
+            | [ assetPath ] -> assetPath
+            | _ -> fail $"Could not identify exactly one resolved net10.0 FSharp.Core compile asset for reference '{actualCompilerReference}'."
+        let referenceHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes actualCompilerReference))
+        let stagedHash = packageEntryHash stagedFSharpPackage relativeAsset
+        if not (String.Equals(referenceHash, stagedHash, StringComparison.Ordinal)) then
+            fail $"Fsc's actual FSharp.Core compiler reference '{actualCompilerReference}' differs from the staged package asset '{relativeAsset}'."
+        if isSdkDefaultConsumer then
+            let expectedHash = packageEntryHash sdkFSharpPackage relativeAsset
+            if not (String.Equals(referenceHash, expectedHash, StringComparison.Ordinal)) then
+                fail $"Actual FSharp.Core compiler reference '{relativeAsset}' differs from the selected SDK library-pack."
+            printfn "Verified actual Fsc reference '%s' asset '%s' SHA-256 %s against selected SDK library-pack." actualCompilerReference relativeAsset referenceHash
+        elif isCanonicalMinimum then
+            let expectedHash = expectedFSharpCore100AssetHash relativeAsset
+            if not (String.Equals(referenceHash, expectedHash, StringComparison.Ordinal)) then
+                fail $"Fsc's actual FSharp.Core compiler reference '{actualCompilerReference}' differs from the trusted NuGet.org 10.0.100 asset."
+            printfn "Verified actual Fsc reference '%s' asset '%s' SHA-256 %s against the signed NuGet.org FSharp.Core 10.0.100 package." actualCompilerReference relativeAsset referenceHash
+        else
+            fail $"No independent FSharp.Core reference can verify Fsc's actual compiler input '{actualCompilerReference}'."
     finally
         if Directory.Exists root then
             Directory.Delete(root, true)
 
 let private validatePackage packagePath useInvalidConsumerSource =
     let summary, fsharpRange = validatePackageFile packagePath
-    validateIndependentConsumer summary.PackagePath summary.Version fsharpRange None useInvalidConsumerSource
+    let sdkVersion, sdkPath, sdkPolicy = sdkDetails ()
+    printfn "Validator selected .NET SDK %s." sdkVersion
+    validateIndependentConsumer summary.PackagePath summary.Version fsharpRange None useInvalidConsumerSource sdkVersion sdkPath sdkPolicy
     if not useInvalidConsumerSource then
-        validateIndependentConsumer summary.PackagePath summary.Version fsharpRange (Some "10.0.100") false
+        validateIndependentConsumer summary.PackagePath summary.Version fsharpRange (Some "10.0.100") false sdkVersion sdkPath sdkPolicy
     summary
 
 let arguments = fsi.CommandLineArgs |> Array.skip 1
