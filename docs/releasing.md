@@ -19,6 +19,40 @@ checkout identifies both alpha.2 packages as local release candidates. Verify th
 status and publishing account ownership before release. The commands below build and validate both
 packages; CI and Distribution validation do not publish them.
 
+The already published alpha.2 package files are immutable NuGet artifacts. A package rebuilt from
+this checkout is a separate local or CI candidate, even when it has the same package ID and version;
+it does not replace or represent the bytes already published. Distribution validation only checks
+and uploads its newly built candidate artifacts.
+
+## Distribution producer SDK policy
+
+Distribution validation runs two independent jobs: `produce_canonical` with SDK `10.0.115` and
+`produce_compatibility` with SDK `10.0.404`. The canonical producer is the only producer whose
+artifacts may be selected as public release candidates. Compatibility packages are diagnostic
+artifacts and are never an alternative public release. The current workflow does not run a four-way
+cross-SDK consumer matrix.
+
+The checked-in [`global.json`](../global.json) continues to request SDK `10.0.112` for ordinary
+repository commands. CI and Distribution install and select their exact workflow SDKs separately;
+Distribution reuses CI's existing selection pattern. Each Distribution producer saves the checked-in
+file, changes only the SDK version and `rollForward` setting for its job, disables roll-forward, and
+requires `dotnet --version` to equal its configured SDK exactly. An `always()` cleanup step restores
+the saved policy. This gives Distribution explicit producer SDKs without changing repository-wide
+SDK selection.
+
+Each uploaded artifact name and manifest identifies the SDK, canonical or compatibility role,
+tested checkout SHA, and run attempt. The artifact includes both packages in separate directories,
+separate `source-revision.txt` files, a manifest with package IDs, versions, paths, and SHA-256
+digests, and `SHA256SUMS`. The workflow verifies both package repository commit attributes and both
+source revision files against the tested checkout before upload. Do not select a compatibility
+artifact for release or mix packages from separate producer artifacts.
+
+The required `Build and validate distributable packages` check waits for both explicitly named
+producer jobs and succeeds only when each job result is `success`. Its `always()` condition lets it
+report failed, skipped, or canceled producer outcomes while the workflow is still active. GitHub can
+terminate a workflow that is canceled in its entirety before the aggregate runs or completes; such a
+run is not a successful aggregate check.
+
 ## 0.1.0-alpha.2 release procedure
 
 ### Package model and compatibility
@@ -283,12 +317,12 @@ revision:
 - `Distribution validation / Build and validate distributable packages`
 
 Confirm each run belongs to this pull request and corresponds to its current head and base
-revisions. Both workflows use `actions/checkout@v7` without a `ref` override. For a
-`pull_request` event, that checks out GitHub's synthetic pull request merge ref; the run's tested
-`GITHUB_SHA` can therefore differ from the pull request branch's head SHA. Do not require those
-SHAs to be equal. Record both run URLs, the pull request head and base SHAs, the event, and each
-run's tested SHA. If the pull request head or base changes after validation, require both checks to
-pass again for the updated pull request state and record the new runs before merging.
+revisions. CI uses `actions/checkout@v7` without a `ref` override; Distribution explicitly checks
+out the event's `github.sha`. For a `pull_request` event, both identify GitHub's synthetic pull
+request merge revision, which can differ from the pull request branch's head SHA. Do not require
+those SHAs to be equal. Record both run URLs, the pull request head and base SHAs, the event, and
+each run's tested SHA. If the pull request head or base changes after validation, require both
+checks to pass again for the updated pull request state and record the new runs before merging.
 
 ### 5. Squash merge into `master`
 
@@ -303,10 +337,13 @@ from the pre-merge pull request checks in step 4a:
 
 - [CI](../.github/workflows/ci.yml) restores, builds, tests, packs, and validates the `PipeL4` tool
   package. It does not validate the `PipeL4.Plugins` distribution by itself.
-- [Distribution validation](../.github/workflows/distribution-validation.yml) packs both packages,
-  validates each package and their matching versions, builds the independent public API consumer,
-  checks FSI authoring, runs the package-backed solution suite, and uploads both candidates with
-  `source-revision.txt` files.
+- [Distribution validation](../.github/workflows/distribution-validation.yml) runs independent
+  exact-SDK producers for `10.0.115` (canonical) and `10.0.404` (compatibility). Both produce and
+  validate the lockstep packages and record package and source provenance. The canonical producer
+  also runs the existing regression harnesses, FSI authoring checks, and package-backed solution
+  suite. Each producer uploads a separately named artifact with its role, SDK, source SHA, run
+  attempt, manifest, checksums, and per-package `source-revision.txt` files. Only the `10.0.115`
+  canonical artifact is eligible for public release review.
 
 Both workflows run on pushes and pull requests targeting `master` and support manual dispatch.
 Neither workflow publishes NuGet packages, creates a Git tag, or publishes a GitHub Release. Save
@@ -316,11 +353,11 @@ merged commit. Do not use an artifact from a pre-merge or unrelated run.
 ### 7. Verify the final source SHA
 
 Before tagging, check the clean `master` checkout, remote branch, both downloaded
-`source-revision.txt` files, and the `repository commit` attributes in both package nuspecs. Each
-must identify the same full squash-merge commit SHA. Distribution records the source revision in
-the artifact but does not compare it with both nuspec commits, so make that comparison explicitly.
-Re-run package validators on the downloaded files and record their SHA-256 checksums. Stop if the
-workflow, source revision, nuspec commit, or local `master` SHA differs.
+`source-revision.txt` files, the manifest, and both package `repository commit` attributes. Each
+must identify the same full squash-merge commit SHA. Distribution verifies the package commits and
+source revision files against the tested checkout and records package SHA-256 digests in both the
+manifest and `SHA256SUMS`. Re-run package validators on the downloaded canonical files and verify
+their checksums. Stop if the workflow, source revision, nuspec commit, or local `master` SHA differs.
 
 ```sh
 git status --short

@@ -13,74 +13,163 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Build and validate distributable packages
+  produce_canonical:
+    name: Produce packages (.NET SDK 10.0.115; canonical)
     runs-on: ubuntu-24.04
-    steps:
-      - name: Check out source
+    env:
+      SDK_VERSION: '10.0.115'
+      PRODUCER_ROLE: canonical
+    steps: &producer_steps
+      - name: Check out tested source revision
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
 
-      - name: Set up .NET SDK from global.json
+      - name: Install producer .NET SDK
         uses: actions/setup-dotnet@v6
         with:
-          global-json-file: global.json
+          dotnet-version: ${{ env.SDK_VERSION }}
+
+      - name: Record tested source revision
+        id: source_revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          tested_sha="$(git rev-parse HEAD)"
+          if [[ "$tested_sha" != "$GITHUB_SHA" ]]; then
+            echo "Checkout provenance mismatch: HEAD is $tested_sha; GITHUB_SHA is $GITHUB_SHA." >&2
+            exit 1
+          fi
+          printf 'sha=%s\n' "$tested_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare producer artifact directories
+        id: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_root="artifacts/producer-sdk-${SDK_VERSION}-${PRODUCER_ROLE}"
+          if [[ -e "$artifact_root" ]]; then
+            echo "Producer artifact directory already exists: $artifact_root" >&2
+            exit 1
+          fi
+          mkdir -p "$artifact_root/packages/PipeL4" "$artifact_root/packages/PipeL4.Plugins"
+          printf 'root=%s\n' "$artifact_root" >> "$GITHUB_OUTPUT"
+
+      - name: Select and verify exact .NET SDK
+        env:
+          ARTIFACT_ROOT: ${{ steps.artifacts.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp global.json "$RUNNER_TEMP/pipel4-global.json"
+          jq --arg sdk "$SDK_VERSION" '.sdk.version = $sdk | .sdk.rollForward = "disable"' \
+            global.json > "$RUNNER_TEMP/pipel4-producer-global.json"
+          cp "$RUNNER_TEMP/pipel4-producer-global.json" global.json
+          selected_sdk="$(dotnet --version)"
+          printf 'Requested .NET SDK: %s; selected .NET SDK: %s\n' "$SDK_VERSION" "$selected_sdk"
+          if [[ "$selected_sdk" != "$SDK_VERSION" ]]; then
+            echo "SDK selection failed: expected $SDK_VERSION, got $selected_sdk." >&2
+            exit 1
+          fi
+          dotnet --info | tee "$ARTIFACT_ROOT/dotnet-info.txt"
+          dotnet --list-sdks | tee "$ARTIFACT_ROOT/installed-sdks.txt"
+
+          # Paket appends NU1605 during target execution; remove its suppression and preserve the existing error list.
+          warning_policy_targets="$RUNNER_TEMP/pipel4-ci-warning-policy.targets"
+          cat > "$warning_policy_targets" <<'EOF'
+          <Project>
+            <Target Name="Pipel4EnforceNu1605AfterPaket" AfterTargets="PaketRestore">
+              <PropertyGroup>
+                <NoWarn>$([System.Text.RegularExpressions.Regex]::Replace('$(NoWarn)', '(?i)(^|[;,])\s*NU1605\s*(?=[;,]|$)', '$1'))</NoWarn>
+                <WarningsAsErrors>$(WarningsAsErrors);NU1605</WarningsAsErrors>
+              </PropertyGroup>
+            </Target>
+          </Project>
+          EOF
 
       - name: Restore Paket tool
         run: dotnet tool restore
+
+      - name: Restore Paket dependencies
+        run: dotnet paket restore
 
       - name: Clean Release outputs
         run: dotnet clean PipeL4.sln --configuration Release -m:1 -p:PaketDisableCliTest=true -p:BuildInParallel=false
 
       - name: Restore dependencies
-        run: dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
+        shell: bash
+        run: CustomAfterMicrosoftCommonTargets="$RUNNER_TEMP/pipel4-ci-warning-policy.targets" dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
 
       - name: Build Release
         run: dotnet build PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true
 
-      - name: Create release candidate package
+      - name: Read expected shared package version
+        id: package_version
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts/release-candidate
+          tool_version="$(dotnet msbuild src/PipeL4/PipeL4.fsproj -getProperty:Version -nologo)"
+          api_version="$(dotnet msbuild src/PipeL4.Plugins/PipeL4.Plugins.fsproj -getProperty:Version -nologo)"
+          if [[ -z "$tool_version" || "$tool_version" != "$api_version" ]]; then
+            echo "Package version mismatch: PipeL4='$tool_version', PipeL4.Plugins='$api_version'." >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$tool_version" >> "$GITHUB_OUTPUT"
+
+      - name: Create .NET Tool package
+        env:
+          ARTIFACT_ROOT: ${{ steps.artifacts.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
           pack_log="$RUNNER_TEMP/pipel4-pack.log"
           dotnet pack src/PipeL4/PipeL4.fsproj \
             --configuration Release \
             --no-restore \
             -p:PaketDisableCliTest=true \
             -p:BuildInParallel=false \
-            --output ./artifacts/release-candidate 2>&1 | tee "$pack_log"
+            --output "$ARTIFACT_ROOT/packages/PipeL4" 2>&1 | tee "$pack_log"
           if grep -F "NU5046" "$pack_log"; then
             echo "Package validation failed: dotnet pack reported a missing package README (NU5046)." >&2
             exit 1
           fi
 
-      - name: Create public API candidate package
+      - name: Create public API package
+        env:
+          ARTIFACT_ROOT: ${{ steps.artifacts.outputs.root }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p artifacts/public-api-candidate
           pack_log="$RUNNER_TEMP/pipel4-public-api-pack.log"
           dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj \
             --configuration Release \
             --no-restore \
             -p:PaketDisableCliTest=true \
             -p:BuildInParallel=false \
-            --output ./artifacts/public-api-candidate 2>&1 | tee "$pack_log"
+            --output "$ARTIFACT_ROOT/packages/PipeL4.Plugins" 2>&1 | tee "$pack_log"
           if grep -F "NU5046" "$pack_log"; then
             echo "Package validation failed: dotnet pack reported a missing public API package README (NU5046)." >&2
             exit 1
           fi
 
       - name: Verify package validator failure handling
-        run: dotnet fsi scripts/test_validation_exit_codes.fsx ./artifacts/release-candidate
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
+        env:
+          ARTIFACT_ROOT: ${{ steps.artifacts.outputs.root }}
+        run: dotnet fsi scripts/test_validation_exit_codes.fsx "$ARTIFACT_ROOT/packages/PipeL4"
 
       - name: Validate package metadata and contents
         id: package
+        env:
+          ARTIFACT_ROOT: ${{ steps.artifacts.outputs.root }}
+          EXPECTED_PACKAGE_VERSION: ${{ steps.package_version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t tool_packages < <(find ./artifacts/release-candidate -maxdepth 1 -type f -name 'PipeL4.*.nupkg' -print)
-          mapfile -t api_packages < <(find ./artifacts/public-api-candidate -maxdepth 1 -type f -name 'PipeL4.Plugins.*.nupkg' -print)
+          tool_dir="$ARTIFACT_ROOT/packages/PipeL4"
+          api_dir="$ARTIFACT_ROOT/packages/PipeL4.Plugins"
+          mapfile -t tool_packages < <(find "$tool_dir" -maxdepth 1 -type f -name '*.nupkg' -print)
+          mapfile -t api_packages < <(find "$api_dir" -maxdepth 1 -type f -name '*.nupkg' -print)
           if [[ ${#tool_packages[@]} -ne 1 ]]; then
             echo "Tool package validation failed: expected one PipeL4 package, found ${#tool_packages[@]}." >&2
             exit 1
@@ -89,66 +178,175 @@ jobs:
             echo "Public API package validation failed: expected one PipeL4.Plugins package, found ${#api_packages[@]}." >&2
             exit 1
           fi
-          dotnet fsi scripts/validate_package.fsx "${tool_packages[0]}"
-          dotnet fsi scripts/validate_public_api_package.fsx "${api_packages[0]}"
-          tool_package_name="${tool_packages[0]##*/}"
-          tool_version="${tool_package_name#PipeL4.}"
-          tool_version="${tool_version%.nupkg}"
-          api_package_name="${api_packages[0]##*/}"
-          api_version="${api_package_name#PipeL4.Plugins.}"
-          api_version="${api_version%.nupkg}"
-          if [[ "$tool_version" != "$api_version" ]]; then
-            echo "Distribution validation failed: PipeL4 version '$tool_version' does not match PipeL4.Plugins version '$api_version'." >&2
+          tool_package="${tool_packages[0]}"
+          api_package="${api_packages[0]}"
+          tool_package_name="${tool_package##*/}"
+          api_package_name="${api_package##*/}"
+          if [[ "$tool_package_name" != "PipeL4.${EXPECTED_PACKAGE_VERSION}.nupkg" ]]; then
+            echo "Unexpected tool package filename '$tool_package_name'." >&2
             exit 1
           fi
-          printf 'Validated lockstep package version %s.\n' "$tool_version"
-          printf 'package_version=%s\n' "$tool_version" >> "$GITHUB_OUTPUT"
-          api_package_path="$(realpath "${api_packages[0]}")"
-          printf 'public_api_package_path=%s\n' "$api_package_path" >> "$GITHUB_OUTPUT"
+          if [[ "$api_package_name" != "PipeL4.Plugins.${EXPECTED_PACKAGE_VERSION}.nupkg" ]]; then
+            echo "Unexpected public API package filename '$api_package_name'." >&2
+            exit 1
+          fi
+          dotnet fsi scripts/validate_package.fsx "$tool_package"
+          dotnet fsi scripts/validate_public_api_package.fsx "$api_package"
+          printf 'Validated lockstep package version %s.\n' "$EXPECTED_PACKAGE_VERSION"
+          printf 'package_version=%s\n' "$EXPECTED_PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'tool_package_path=%s\n' "$(realpath "$tool_package")" >> "$GITHUB_OUTPUT"
+          printf 'public_api_package_path=%s\n' "$(realpath "$api_package")" >> "$GITHUB_OUTPUT"
 
       - name: Verify public API consumer compilation failure handling
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
         env:
           PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
         run: dotnet fsi scripts/test_public_api_consumer.fsx "$PUBLIC_API_PACKAGE_PATH"
 
       - name: Verify public API package consumer regressions
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
         env:
           PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
         run: dotnet fsi scripts/test_public_api_package.fsx "$PUBLIC_API_PACKAGE_PATH"
 
       - name: Verify FSI authoring dependency-manager cache isolation
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
         env:
           PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
         run: dotnet fsi scripts/test_fsi_authoring_cache.fsx "$PUBLIC_API_PACKAGE_PATH" examples/AsciiUppercase.fsx
 
       - name: Validate F# Interactive authoring with the local API candidate
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
         env:
           PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
         run: dotnet fsi scripts/validate_fsi_authoring.fsx "$PUBLIC_API_PACKAGE_PATH" examples/AsciiUppercase.fsx
 
-      - name: Run regression suite against release candidate
+      - name: Run regression suite against canonical release candidate
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
+        env:
+          PIPEL4_PACKAGE_PATH: ${{ steps.package.outputs.tool_package_path }}
+        run: dotnet test --solution PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false
+
+      - name: Record package provenance and verify artifact hashes
+        env:
+          ARTIFACT_ROOT: ${{ steps.artifacts.outputs.root }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.package_version }}
+          TESTED_SHA: ${{ steps.source_revision.outputs.sha }}
+          TOOL_PACKAGE_PATH: ${{ steps.package.outputs.tool_package_path }}
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t packages < <(find ./artifacts/release-candidate -maxdepth 1 -type f -name 'PipeL4.*.nupkg' -print)
-          if [[ ${#packages[@]} -ne 1 ]]; then
-            echo "Installed-tool validation failed: expected one validated PipeL4 package, found ${#packages[@]}" >&2
+          tool_dir="$ARTIFACT_ROOT/packages/PipeL4"
+          api_dir="$ARTIFACT_ROOT/packages/PipeL4.Plugins"
+          tool_package="$tool_dir/PipeL4.${PACKAGE_VERSION}.nupkg"
+          api_package="$api_dir/PipeL4.Plugins.${PACKAGE_VERSION}.nupkg"
+          test "$(realpath "$tool_package")" = "$TOOL_PACKAGE_PATH"
+          test "$(realpath "$api_package")" = "$PUBLIC_API_PACKAGE_PATH"
+          tool_nuspec="PipeL4.nuspec"
+          api_nuspec="PipeL4.Plugins.nuspec"
+          if ! unzip -p "$tool_package" "$tool_nuspec" | grep -Fq "commit=\"$TESTED_SHA\""; then
+            echo "Tool package repository commit does not match tested checkout $TESTED_SHA." >&2
             exit 1
           fi
-          PIPEL4_PACKAGE_PATH="${packages[0]}" dotnet test \
-            --solution PipeL4.sln \
-            --configuration Release \
-            --no-restore \
-            -p:PaketDisableCliTest=true \
-            -p:BuildInParallel=false
-          printf '%s\n' "$GITHUB_SHA" > ./artifacts/release-candidate/source-revision.txt
-          printf '%s\n' "$GITHUB_SHA" > ./artifacts/public-api-candidate/source-revision.txt
+          if ! unzip -p "$api_package" "$api_nuspec" | grep -Fq "commit=\"$TESTED_SHA\""; then
+            echo "Public API package repository commit does not match tested checkout $TESTED_SHA." >&2
+            exit 1
+          fi
+          printf '%s\n' "$TESTED_SHA" > "$tool_dir/source-revision.txt"
+          printf '%s\n' "$TESTED_SHA" > "$api_dir/source-revision.txt"
+          test "$(cat "$tool_dir/source-revision.txt")" = "$TESTED_SHA"
+          test "$(cat "$api_dir/source-revision.txt")" = "$TESTED_SHA"
 
-      - name: Upload validated release candidate
+          tool_relative_path="packages/PipeL4/$(basename "$tool_package")"
+          api_relative_path="packages/PipeL4.Plugins/$(basename "$api_package")"
+          tool_workspace_path="$ARTIFACT_ROOT/$tool_relative_path"
+          api_workspace_path="$ARTIFACT_ROOT/$api_relative_path"
+          tool_sha256="$(sha256sum "$tool_package" | cut -d ' ' -f 1)"
+          api_sha256="$(sha256sum "$api_package" | cut -d ' ' -f 1)"
+
+          jq -n \
+            --arg sdk "$SDK_VERSION" \
+            --arg role "$PRODUCER_ROLE" \
+            --arg tested_sha "$TESTED_SHA" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg version "$PACKAGE_VERSION" \
+            --arg tool_path "$tool_relative_path" \
+            --arg tool_workspace_path "$tool_workspace_path" \
+            --arg tool_sha256 "$tool_sha256" \
+            --arg tool_revision "$(cat "$tool_dir/source-revision.txt")" \
+            --arg api_path "$api_relative_path" \
+            --arg api_workspace_path "$api_workspace_path" \
+            --arg api_sha256 "$api_sha256" \
+            --arg api_revision "$(cat "$api_dir/source-revision.txt")" \
+            '{
+              format_version: 1,
+              producer: { sdk: $sdk, role: $role },
+              run_attempt: ($attempt | tonumber),
+              tested_checkout_sha: $tested_sha,
+              packages: [
+                { id: "PipeL4", version: $version, path: $tool_path, workspace_path: $tool_workspace_path, sha256: $tool_sha256, source_revision: $tool_revision, source_revision_file: "packages/PipeL4/source-revision.txt" },
+                { id: "PipeL4.Plugins", version: $version, path: $api_path, workspace_path: $api_workspace_path, sha256: $api_sha256, source_revision: $api_revision, source_revision_file: "packages/PipeL4.Plugins/source-revision.txt" }
+              ]
+            }' > "$ARTIFACT_ROOT/manifest.json"
+
+          (
+            cd "$ARTIFACT_ROOT"
+            sha256sum \
+              "packages/PipeL4/$(basename "$tool_package")" \
+              packages/PipeL4/source-revision.txt \
+              "packages/PipeL4.Plugins/$(basename "$api_package")" \
+              packages/PipeL4.Plugins/source-revision.txt > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          jq -e \
+            --arg sdk "$SDK_VERSION" \
+            --arg role "$PRODUCER_ROLE" \
+            --arg tested_sha "$TESTED_SHA" \
+            --arg tool_sha "$tool_sha256" \
+            --arg api_sha "$api_sha256" \
+            '.producer.sdk == $sdk and .producer.role == $role and .tested_checkout_sha == $tested_sha and .packages[0].sha256 == $tool_sha and .packages[1].sha256 == $api_sha' \
+            "$ARTIFACT_ROOT/manifest.json" > /dev/null
+
+      - name: Upload producer packages and provenance
         uses: actions/upload-artifact@v7
         with:
-          name: PipeL4-${{ steps.package.outputs.package_version }}-release-candidate-${{ github.sha }}
-          path: |
-            ./artifacts/release-candidate/
-            ./artifacts/public-api-candidate/
+          name: PipeL4-${{ env.PRODUCER_ROLE }}-sdk-${{ env.SDK_VERSION }}-source-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ steps.artifacts.outputs.root }}/
           if-no-files-found: error
+
+      - name: Restore SDK policy and verify dependency files are unchanged
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/pipel4-global.json" ]]; then
+            cp "$RUNNER_TEMP/pipel4-global.json" global.json
+          fi
+          git diff --exit-code -- global.json paket.dependencies paket.lock
+
+  produce_compatibility:
+    name: Produce packages (.NET SDK 10.0.404; compatibility)
+    runs-on: ubuntu-24.04
+    env:
+      SDK_VERSION: '10.0.404'
+      PRODUCER_ROLE: compatibility
+    steps: *producer_steps
+
+  validate:
+    name: Build and validate distributable packages
+    needs: [produce_canonical, produce_compatibility]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require both independent producer jobs to succeed
+        env:
+          CANONICAL_RESULT: ${{ needs.produce_canonical.result }}
+          COMPATIBILITY_RESULT: ${{ needs.produce_compatibility.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$CANONICAL_RESULT" != "success" || "$COMPATIBILITY_RESULT" != "success" ]]; then
+            echo "Distribution producers must both succeed; canonical=$CANONICAL_RESULT, compatibility=$COMPATIBILITY_RESULT." >&2
+            exit 1
+          fi
