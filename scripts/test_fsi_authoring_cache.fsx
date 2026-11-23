@@ -1334,7 +1334,7 @@ let private runRegression packageArgument sourceArgument =
         printfn "PASS production validator failed explicitly when exact SDK %s was unavailable." unavailableSdk
 
         let mutationWork = Path.Combine(Path.GetTempPath(), $"PipeL4 FSI production pin mutation {Guid.NewGuid():N}")
-        let mutationTemp = Path.Combine(mutationWork, "temp")
+        let mutationTemp = Path.Combine(Path.GetTempPath(), $"PipeL4 FSI production pin mutation temp {Guid.NewGuid():N}")
         let mutatedValidator = Path.Combine(mutationWork, "validate_fsi_authoring_without_pins.fsx")
         createPrivateDirectory mutationWork
         createPrivateDirectory mutationTemp
@@ -1342,6 +1342,9 @@ let private runRegression packageArgument sourceArgument =
         try
             if Option.isSome (nearestGlobalJson mutationWork) then
                 fail $"The production pin-removal control unexpectedly inherits a global.json: {mutationWork}"
+
+            if Option.isSome (nearestGlobalJson mutationTemp) then
+                fail $"The production pin-removal temp root unexpectedly inherits a global.json: {mutationTemp}"
 
             let productionValidatorSource = File.ReadAllLines validatorPath
             let productionPinWrites =
@@ -1366,6 +1369,14 @@ let private runRegression packageArgument sourceArgument =
                   "TEMP", mutationTemp
                   "TMP", mutationTemp ]
 
+            // Keep dotnet's initial selection aligned with the running FSI even
+            // when several SDKs are installed. The validator creates its own
+            // random working root directly under TMPDIR (mutationTemp), which
+            // is a sibling of mutationWork, so this bootstrap cannot satisfy
+            // any validator-owned working-directory, HOME, or temp pins.
+            writeSdkPin mutationWork sdkSelection
+            verifySdkPin mutationWork sdkSelection
+
             let mutationResult =
                 runDotnet
                     mutationWork
@@ -1376,13 +1387,17 @@ let private runRegression packageArgument sourceArgument =
 
             if mutationResult.TimedOut
                || mutationResult.ExitCode = 0
-               || not (mutationOutput.Contains("Production SDK pin is missing", StringComparison.Ordinal)) then
+               || not (mutationOutput.Contains("Parent SDK selection:", StringComparison.Ordinal))
+               || not (mutationOutput.Contains("Production SDK pin is missing for FSI working directory:", StringComparison.Ordinal)) then
                 fail $"Regression failed to detect disabled production SDK pins (exit {mutationResult.ExitCode}). {mutationOutput}"
 
             printfn "PASS production-pin-removal mutation was rejected for a missing validator-owned SDK pin."
         finally
             if Directory.Exists mutationWork then
                 Directory.Delete(mutationWork, true)
+
+            if Directory.Exists mutationTemp then
+                Directory.Delete(mutationTemp, true)
 
         let availableSdks = enumerateInstalledSdks ()
         let singleSdkFixture = [ sdkSelection.Version, "<controlled-single-sdk-fixture>" ]
