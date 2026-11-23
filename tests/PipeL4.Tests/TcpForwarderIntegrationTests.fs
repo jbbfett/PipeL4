@@ -310,7 +310,8 @@ module TcpForwarderIntegrationTests =
                 ()
         }
 
-    let private runWithForwarderAndArguments
+    let private runWithForwarderAndArgumentsOnPort
+        listenPort
         startForwarder
         backendPort
         extraArguments
@@ -318,40 +319,159 @@ module TcpForwarderIntegrationTests =
         (body: ProxyContext -> Task<unit>)
         =
         task {
-            let listenPort = reservePort ()
             let configuration =
                 createConfigurationWithArguments listenPort backendPort extraArguments
 
             use proxyShutdown =
                 CancellationTokenSource.CreateLinkedTokenSource testCancellationToken
 
-            let proxyTask = startForwarder configuration proxyShutdown.Token
+            let proxyEndpoint = IPEndPoint(loopback, listenPort).ToString()
+            let failures = ResizeArray<string * exn>()
+            let mutable proxyTask: Task option = None
+            let mutable forwarderFailureObserved = false
+
+            let recordFailure role error =
+                failures.Add((role, error))
+
+            try
+                proxyTask <- Some(startForwarder configuration proxyShutdown.Token :> Task)
+            with error ->
+                recordFailure "forwarder startup" error
+                forwarderFailureObserved <- true
+
+            // A listener bind failure can be complete before the first body
+            // operation. Observe it before attempting a client connection so
+            // that a secondary Connection refused does not hide the cause.
+            if not forwarderFailureObserved then
+                match proxyTask with
+                | Some task when task.IsFaulted || task.IsCanceled ->
+                    try
+                        do! task
+                    with error ->
+                        recordFailure "forwarder startup" error
+                        forwarderFailureObserved <- true
+                | _ -> ()
 
             let proxy =
                 { ListenPort = listenPort
                   Shutdown = proxyShutdown
-                  Completion = proxyTask :> Task }
+                  Completion = proxyTask |> Option.defaultValue Task.CompletedTask }
 
+            if not forwarderFailureObserved then
+                try
+                    do! body proxy
+                with error ->
+                    recordFailure "body" error
+
+            // Take a final task-state snapshot before requesting shutdown. A
+            // forwarder that canceled itself during the body is a test failure,
+            // even when its cancellation token is the same token shutdown uses.
+            if not forwarderFailureObserved then
+                match proxyTask with
+                | Some task when task.IsFaulted || task.IsCanceled ->
+                    try
+                        do! task
+                    with error ->
+                        recordFailure "forwarder" error
+                        forwarderFailureObserved <- true
+                | _ -> ()
+
+            try
+                proxyShutdown.Cancel()
+            with error ->
+                recordFailure "forwarder shutdown" error
+
+            match proxyTask with
+            | Some task ->
+                try
+                    // Await without the test token: it is linked to the
+                    // forwarder's shutdown token, and cleanup must finish even
+                    // when the test body or its timeout has failed.
+                    do! task
+                with
+                | :? OperationCanceledException as error
+                    when proxyShutdown.IsCancellationRequested
+                         && (error.CancellationToken = proxyShutdown.Token
+                             || (testCancellationToken.IsCancellationRequested
+                                 && error.CancellationToken = testCancellationToken)) ->
+                    ()
+                | error ->
+                    if not forwarderFailureObserved then
+                        recordFailure "forwarder" error
+            | None -> ()
+
+            if failures.Count > 0 then
+                let failureKinds = failures |> Seq.map fst |> String.concat " and "
+                let causes = failures |> Seq.map snd |> Seq.toArray
+
+                return
+                    raise (
+                        AggregateException(
+                            $"TCP integration failed for proxy listener {proxyEndpoint}: {failureKinds}.",
+                            causes
+                        )
+                    )
+        }
+
+    let private runWithForwarderAndArguments
+        startForwarder
+        backendPort
+        extraArguments
+        (testCancellationToken: CancellationToken)
+        (body: ProxyContext -> Task<unit>)
+        =
+        runWithForwarderAndArgumentsOnPort
+            (reservePort ())
+            startForwarder
+            backendPort
+            extraArguments
+            testCancellationToken
+            body
+
+    let private withBodyCleanup
+        (cleanup: unit -> unit)
+        (body: ProxyContext -> Task<unit>)
+        =
+        fun proxy ->
+            task {
+                try
+                    do! body proxy
+                finally
+                    cleanup ()
+            }
+
+    let private runHelperWithFailsafeCleanup
+        (cleanup: unit -> unit)
+        (helper: Task<unit>)
+        =
+        task {
+            use failsafe = new CancellationTokenSource(2_000: int)
+            let mutable timedOut = false
             let mutable failure: exn option = None
 
             try
-                do! body proxy
-            with error ->
-                failure <- Some error
+                try
+                    do! helper.WaitAsync(failsafe.Token)
+                with
+                | :? AggregateException as error -> failure <- Some error
+                | :? OperationCanceledException when failsafe.IsCancellationRequested ->
+                    timedOut <- true
+                | error -> failure <- Some error
+            finally
+                // This is independent of the body-owned cleanup under test. It
+                // keeps a broken regression from leaving its forwarder running.
+                cleanup ()
 
-            proxyShutdown.Cancel()
+            if timedOut then
+                try
+                    do! helper.WaitAsync(TimeSpan.FromSeconds 2.)
+                with
+                | :? AggregateException as error -> failure <- Some error
+                | _ -> ()
 
-            try
-                do! proxyTask.WaitAsync(testCancellationToken)
-            with error ->
-                if failure.IsNone then
-                    failure <- Some error
+                failwith "The integration helper did not finish before the failsafe timeout."
 
-            match failure with
-            | Some error ->
-                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(error).Throw()
-                return ()
-            | None -> return ()
+            return failure
         }
 
     let private runWithForwarder
@@ -551,6 +671,374 @@ module TcpForwarderIntegrationTests =
     let private passThroughPipelines (_: ConnectionState) =
         { ClientToBackend = [| passThroughProcessor () |]
           BackendToClient = [| passThroughProcessor () |] }
+
+    [<Fact>]
+    let ``forwarder helper completes a healthy proxy and body`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            do!
+                runWithForwarderAndArguments
+                    (fun configuration cancellationToken ->
+                        TcpForwarder.runAsync configuration NullLogger.Instance cancellationToken)
+                    (endpointPort backendListener)
+                    Array.empty
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                            use! client = connect proxy.ListenPort timeout.Token
+                            use! backend = acceptBackend
+
+                            let payload = [| 41uy; 42uy; 43uy |]
+                            let received = readExactly (backend.GetStream()) payload.Length timeout.Token
+
+                            do! client.GetStream().WriteAsync(payload, 0, payload.Length, timeout.Token)
+
+                            let! forwarded = received
+                            forwarded |> should equal payload
+                        })
+        }
+
+    [<Fact>]
+    let ``forwarder helper reports a deterministic listener bind conflict`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use occupiedListener = new TcpListener(loopback, 0)
+            occupiedListener.Start()
+
+            let listenPort = endpointPort occupiedListener
+            let mutable bodyExecuted = false
+            let mutable forwarderTask: Task option = None
+            let mutable shutdownToken = CancellationToken.None
+
+            let startForwarder configuration cancellationToken =
+                shutdownToken <- cancellationToken
+
+                let started =
+                    TcpForwarder.runAsync configuration NullLogger.Instance cancellationToken
+
+                forwarderTask <- Some(started :> Task)
+                started
+
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsOnPort
+                        listenPort
+                        startForwarder
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun _ ->
+                            bodyExecuted <- true
+                            Task.FromResult(()))
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate helper failure, got %O." error
+                | None -> failwith "Expected the listener bind conflict to fail the helper."
+
+            aggregate.Message.Contains($"127.0.0.1:{listenPort}") |> should equal true
+            bodyExecuted |> should equal false
+
+            let bindFailure =
+                aggregate.InnerExceptions
+                |> Seq.tryPick (function
+                    | :? SocketException as error -> Some error
+                    | _ -> None)
+                |> Option.defaultWith (fun () -> failwith "The forwarder SocketException was lost.")
+
+            bindFailure.SocketErrorCode |> should equal SocketError.AddressAlreadyInUse
+            forwarderTask.Value.IsCompleted |> should equal true
+            shutdownToken.IsCancellationRequested |> should equal true
+        }
+
+    [<Fact>]
+    let ``forwarder helper preserves client and forwarder failures together`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let listenPort = reservePort ()
+            let forwarderFinished = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let expectedForwarderFailure = InvalidOperationException("injected forwarder failure")
+            let mutable forwarderTask: Task option = None
+            let mutable shutdownToken = CancellationToken.None
+
+            let startForwarder configuration cancellationToken =
+                shutdownToken <- cancellationToken
+
+                let started =
+                    task {
+                        try
+                            try
+                                do! Task.Delay(Timeout.Infinite, cancellationToken)
+                            with :? OperationCanceledException ->
+                                raise expectedForwarderFailure
+                        finally
+                            forwarderFinished.TrySetResult(()) |> ignore
+                    }
+
+                forwarderTask <- Some(started :> Task)
+                started
+
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsOnPort
+                        listenPort
+                        startForwarder
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun proxy ->
+                            task {
+                                use! _client = connect proxy.ListenPort timeout.Token
+                                failwith "Expected connection to the unlistened proxy port to fail."
+                            })
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate helper failure, got %O." error
+                | None -> failwith "Expected both the client and forwarder to fail."
+
+            aggregate.Message.Contains($"127.0.0.1:{listenPort}") |> should equal true
+            aggregate.InnerExceptions.Count |> should equal 2
+
+            let clientFailure =
+                aggregate.InnerExceptions
+                |> Seq.tryPick (function
+                    | :? SocketException as error -> Some error
+                    | _ -> None)
+                |> Option.defaultWith (fun () -> failwith "The client connection failure was lost.")
+
+            clientFailure.SocketErrorCode |> should equal SocketError.ConnectionRefused
+
+            aggregate.InnerExceptions
+            |> Seq.exists (fun error -> Object.ReferenceEquals(error, expectedForwarderFailure))
+            |> should equal true
+
+            forwarderTask.Value.IsCompleted |> should equal true
+            shutdownToken.IsCancellationRequested |> should equal true
+        }
+
+    [<Fact>]
+    let ``forwarder helper treats shutdown cancellation as successful cleanup`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let mutable shutdownToken = CancellationToken.None
+            let cleanupStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseCleanup = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let cleanupCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+            let helperRun =
+                runWithForwarderAndArgumentsOnPort
+                    (reservePort ())
+                    (fun _ cancellationToken ->
+                        shutdownToken <- cancellationToken
+
+                        task {
+                            try
+                                do! Task.Delay(Timeout.Infinite, cancellationToken)
+                            with :? OperationCanceledException as error ->
+                                cleanupStarted.TrySetResult(()) |> ignore
+                                do! releaseCleanup.Task
+                                cleanupCompleted.TrySetResult(()) |> ignore
+                                return raise error
+                        })
+                    (reservePort ())
+                    Array.empty
+                    timeout.Token
+                    (fun _ -> Task.FromResult(()))
+
+            do! cleanupStarted.Task.WaitAsync(timeout.Token)
+            let helperReturnedBeforeCleanup = helperRun.IsCompleted
+            releaseCleanup.TrySetResult(()) |> ignore
+            do! helperRun
+
+            helperReturnedBeforeCleanup |> should equal false
+            cleanupCompleted.Task.IsCompleted |> should equal true
+            shutdownToken.IsCancellationRequested |> should equal true
+        }
+
+    [<Fact>]
+    let ``forwarder cancellation completed during the body is reported`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let canceledForwarder = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let mutable forwarderToken = CancellationToken.None
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsOnPort
+                        (reservePort ())
+                        (fun _ _ -> canceledForwarder.Task)
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun proxy ->
+                            forwarderToken <- proxy.Shutdown.Token
+                            forwarderToken.IsCancellationRequested |> should equal false
+                            canceledForwarder.TrySetCanceled(forwarderToken) |> should equal true
+                            canceledForwarder.Task.IsCanceled |> should equal true
+                            Task.FromResult(()))
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate helper failure, got %O." error
+                | None -> failwith "Expected pre-shutdown forwarder cancellation to fail the helper."
+
+            aggregate.InnerExceptions.Count |> should equal 1
+
+            let cancellation =
+                match aggregate.InnerExceptions[0] with
+                | :? OperationCanceledException as error -> error
+                | error -> failwithf "Expected the original cancellation, got %O." error
+
+            cancellation.CancellationToken |> should equal forwarderToken
+        }
+
+    [<Fact>]
+    let ``forwarder cancellation with an unrelated token remains a failure`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use unrelatedCancellation = new CancellationTokenSource()
+            let canceledForwarder = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsOnPort
+                        (reservePort ())
+                        (fun _ _ -> canceledForwarder.Task)
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun _ ->
+                            canceledForwarder.TrySetCanceled(unrelatedCancellation.Token)
+                            |> should equal true
+
+                            canceledForwarder.Task.IsCanceled |> should equal true
+                            Task.FromResult(()))
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate helper failure, got %O." error
+                | None -> failwith "Expected unrelated forwarder cancellation to fail the helper."
+
+            let cancellation =
+                match aggregate.InnerExceptions[0] with
+                | :? OperationCanceledException as error -> error
+                | error -> failwithf "Expected the original cancellation, got %O." error
+
+            cancellation.CancellationToken |> should equal unrelatedCancellation.Token
+        }
+
+    [<Fact>]
+    let ``body failure releases gated forwarder disposal before helper cleanup`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let disposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseDisposal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let disposalCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let expectedBodyFailure = InvalidOperationException("injected body failure before gate release")
+            let mutable bodyCleanupReleased = false
+            let mutable helperFailure: exn option = None
+
+            let createPipelines (_: ConnectionState) =
+                let gated =
+                    GatedDisposalProcessor(
+                        (fun input output _ ->
+                            output.AppendInput(0L, input.Bytes.Length)
+                            completed 0L),
+                        disposalStarted,
+                        releaseDisposal,
+                        disposalCompleted
+                    )
+
+                { ClientToBackend = [| gated :> IByteStreamProcessor |]
+                  BackendToClient = [| passThroughProcessor () |] }
+
+            let helperRun =
+                runWithProcessorProxyAndLoggerForDiagnostics
+                    createPipelines
+                    NullLogger.Instance
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (withBodyCleanup
+                        (fun () ->
+                            bodyCleanupReleased <- true
+                            releaseDisposal.TrySetResult(()) |> ignore)
+                        (fun proxy ->
+                            task {
+                                let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                                use! _client = connect proxy.ListenPort timeout.Token
+                                use! _backend = acceptBackend
+
+                                do! _client.GetStream().WriteAsync([| 1uy |], timeout.Token).AsTask()
+                                let! received = readExactly (_backend.GetStream()) 1 timeout.Token
+                                received |> should equal [| 1uy |]
+
+                                proxy.Shutdown.Cancel()
+                                do! disposalStarted.Task.WaitAsync(timeout.Token)
+                                return raise expectedBodyFailure
+                            }))
+
+            let mutable completedWithinBound = false
+
+            try
+                let! completedTask = Task.WhenAny(helperRun :> Task, Task.Delay(TimeSpan.FromSeconds(5.0)))
+                completedWithinBound <- Object.ReferenceEquals(completedTask, helperRun)
+
+                if completedWithinBound then
+                    try
+                        do! helperRun
+                    with error ->
+                        helperFailure <- Some error
+            finally
+                // Failsafe cleanup lets the regression report a bounded failure
+                // if the body no longer releases the gate before helper cleanup.
+                releaseDisposal.TrySetResult(()) |> ignore
+
+            if not completedWithinBound then
+                try
+                    do! helperRun.WaitAsync(timeout.Token)
+                with error ->
+                    helperFailure <- Some error
+
+            completedWithinBound |> should equal true
+            bodyCleanupReleased |> should equal true
+            disposalCompleted.Task.IsCompletedSuccessfully |> should equal true
+
+            let aggregate =
+                match helperFailure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected the body failure aggregate, got %O." error
+                | None -> failwith "Expected the helper to preserve the injected body failure."
+
+            aggregate.InnerExceptions.Count |> should equal 1
+            Object.ReferenceEquals(aggregate.InnerExceptions[0], expectedBodyFailure)
+            |> should equal true
+        }
 
     [<Fact>]
     let ``enabled terminal diagnostics emit structured connection and direction summaries`` () =
@@ -833,8 +1321,11 @@ module TcpForwarderIntegrationTests =
                         (logger :> ILogger)
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () ->
+                                expansionCommitted.TrySetResult(()) |> ignore
+                                releaseExpansion.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
                                 use! client = connect proxy.ListenPort timeout.Token
                                 use! backend = acceptBackend
@@ -884,7 +1375,7 @@ module TcpForwarderIntegrationTests =
                                 do! expectEndOfStream backendStream timeout.Token
                                 do! expectEndOfStream clientStream timeout.Token
                                 do! logger.TerminalDirectionDiagnosticsPublished.WaitAsync timeout.Token
-                            })
+                            }))
             finally
                 expansionCommitted.TrySetResult(()) |> ignore
                 releaseExpansion.TrySetResult(()) |> ignore
@@ -1905,8 +2396,9 @@ module TcpForwarderIntegrationTests =
                         (fun value -> observed.TrySetResult(value) |> ignore)
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () -> release.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptBackend =
                                     backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
 
@@ -1964,7 +2456,7 @@ module TcpForwarderIntegrationTests =
                                 release.TrySetResult(()) |> ignore
                                 let! received = receive
                                 received |> should equal payload
-                            })
+                            }))
             finally
                 release.TrySetResult(()) |> ignore
 
@@ -2024,8 +2516,9 @@ module TcpForwarderIntegrationTests =
                         (fun value -> observed.TrySetResult(value) |> ignore)
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () -> release.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptBackend =
                                     backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
 
@@ -2104,7 +2597,7 @@ module TcpForwarderIntegrationTests =
                                 // direction remains active.
                                 remaining |> should be (greaterThan 0L)
                                 bothDirections |> should be (greaterThan remaining)
-                            })
+                            }))
             finally
                 release.TrySetResult(()) |> ignore
 
@@ -2442,6 +2935,7 @@ module TcpForwarderIntegrationTests =
             backendListener.Start()
 
             let allRetained = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let bodyFailureAbort = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let boundaryReady = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let boundaryRelease = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let observed =
@@ -2450,6 +2944,18 @@ module TcpForwarderIntegrationTests =
             let mutable retainedInvocations = 0
             let mutable clientToBackendReceives = 0
             let mutable backendToClientReceives = 0
+
+            let waitForBothRetainedOrAbort () =
+                task {
+                    let! _ =
+                        Task.WhenAny(
+                            allRetained.Task :> Task,
+                            bodyFailureAbort.Task :> Task
+                        )
+
+                    if not allRetained.Task.IsCompleted then
+                        raise (InvalidOperationException("Physical-share test coordination was aborted."))
+                }
 
             let retainingProcessor () =
                 processor (fun input _ _ ->
@@ -2461,7 +2967,7 @@ module TcpForwarderIntegrationTests =
 
                         ValueTask<ProcessorResult>(
                             task {
-                                do! allRetained.Task
+                                do! waitForBothRetainedOrAbort ()
                                 return { RetainedLength = input.Bytes.Length }
                             }
                         ))
@@ -2487,46 +2993,292 @@ module TcpForwarderIntegrationTests =
                   PendingSend = ignore
                   CapacityAccounting = None }
 
-            do!
+            let releaseTestCoordination () =
+                bodyFailureAbort.TrySetResult(()) |> ignore
+                boundaryRelease.TrySetResult(()) |> ignore
+
+            try
+                do!
+                    runWithBoundedObservedProcessorProxyAndLogger
+                        createPipelines
+                        (ConnectionCapacityLimits(128L, 128L, 64L))
+                        (fun value -> observed.TrySetResult(value) |> ignore)
+                        (logger :> ILogger)
+                        hooks
+                        (endpointPort backendListener)
+                        timeout.Token
+                        (withBodyCleanup
+                            releaseTestCoordination
+                            (fun proxy -> task {
+                                let acceptBackend =
+                                    backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+
+                                use! client = connect proxy.ListenPort timeout.Token
+                                use! backend = acceptBackend
+                                let clientPayload = createPayload 32 193
+                                let backendPayload = createPayload 32 197
+
+                                do!
+                                    Task.WhenAll(
+                                        client.GetStream().WriteAsync(clientPayload, timeout.Token).AsTask(),
+                                        backend.GetStream().WriteAsync(backendPayload, timeout.Token).AsTask()
+                                    )
+
+                                do! allRetained.Task.WaitAsync(timeout.Token)
+                                do! boundaryReady.Task.WaitAsync(timeout.Token)
+
+                                let occupied = observed.Task.Result.GetSnapshot()
+                                occupied.CurrentPhysicalBufferCapacityBytes |> should equal 64L
+                                occupied.ClientToBackend.CurrentLogicalBufferedBytes |> should equal 32L
+                                occupied.BackendToClient.CurrentLogicalBufferedBytes |> should equal 32L
+
+                                boundaryRelease.TrySetResult(()) |> ignore
+                                let! failure = logger.FirstFailure.WaitAsync(timeout.Token)
+                                failure.Message |> should haveSubstring "quiescent receive boundary"
+                                proxy.Completion.IsCompleted |> should equal false
+                                do! expectDisconnect (client.GetStream()) timeout.Token
+                                do! expectDisconnect (backend.GetStream()) timeout.Token
+                            }))
+            finally
+                // Outer failsafe in addition to the body-owned release above.
+                releaseTestCoordination ()
+
+            let! accounting = observed.Task.WaitAsync(timeout.Token)
+            let snapshot = accounting.GetSnapshot()
+            snapshot.CurrentPhysicalBufferCapacityBytes |> should equal 0L
+            snapshot.ClientToBackend.CurrentLogicalBufferedBytes |> should equal 0L
+            snapshot.BackendToClient.CurrentLogicalBufferedBytes |> should equal 0L
+        }
+
+    [<Fact>]
+    let ``physical-share failure aborts an unfinished retained rendezvous`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let allRetained = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let firstRetained = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let bodyFailureAbort = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let boundaryRelease = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let observed = TaskCompletionSource<ConnectionRuntimeMetrics>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let expectedBodyFailure = InvalidOperationException("injected before both directions retained")
+            let mutable retainedInvocations = 0
+            let mutable proxyCompletion: Task option = None
+
+            let waitForBothRetainedOrAbort () =
+                task {
+                    let! _ =
+                        Task.WhenAny(
+                            allRetained.Task :> Task,
+                            bodyFailureAbort.Task :> Task
+                        )
+
+                    if not allRetained.Task.IsCompleted then
+                        raise (InvalidOperationException("Physical-share test coordination was aborted."))
+                }
+
+            let retainingProcessor () =
+                processor (fun input _ _ ->
+                    if input.IsCompleted then
+                        completed 0L
+                    else
+                        let invocation = Interlocked.Increment(&retainedInvocations)
+
+                        if invocation = 1 then
+                            firstRetained.TrySetResult(()) |> ignore
+
+                        if invocation = 2 then
+                            allRetained.TrySetResult(()) |> ignore
+
+                        ValueTask<ProcessorResult>(
+                            task {
+                                do! waitForBothRetainedOrAbort ()
+                                return { RetainedLength = input.Bytes.Length }
+                            }
+                        ))
+
+            let createPipelines (_: ConnectionState) =
+                { ClientToBackend = [| retainingProcessor () |]
+                  BackendToClient = [| retainingProcessor () |] }
+
+            let hooks =
+                { BeforeReceive = ignore
+                  AfterReceive = fun _ _ -> ()
+                  PendingSend = ignore
+                  CapacityAccounting = None }
+
+            let releaseTestCoordination () =
+                bodyFailureAbort.TrySetResult(()) |> ignore
+                boundaryRelease.TrySetResult(()) |> ignore
+
+            let helper =
                 runWithBoundedObservedProcessorProxyAndLogger
                     createPipelines
                     (ConnectionCapacityLimits(128L, 128L, 64L))
                     (fun value -> observed.TrySetResult(value) |> ignore)
-                    (logger :> ILogger)
+                    NullLogger.Instance
                     hooks
                     (endpointPort backendListener)
                     timeout.Token
-                    (fun proxy ->
-                        task {
-                            let acceptBackend =
-                                backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                    (withBodyCleanup
+                        releaseTestCoordination
+                        (fun proxy ->
+                            proxyCompletion <- Some proxy.Completion
 
-                            use! client = connect proxy.ListenPort timeout.Token
-                            use! backend = acceptBackend
-                            let clientPayload = createPayload 32 193
-                            let backendPayload = createPayload 32 197
+                            task {
+                                let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                                use! client = connect proxy.ListenPort timeout.Token
+                                use! _backend = acceptBackend
+                                do! client.GetStream().WriteAsync([| 11uy |], timeout.Token).AsTask()
+                                do! firstRetained.Task.WaitAsync(timeout.Token)
+                                raise expectedBodyFailure
+                            }))
 
-                            do!
-                                Task.WhenAll(
-                                    client.GetStream().WriteAsync(clientPayload, timeout.Token).AsTask(),
-                                    backend.GetStream().WriteAsync(backendPayload, timeout.Token).AsTask()
-                                )
+            let! helperFailure = runHelperWithFailsafeCleanup releaseTestCoordination helper
 
-                            do! allRetained.Task.WaitAsync(timeout.Token)
-                            do! boundaryReady.Task.WaitAsync(timeout.Token)
+            let aggregate =
+                match helperFailure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate helper failure, got %O." error
+                | None -> failwith "Expected the injected body failure to fail the helper."
 
-                            let occupied = observed.Task.Result.GetSnapshot()
-                            occupied.CurrentPhysicalBufferCapacityBytes |> should equal 64L
-                            occupied.ClientToBackend.CurrentLogicalBufferedBytes |> should equal 32L
-                            occupied.BackendToClient.CurrentLogicalBufferedBytes |> should equal 32L
+            aggregate.InnerExceptions
+            |> Seq.exists (fun error -> Object.ReferenceEquals(error, expectedBodyFailure))
+            |> should equal true
 
-                            boundaryRelease.TrySetResult(()) |> ignore
-                            let! failure = logger.FirstFailure.WaitAsync(timeout.Token)
-                            failure.Message |> should haveSubstring "quiescent receive boundary"
-                            proxy.Completion.IsCompleted |> should equal false
-                            do! expectDisconnect (client.GetStream()) timeout.Token
-                            do! expectDisconnect (backend.GetStream()) timeout.Token
-                        })
+            firstRetained.Task.IsCompletedSuccessfully |> should equal true
+            allRetained.Task.IsCompleted |> should equal false
+            bodyFailureAbort.Task.IsCompletedSuccessfully |> should equal true
+            boundaryRelease.Task.IsCompletedSuccessfully |> should equal true
+            proxyCompletion.Value.IsCompleted |> should equal true
+
+            let! accounting = observed.Task.WaitAsync(timeout.Token)
+            let snapshot = accounting.GetSnapshot()
+            snapshot.CurrentPhysicalBufferCapacityBytes |> should equal 0L
+            snapshot.ClientToBackend.CurrentLogicalBufferedBytes |> should equal 0L
+            snapshot.BackendToClient.CurrentLogicalBufferedBytes |> should equal 0L
+        }
+
+    [<Fact>]
+    let ``physical-share boundary failure releases both blocked directions`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let allRetained = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let boundaryReady = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let bodyFailureAbort = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let boundaryRelease = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let observed = TaskCompletionSource<ConnectionRuntimeMetrics>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let expectedBodyFailure = InvalidOperationException("injected before the normal boundary release")
+            let mutable retainedInvocations = 0
+            let mutable clientToBackendReceives = 0
+            let mutable backendToClientReceives = 0
+            let mutable proxyCompletion: Task option = None
+
+            let waitForBothRetainedOrAbort () =
+                task {
+                    let! _ =
+                        Task.WhenAny(
+                            allRetained.Task :> Task,
+                            bodyFailureAbort.Task :> Task
+                        )
+
+                    if not allRetained.Task.IsCompleted then
+                        raise (InvalidOperationException("Physical-share test coordination was aborted."))
+                }
+
+            let retainingProcessor () =
+                processor (fun input _ _ ->
+                    if input.IsCompleted then
+                        completed 0L
+                    else
+                        if Interlocked.Increment(&retainedInvocations) = 2 then
+                            allRetained.TrySetResult(()) |> ignore
+
+                        ValueTask<ProcessorResult>(
+                            task {
+                                do! waitForBothRetainedOrAbort ()
+                                return { RetainedLength = input.Bytes.Length }
+                            }
+                        ))
+
+            let createPipelines (_: ConnectionState) =
+                { ClientToBackend = [| retainingProcessor () |]
+                  BackendToClient = [| retainingProcessor () |] }
+
+            let hooks =
+                { BeforeReceive =
+                      (fun direction ->
+                          let count =
+                              match direction with
+                              | ClientToBackend -> Interlocked.Increment(&clientToBackendReceives)
+                              | BackendToClient -> Interlocked.Increment(&backendToClientReceives)
+
+                          if clientToBackendReceives >= 2 && backendToClientReceives >= 2 then
+                              boundaryReady.TrySetResult(()) |> ignore
+
+                          if count >= 2 then
+                              boundaryRelease.Task.GetAwaiter().GetResult())
+                  AfterReceive = fun _ _ -> ()
+                  PendingSend = ignore
+                  CapacityAccounting = None }
+
+            let releaseTestCoordination () =
+                bodyFailureAbort.TrySetResult(()) |> ignore
+                boundaryRelease.TrySetResult(()) |> ignore
+
+            let helper =
+                runWithBoundedObservedProcessorProxyAndLogger
+                    createPipelines
+                    (ConnectionCapacityLimits(128L, 128L, 64L))
+                    (fun value -> observed.TrySetResult(value) |> ignore)
+                    NullLogger.Instance
+                    hooks
+                    (endpointPort backendListener)
+                    timeout.Token
+                    (withBodyCleanup
+                        releaseTestCoordination
+                        (fun proxy ->
+                            proxyCompletion <- Some proxy.Completion
+
+                            task {
+                                let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                                use! client = connect proxy.ListenPort timeout.Token
+                                use! backend = acceptBackend
+                                let clientPayload = createPayload 32 211
+                                let backendPayload = createPayload 32 223
+
+                                do!
+                                    Task.WhenAll(
+                                        client.GetStream().WriteAsync(clientPayload, timeout.Token).AsTask(),
+                                        backend.GetStream().WriteAsync(backendPayload, timeout.Token).AsTask()
+                                    )
+
+                                do! allRetained.Task.WaitAsync(timeout.Token)
+                                do! boundaryReady.Task.WaitAsync(timeout.Token)
+                                raise expectedBodyFailure
+                            }))
+
+            let! helperFailure = runHelperWithFailsafeCleanup releaseTestCoordination helper
+
+            let aggregate =
+                match helperFailure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate helper failure, got %O." error
+                | None -> failwith "Expected the injected body failure to fail the helper."
+
+            aggregate.InnerExceptions
+            |> Seq.exists (fun error -> Object.ReferenceEquals(error, expectedBodyFailure))
+            |> should equal true
+
+            allRetained.Task.IsCompletedSuccessfully |> should equal true
+            boundaryReady.Task.IsCompletedSuccessfully |> should equal true
+            bodyFailureAbort.Task.IsCompletedSuccessfully |> should equal true
+            boundaryRelease.Task.IsCompletedSuccessfully |> should equal true
+            proxyCompletion.Value.IsCompleted |> should equal true
 
             let! accounting = observed.Task.WaitAsync(timeout.Token)
             let snapshot = accounting.GetSnapshot()
@@ -2665,8 +3417,9 @@ module TcpForwarderIntegrationTests =
                         createPipelines
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () -> release.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptBackend =
                                     backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
 
@@ -2708,7 +3461,7 @@ module TcpForwarderIntegrationTests =
                                 release.TrySetResult(()) |> ignore
                                 let! receivedBlocked = receiveBlocked
                                 receivedBlocked |> should equal blockedPayload
-                            })
+                            }))
             finally
                 release.TrySetResult(()) |> ignore
         }
@@ -2753,8 +3506,9 @@ module TcpForwarderIntegrationTests =
                         createPipelines
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () -> release.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptFirstBackend =
                                     backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
 
@@ -2805,7 +3559,7 @@ module TcpForwarderIntegrationTests =
                                 release.TrySetResult(()) |> ignore
                                 let! receivedFirst = receiveFirst
                                 receivedFirst |> should equal firstPayload
-                            })
+                            }))
             finally
                 release.TrySetResult(()) |> ignore
         }
@@ -3003,8 +3757,9 @@ module TcpForwarderIntegrationTests =
                         hooks
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () -> releaseEof.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
                                 use! client = connect proxy.ListenPort timeout.Token
                                 use! _backend = acceptBackend
@@ -3015,7 +3770,7 @@ module TcpForwarderIntegrationTests =
                                 releaseEof.TrySetResult(()) |> ignore
                                 do! proxy.Completion.WaitAsync(timeout.Token)
                                 Volatile.Read(&completionInvocations) |> should equal 0
-                            })
+                            }))
             finally
                 releaseEof.TrySetResult(()) |> ignore
 
@@ -3359,8 +4114,11 @@ module TcpForwarderIntegrationTests =
                           CapacityAccounting = None }
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () ->
+                                releaseSecondBackendReceive.TrySetResult(()) |> ignore
+                                releaseDisposal.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
                                 use! client = connect proxy.ListenPort timeout.Token
                                 use! backend = acceptBackend
@@ -3395,7 +4153,7 @@ module TcpForwarderIntegrationTests =
                                 do! expectEndOfStream clientStream timeout.Token
                                 releaseDisposal.TrySetResult(()) |> ignore
                                 do! disposalCompleted.Task.WaitAsync(timeout.Token)
-                            })
+                            }))
             finally
                 releaseDisposal.TrySetResult(()) |> ignore
 
@@ -3446,8 +4204,9 @@ module TcpForwarderIntegrationTests =
                           CapacityAccounting = None }
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () -> releaseDisposal.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
                                 use! client = connect proxy.ListenPort timeout.Token
                                 use! backend = acceptBackend
@@ -3464,7 +4223,7 @@ module TcpForwarderIntegrationTests =
                                 do! disposalCompleted.Task.WaitAsync(timeout.Token)
                                 let! failure = logger.FirstFailure.WaitAsync(timeout.Token)
                                 failure.Message |> should haveSubstring "processor failed before cleanup"
-                            })
+                            }))
             finally
                 releaseDisposal.TrySetResult(()) |> ignore
 
@@ -3618,6 +4377,7 @@ module TcpForwarderIntegrationTests =
             backendListener.Start()
             let clientActionReady = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let backendActionReady = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let bodyFailureAbort = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let clientDisposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let releaseClientDisposal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let clientDisposalCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -3626,6 +4386,14 @@ module TcpForwarderIntegrationTests =
             let backendDisposalCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let observed = TaskCompletionSource<ConnectionRuntimeMetrics>(TaskCreationOptions.RunContinuationsAsynchronously)
             let logger = RecordingLogger()
+
+            let waitForSignalOrAbort (signal: Task) =
+                task {
+                    let! _ = Task.WhenAny(signal, bodyFailureAbort.Task :> Task)
+
+                    if not signal.IsCompleted then
+                        raise (InvalidOperationException("Registered-failure test coordination was aborted."))
+                }
 
             let createPipelines (_: ConnectionState) =
                 let clientFailure =
@@ -3638,7 +4406,7 @@ module TcpForwarderIntegrationTests =
 
                                 ValueTask<ProcessorResult>(
                                     task {
-                                        do! backendActionReady.Task
+                                        do! waitForSignalOrAbort (backendActionReady.Task :> Task)
                                         return raise (InvalidOperationException("client direction failed"))
                                     }
                                 )),
@@ -3657,8 +4425,8 @@ module TcpForwarderIntegrationTests =
 
                                 ValueTask<ProcessorResult>(
                                     task {
-                                        do! clientActionReady.Task
-                                        do! clientDisposalStarted.Task
+                                        do! waitForSignalOrAbort (clientActionReady.Task :> Task)
+                                        do! waitForSignalOrAbort (clientDisposalStarted.Task :> Task)
                                         return raise (InvalidOperationException("backend direction failed"))
                                     }
                                 )),
@@ -3672,44 +4440,185 @@ module TcpForwarderIntegrationTests =
                 { ClientToBackend = [| clientFailure :> IByteStreamProcessor |]
                   BackendToClient = [| backendFailure :> IByteStreamProcessor |] }
 
-            do!
+            let releaseTestCoordination () =
+                bodyFailureAbort.TrySetResult(()) |> ignore
+                releaseClientDisposal.TrySetResult(()) |> ignore
+                releaseBackendDisposal.TrySetResult(()) |> ignore
+
+            try
+                do!
+                    runWithBoundedObservedProcessorProxyAndLogger
+                        createPipelines
+                        (ConnectionCapacityLimits(128L, 128L, 64L))
+                        (fun value -> observed.TrySetResult(value) |> ignore)
+                        (logger :> ILogger)
+                        { BeforeReceive = ignore
+                          AfterReceive = fun _ _ -> ()
+                          PendingSend = ignore
+                          CapacityAccounting = None }
+                        (endpointPort backendListener)
+                        timeout.Token
+                        (withBodyCleanup
+                            releaseTestCoordination
+                            (fun proxy -> task {
+                                let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                                use! client = connect proxy.ListenPort timeout.Token
+                                use! backend = acceptBackend
+
+                                do!
+                                    Task.WhenAll(
+                                        client.GetStream().WriteAsync([| 1uy |], timeout.Token).AsTask(),
+                                        backend.GetStream().WriteAsync([| 2uy |], timeout.Token).AsTask()
+                                    )
+
+                                do! clientDisposalStarted.Task.WaitAsync(timeout.Token)
+                                do! backendDisposalCompleted.Task.WaitAsync(timeout.Token)
+                                proxy.Completion.IsCompleted |> should equal false
+
+                                releaseClientDisposal.TrySetResult(()) |> ignore
+                                do! clientDisposalCompleted.Task.WaitAsync(timeout.Token)
+                                do! logger.TwoFailures.WaitAsync(timeout.Token)
+
+                                logger.Failures
+                                |> Array.map _.Message
+                                |> should equal [| "client direction failed"; "backend direction failed" |]
+                            }))
+            finally
+                releaseTestCoordination ()
+
+            let snapshot = observed.Task.Result.GetSnapshot()
+            snapshot.CurrentPhysicalBufferCapacityBytes |> should equal 0L
+            snapshot.ClientToBackend.CurrentLogicalBufferedBytes |> should equal 0L
+            snapshot.BackendToClient.CurrentLogicalBufferedBytes |> should equal 0L
+        }
+
+    [<Fact>]
+    let ``registered-failure partial rendezvous aborts cleanly after body failure`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+
+            let clientActionReady = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let backendActionReady = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let bodyFailureAbort = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let clientDisposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseClientDisposal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let clientDisposalCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let backendDisposalStarted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let releaseBackendDisposal = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let backendDisposalCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let observed = TaskCompletionSource<ConnectionRuntimeMetrics>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let expectedBodyFailure = InvalidOperationException("injected with one direction at rendezvous")
+            let mutable proxyCompletion: Task option = None
+
+            let waitForSignalOrAbort (signal: Task) =
+                task {
+                    let! _ = Task.WhenAny(signal, bodyFailureAbort.Task :> Task)
+
+                    if not signal.IsCompleted then
+                        raise (InvalidOperationException("Registered-failure test coordination was aborted."))
+                }
+
+            let createPipelines (_: ConnectionState) =
+                let clientFailure =
+                    GatedDisposalProcessor(
+                        (fun input _ _ ->
+                            if input.Bytes.IsEmpty then
+                                completed 0L
+                            else
+                                clientActionReady.TrySetResult(()) |> ignore
+
+                                ValueTask<ProcessorResult>(
+                                    task {
+                                        do! waitForSignalOrAbort (backendActionReady.Task :> Task)
+                                        return raise (InvalidOperationException("client direction failed"))
+                                    }
+                                )),
+                        clientDisposalStarted,
+                        releaseClientDisposal,
+                        clientDisposalCompleted
+                    )
+
+                let backendFailure =
+                    GatedDisposalProcessor(
+                        (fun input _ _ ->
+                            if input.Bytes.IsEmpty then
+                                completed 0L
+                            else
+                                backendActionReady.TrySetResult(()) |> ignore
+
+                                ValueTask<ProcessorResult>(
+                                    task {
+                                        do! waitForSignalOrAbort (clientActionReady.Task :> Task)
+                                        do! waitForSignalOrAbort (clientDisposalStarted.Task :> Task)
+                                        return raise (InvalidOperationException("backend direction failed"))
+                                    }
+                                )),
+                        backendDisposalStarted,
+                        releaseBackendDisposal,
+                        backendDisposalCompleted
+                    )
+
+                releaseBackendDisposal.TrySetResult(()) |> ignore
+
+                { ClientToBackend = [| clientFailure :> IByteStreamProcessor |]
+                  BackendToClient = [| backendFailure :> IByteStreamProcessor |] }
+
+            let releaseTestCoordination () =
+                bodyFailureAbort.TrySetResult(()) |> ignore
+                releaseClientDisposal.TrySetResult(()) |> ignore
+                releaseBackendDisposal.TrySetResult(()) |> ignore
+
+            let helper =
                 runWithBoundedObservedProcessorProxyAndLogger
                     createPipelines
                     (ConnectionCapacityLimits(128L, 128L, 64L))
                     (fun value -> observed.TrySetResult(value) |> ignore)
-                    (logger :> ILogger)
+                    NullLogger.Instance
                     { BeforeReceive = ignore
                       AfterReceive = fun _ _ -> ()
                       PendingSend = ignore
                       CapacityAccounting = None }
                     (endpointPort backendListener)
                     timeout.Token
-                    (fun proxy ->
-                        task {
-                            let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
-                            use! client = connect proxy.ListenPort timeout.Token
-                            use! backend = acceptBackend
+                    (withBodyCleanup
+                        releaseTestCoordination
+                        (fun proxy ->
+                            proxyCompletion <- Some proxy.Completion
 
-                            do!
-                                Task.WhenAll(
-                                    client.GetStream().WriteAsync([| 1uy |], timeout.Token).AsTask(),
-                                    backend.GetStream().WriteAsync([| 2uy |], timeout.Token).AsTask()
-                                )
+                            task {
+                                let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                                use! client = connect proxy.ListenPort timeout.Token
+                                use! _backend = acceptBackend
 
-                            do! clientDisposalStarted.Task.WaitAsync(timeout.Token)
-                            do! backendDisposalCompleted.Task.WaitAsync(timeout.Token)
-                            proxy.Completion.IsCompleted |> should equal false
+                                do! client.GetStream().WriteAsync([| 1uy |], timeout.Token).AsTask()
+                                do! clientActionReady.Task.WaitAsync(timeout.Token)
+                                raise expectedBodyFailure
+                            }))
 
-                            releaseClientDisposal.TrySetResult(()) |> ignore
-                            do! clientDisposalCompleted.Task.WaitAsync(timeout.Token)
-                            do! logger.TwoFailures.WaitAsync(timeout.Token)
+            let! helperFailure = runHelperWithFailsafeCleanup releaseTestCoordination helper
 
-                            logger.Failures
-                            |> Array.map _.Message
-                            |> should equal [| "client direction failed"; "backend direction failed" |]
-                        })
+            let aggregate =
+                match helperFailure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate helper failure, got %O." error
+                | None -> failwith "Expected the injected body failure to fail the helper."
 
-            let snapshot = observed.Task.Result.GetSnapshot()
+            aggregate.InnerExceptions
+            |> Seq.exists (fun error -> Object.ReferenceEquals(error, expectedBodyFailure))
+            |> should equal true
+
+            clientActionReady.Task.IsCompletedSuccessfully |> should equal true
+            backendActionReady.Task.IsCompleted |> should equal false
+            bodyFailureAbort.Task.IsCompletedSuccessfully |> should equal true
+            clientDisposalStarted.Task.IsCompletedSuccessfully |> should equal true
+            clientDisposalCompleted.Task.IsCompletedSuccessfully |> should equal true
+            backendDisposalCompleted.Task.IsCompletedSuccessfully |> should equal true
+            proxyCompletion.Value.IsCompleted |> should equal true
+
+            let! accounting = observed.Task.WaitAsync(timeout.Token)
+            let snapshot = accounting.GetSnapshot()
             snapshot.CurrentPhysicalBufferCapacityBytes |> should equal 0L
             snapshot.ClientToBackend.CurrentLogicalBufferedBytes |> should equal 0L
             snapshot.BackendToClient.CurrentLogicalBufferedBytes |> should equal 0L
@@ -4464,8 +5373,9 @@ module TcpForwarderIntegrationTests =
                         createPipelines
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () -> releaseDisposal.TrySetResult(()) |> ignore)
+                            (fun proxy -> task {
                                 let acceptBackend =
                                     backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
 
@@ -4497,7 +5407,7 @@ module TcpForwarderIntegrationTests =
                                 releaseDisposal.TrySetResult(()) |> ignore
                                 do! proxy.Completion.WaitAsync(timeout.Token)
                                 disposalCompleted.Task.IsCompletedSuccessfully |> should equal true
-                            })
+                            }))
             finally
                 releaseDisposal.TrySetResult(()) |> ignore
         }
@@ -4747,8 +5657,9 @@ module TcpForwarderIntegrationTests =
                         createPipelines
                         (endpointPort backendListener)
                         timeout.Token
-                        (fun proxy ->
-                            task {
+                        (withBodyCleanup
+                            (fun () -> releaseSlow.Set())
+                            (fun proxy -> task {
                                 let acceptBackend =
                                     backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
 
@@ -4782,7 +5693,7 @@ module TcpForwarderIntegrationTests =
                                         timeout.Token
 
                                 receivedAtBackend |> should equal fromClient
-                            })
+                            }))
             finally
                 releaseSlow.Set()
         }
