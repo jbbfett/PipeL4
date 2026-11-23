@@ -5375,38 +5375,56 @@ module TcpForwarderIntegrationTests =
                         timeout.Token
                         (withBodyCleanup
                             (fun () -> releaseDisposal.TrySetResult(()) |> ignore)
-                            (fun proxy -> task {
-                                let acceptBackend =
-                                    backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                            (fun proxy ->
+                                task {
+                                    let acceptBackend =
+                                        backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
 
-                                use! client = connect proxy.ListenPort timeout.Token
-                                use! backend = acceptBackend
-                                let clientStream = client.GetStream()
-                                let backendStream = backend.GetStream()
-                                let request = [| 11uy; 12uy |]
-                                do! clientStream.WriteAsync(request, timeout.Token)
-                                let! forwarded = readExactly backendStream request.Length timeout.Token
-                                forwarded |> should equal request
+                                    use! client = connect proxy.ListenPort timeout.Token
+                                    use! backend = acceptBackend
+                                    let clientStream = client.GetStream()
+                                    let backendStream = backend.GetStream()
+                                    let request = [| 11uy; 12uy |]
+                                    do! clientStream.WriteAsync(request, timeout.Token)
+                                    let! forwarded = readExactly backendStream request.Length timeout.Token
+                                    forwarded |> should equal request
 
-                                client.Client.Shutdown(SocketShutdown.Send)
-                                do! expectEndOfStream backendStream timeout.Token
-                                disposalStarted.Task.IsCompleted |> should equal false
+                                    client.Client.Shutdown(SocketShutdown.Send)
+                                    do! expectEndOfStream backendStream timeout.Token
+                                    disposalStarted.Task.IsCompleted |> should equal false
 
-                                let response = [| 13uy; 14uy; 15uy |]
-                                do! backendStream.WriteAsync(response, timeout.Token)
-                                let! returned = readExactly clientStream response.Length timeout.Token
-                                returned |> should equal response
-                                do! reverseObserved.Task.WaitAsync(timeout.Token)
+                                    let response = [| 13uy; 14uy; 15uy |]
+                                    do! backendStream.WriteAsync(response, timeout.Token)
+                                    let! returned = readExactly clientStream response.Length timeout.Token
+                                    returned |> should equal response
+                                    do! reverseObserved.Task.WaitAsync(timeout.Token)
 
-                                backend.Client.Shutdown(SocketShutdown.Send)
-                                do! expectEndOfStream clientStream timeout.Token
-                                do! disposalStarted.Task.WaitAsync(timeout.Token)
+                                    backend.Client.Shutdown(SocketShutdown.Send)
+                                    do! expectEndOfStream clientStream timeout.Token
+                                    do! disposalStarted.Task.WaitAsync(timeout.Token)
+                                    disposalCompleted.Task.IsCompleted |> should equal false
 
-                                proxy.Shutdown.Cancel()
-                                proxy.Completion.IsCompleted |> should equal false
-                                releaseDisposal.TrySetResult(()) |> ignore
-                                do! proxy.Completion.WaitAsync(timeout.Token)
-                                disposalCompleted.Task.IsCompletedSuccessfully |> should equal true
+                                    proxy.Shutdown.Cancel()
+                                    proxy.Completion.IsCompleted |> should equal false
+
+                                    // This observes the listener task that joins active connection
+                                    // tasks. It must remain pending while state disposal is gated.
+                                    use completionObservation = new CancellationTokenSource(1_000: int)
+                                    let mutable forwarderCompletedBeforeRelease = false
+
+                                    try
+                                        do! proxy.Completion.WaitAsync(completionObservation.Token)
+                                        forwarderCompletedBeforeRelease <- true
+                                    with
+                                    | :? OperationCanceledException
+                                        when completionObservation.IsCancellationRequested ->
+                                        ()
+
+                                    forwarderCompletedBeforeRelease |> should equal false
+                                    releaseDisposal.TrySetResult(()) |> ignore
+                                    do! disposalCompleted.Task.WaitAsync(timeout.Token)
+                                    do! proxy.Completion.WaitAsync(timeout.Token)
+                                    disposalCompleted.Task.IsCompletedSuccessfully |> should equal true
                             }))
             finally
                 releaseDisposal.TrySetResult(()) |> ignore
