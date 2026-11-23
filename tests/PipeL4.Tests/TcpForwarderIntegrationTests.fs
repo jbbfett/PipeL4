@@ -29,6 +29,12 @@ module TcpForwarderIntegrationTests =
           Shutdown: CancellationTokenSource
           Completion: Task }
 
+    [<NoEquality; NoComparison>]
+    type private ForwarderAttemptResult =
+        { Failures: (string * exn) array
+          StartupFailure: exn option
+          BodyEntered: bool }
+
     type private SignalingAsyncDisposable
         (
             disposed: TaskCompletionSource<unit>,
@@ -310,7 +316,7 @@ module TcpForwarderIntegrationTests =
                 ()
         }
 
-    let private runWithForwarderAndArgumentsOnPort
+    let private runForwarderAttemptOnPort
         listenPort
         startForwarder
         backendPort
@@ -325,18 +331,21 @@ module TcpForwarderIntegrationTests =
             use proxyShutdown =
                 CancellationTokenSource.CreateLinkedTokenSource testCancellationToken
 
-            let proxyEndpoint = IPEndPoint(loopback, listenPort).ToString()
             let failures = ResizeArray<string * exn>()
             let mutable proxyTask: Task option = None
             let mutable forwarderFailureObserved = false
+            let mutable startupFailure: exn option = None
+            let mutable bodyEntered = false
 
             let recordFailure role error =
                 failures.Add((role, error))
 
             try
+                testCancellationToken.ThrowIfCancellationRequested()
                 proxyTask <- Some(startForwarder configuration proxyShutdown.Token :> Task)
             with error ->
                 recordFailure "forwarder startup" error
+                startupFailure <- Some error
                 forwarderFailureObserved <- true
 
             // A listener bind failure can be complete before the first body
@@ -349,6 +358,7 @@ module TcpForwarderIntegrationTests =
                         do! task
                     with error ->
                         recordFailure "forwarder startup" error
+                        startupFailure <- Some error
                         forwarderFailureObserved <- true
                 | _ -> ()
 
@@ -359,6 +369,7 @@ module TcpForwarderIntegrationTests =
 
             if not forwarderFailureObserved then
                 try
+                    bodyEntered <- true
                     do! body proxy
                 with error ->
                     recordFailure "body" error
@@ -400,17 +411,153 @@ module TcpForwarderIntegrationTests =
                         recordFailure "forwarder" error
             | None -> ()
 
-            if failures.Count > 0 then
-                let failureKinds = failures |> Seq.map fst |> String.concat " and "
-                let causes = failures |> Seq.map snd |> Seq.toArray
+            return
+                { Failures = failures.ToArray()
+                  StartupFailure = startupFailure
+                  BodyEntered = bodyEntered }
+        }
 
-                return
-                    raise (
-                        AggregateException(
-                            $"TCP integration failed for proxy listener {proxyEndpoint}: {failureKinds}.",
-                            causes
-                        )
-                    )
+    let private raiseAttemptFailures attempts =
+        let attemptArray = attempts |> Seq.toArray
+        let causes =
+            attemptArray
+            |> Array.collect (fun (_, attempt) -> attempt.Failures |> Array.map snd)
+
+        if attemptArray.Length = 1 then
+            let listenPort, attempt = attemptArray[0]
+            let failureKinds = attempt.Failures |> Array.map fst |> String.concat " and "
+
+            raise (
+                AggregateException(
+                    $"TCP integration failed for proxy listener {IPEndPoint(loopback, listenPort)}: {failureKinds}.",
+                    causes
+                )
+            )
+        else
+            let endpoints =
+                attemptArray
+                |> Array.map (fun (listenPort, attempt) ->
+                    let failureKinds = attempt.Failures |> Array.map fst |> String.concat " and "
+                    $"{IPEndPoint(loopback, listenPort)} ({failureKinds})")
+                |> String.concat "; "
+
+            raise (
+                AggregateException(
+                    $"TCP integration could not start after {attemptArray.Length} automatic listener attempts: {endpoints}.",
+                    causes
+                )
+            )
+
+    let private runWithForwarderAndArgumentsOnPort
+        listenPort
+        startForwarder
+        backendPort
+        extraArguments
+        (testCancellationToken: CancellationToken)
+        (body: ProxyContext -> Task<unit>)
+        =
+        task {
+            let! attempt =
+                runForwarderAttemptOnPort
+                    listenPort
+                    startForwarder
+                    backendPort
+                    extraArguments
+                    testCancellationToken
+                    body
+
+            if attempt.Failures.Length > 0 then
+                return raiseAttemptFailures [ listenPort, attempt ]
+        }
+
+    let private maximumAutomaticPortStartupAttempts = 3
+
+    let private reportTestDiagnostic (message: string) =
+        TestContext.Current.SendDiagnosticMessage(message)
+
+    let private runWithForwarderAndArgumentsUsingPorts
+        selectPort
+        reportDiagnostic
+        afterAttemptCleanup
+        startForwarder
+        backendPort
+        extraArguments
+        (testCancellationToken: CancellationToken)
+        (body: ProxyContext -> Task<unit>)
+        =
+        task {
+            let attempts = ResizeArray<int * ForwarderAttemptResult>()
+            let retryDiagnostics = ResizeArray<int * exn>()
+            let mutable attemptNumber = 1
+            let mutable finished = false
+
+            while not finished do
+                let listenPort = selectPort attemptNumber
+
+                let! attempt =
+                    runForwarderAttemptOnPort
+                        listenPort
+                        startForwarder
+                        backendPort
+                        extraArguments
+                        testCancellationToken
+                        body
+
+                // The per-attempt helper returns only after cancellation, forwarder
+                // completion, and linked cancellation-source disposal have finished.
+                afterAttemptCleanup attemptNumber
+                attempts.Add((listenPort, attempt))
+
+                if attempt.Failures.Length = 0 then
+                    finished <- true
+
+                    for failedAttempt, failure in retryDiagnostics do
+                        let failureDetails =
+                            match failure with
+                            | :? SocketException as socketFailure ->
+                                $"SocketErrorCode={socketFailure.SocketErrorCode}; {socketFailure}"
+                            | _ -> failure.ToString()
+
+                        reportDiagnostic
+                            $"Automatic TCP proxy listener {IPEndPoint(loopback, failedAttempt)} collided during startup; a later attempt succeeded. Startup exception: {failureDetails}"
+                else
+                    let soleFailure = attempt.Failures[0]
+
+                    let isSoleAutomaticBindConflict =
+                        attempt.Failures.Length = 1
+                        && fst soleFailure = "forwarder startup"
+                        && not attempt.BodyEntered
+                        && (match attempt.StartupFailure with
+                            | Some (:? SocketException as error) ->
+                                error.SocketErrorCode = SocketError.AddressAlreadyInUse
+                            | _ -> false)
+
+                    if isSoleAutomaticBindConflict then
+                        if testCancellationToken.IsCancellationRequested then
+                            let cancellation =
+                                OperationCanceledException(
+                                    "The TCP integration operation was canceled before its next automatic-port attempt.",
+                                    testCancellationToken
+                                )
+
+                            let updated =
+                                { attempt with
+                                    Failures = Array.append attempt.Failures [| "operation cancellation", cancellation |] }
+
+                            attempts[attempts.Count - 1] <- (listenPort, updated)
+                            finished <- true
+                        elif attemptNumber >= maximumAutomaticPortStartupAttempts then
+                            finished <- true
+                        else
+                            retryDiagnostics.Add((listenPort, Option.get attempt.StartupFailure))
+                            attemptNumber <- attemptNumber + 1
+                    else
+                        finished <- true
+
+            let finalAttempt = attempts[attempts.Count - 1] |> snd
+
+            if finalAttempt.Failures.Length > 0 then
+                return raiseAttemptFailures attempts
         }
 
     let private runWithForwarderAndArguments
@@ -420,8 +567,10 @@ module TcpForwarderIntegrationTests =
         (testCancellationToken: CancellationToken)
         (body: ProxyContext -> Task<unit>)
         =
-        runWithForwarderAndArgumentsOnPort
-            (reservePort ())
+        runWithForwarderAndArgumentsUsingPorts
+            (fun _ -> reservePort ())
+            reportTestDiagnostic
+            ignore
             startForwarder
             backendPort
             extraArguments
@@ -703,6 +852,374 @@ module TcpForwarderIntegrationTests =
         }
 
     [<Fact>]
+    let ``automatic listener startup retries one bind collision after complete attempt cleanup`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let candidatePorts = [| 41001; 41002 |]
+            let events = ResizeArray<string>()
+            let diagnostics = ResizeArray<string>()
+            let bodyEntered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let bindFailure = SocketException(int SocketError.AddressAlreadyInUse)
+            let mutable startCount = 0
+            let mutable bodyCount = 0
+            let mutable firstToken = CancellationToken.None
+            let mutable firstForwarderTask: Task option = None
+            let mutable secondToken = CancellationToken.None
+
+            let selectPort attemptNumber =
+                if attemptNumber = 2 then
+                    events.Add("selected candidate 2")
+
+                candidatePorts[attemptNumber - 1]
+
+            let startForwarder _ cancellationToken =
+                startCount <- startCount + 1
+
+                if startCount = 1 then
+                    firstToken <- cancellationToken
+                    let failed = Task.FromException(bindFailure)
+                    firstForwarderTask <- Some failed
+                    failed
+                else
+                    secondToken <- cancellationToken
+                    events.Add("started candidate 2")
+                    Object.Equals(firstToken, secondToken) |> should equal false
+                    Task.CompletedTask
+
+            do!
+                runWithForwarderAndArgumentsUsingPorts
+                    selectPort
+                    diagnostics.Add
+                    (fun attemptNumber ->
+                        if attemptNumber = 1 then
+                            events.Add("attempt 1 cleanup complete")
+                            firstForwarderTask.Value.IsCompleted |> should equal true
+                            firstToken.IsCancellationRequested |> should equal true)
+                    startForwarder
+                    (reservePort ())
+                    Array.empty
+                    timeout.Token
+                    (fun proxy ->
+                        bodyCount <- bodyCount + 1
+                        proxy.ListenPort |> should equal candidatePorts[1]
+                        bodyEntered.TrySetResult(()) |> should equal true
+                        Task.FromResult(()))
+
+            do! bodyEntered.Task.WaitAsync(timeout.Token)
+            startCount |> should equal 2
+            bodyCount |> should equal 1
+            events.ToArray()
+            |> should equal [| "attempt 1 cleanup complete"; "selected candidate 2"; "started candidate 2" |]
+            diagnostics.Count |> should equal 1
+            diagnostics[0].Contains("127.0.0.1:41001") |> should equal true
+            diagnostics[0].Contains("AddressAlreadyInUse") |> should equal true
+        }
+
+    [<Fact>]
+    let ``automatic listener startup exhaustion retains every endpoint and bind cause`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let candidatePorts = [| 41101; 41102; 41103 |]
+            let failures =
+                Array.init candidatePorts.Length (fun _ -> SocketException(int SocketError.AddressAlreadyInUse))
+
+            let mutable startCount = 0
+            let mutable bodyCount = 0
+
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsUsingPorts
+                        (fun attemptNumber -> candidatePorts[attemptNumber - 1])
+                        ignore
+                        ignore
+                        (fun _ _ ->
+                            let error = failures[startCount]
+                            startCount <- startCount + 1
+                            Task.FromException(error))
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun _ ->
+                            bodyCount <- bodyCount + 1
+                            Task.FromResult(()))
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate startup failure, got %O." error
+                | None -> failwith "Expected all automatic listener attempts to fail."
+
+            startCount |> should equal 3
+            bodyCount |> should equal 0
+            aggregate.InnerExceptions.Count |> should equal 3
+
+            for port in candidatePorts do
+                aggregate.Message.Contains($"127.0.0.1:{port}") |> should equal true
+
+            for index in 0 .. failures.Length - 1 do
+                Object.ReferenceEquals(aggregate.InnerExceptions[index], failures[index])
+                |> should equal true
+        }
+
+    [<Fact>]
+    let ``automatic listener startup does not retry a non-bind failure`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let expectedFailure = InvalidOperationException("injected non-bind startup failure")
+            let mutable startCount = 0
+            let mutable bodyCount = 0
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsUsingPorts
+                        (fun attemptNumber -> 41200 + attemptNumber)
+                        ignore
+                        ignore
+                        (fun _ _ ->
+                            startCount <- startCount + 1
+                            Task.FromException(expectedFailure))
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun _ ->
+                            bodyCount <- bodyCount + 1
+                            Task.FromResult(()))
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate startup failure, got %O." error
+                | None -> failwith "Expected the startup failure to remain terminal."
+
+            startCount |> should equal 1
+            bodyCount |> should equal 0
+            Object.ReferenceEquals(aggregate.InnerExceptions[0], expectedFailure) |> should equal true
+        }
+
+    [<Fact>]
+    let ``automatic listener startup does not retry a body bind exception`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let expectedFailure = SocketException(int SocketError.AddressAlreadyInUse)
+            let mutable startCount = 0
+            let mutable bodyCount = 0
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsUsingPorts
+                        (fun attemptNumber -> 41300 + attemptNumber)
+                        ignore
+                        ignore
+                        (fun _ _ ->
+                            startCount <- startCount + 1
+                            Task.CompletedTask)
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun _ ->
+                            bodyCount <- bodyCount + 1
+                            Task.FromException<unit>(expectedFailure))
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate body failure, got %O." error
+                | None -> failwith "Expected the body failure to remain terminal."
+
+            startCount |> should equal 1
+            bodyCount |> should equal 1
+            Object.ReferenceEquals(aggregate.InnerExceptions[0], expectedFailure) |> should equal true
+        }
+
+    [<Fact>]
+    let ``automatic listener startup does not retry a bind conflict with cleanup failure`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let bindFailure = SocketException(int SocketError.AddressAlreadyInUse)
+            let cleanupFailure = InvalidOperationException("injected shutdown cleanup failure")
+            let mutable startCount = 0
+            let mutable bodyCount = 0
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsUsingPorts
+                        (fun attemptNumber -> 41400 + attemptNumber)
+                        ignore
+                        ignore
+                        (fun _ cancellationToken ->
+                            startCount <- startCount + 1
+                            cancellationToken.Register(fun () -> raise cleanupFailure) |> ignore
+                            Task.FromException(bindFailure))
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun _ ->
+                            bodyCount <- bodyCount + 1
+                            Task.FromResult(()))
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate startup and cleanup failure, got %O." error
+                | None -> failwith "Expected startup and cleanup failures to remain terminal."
+
+            startCount |> should equal 1
+            bodyCount |> should equal 0
+            let causes = aggregate.Flatten().InnerExceptions
+            causes |> Seq.exists (fun error -> Object.ReferenceEquals(error, bindFailure)) |> should equal true
+            causes |> Seq.exists (fun error -> Object.ReferenceEquals(error, cleanupFailure)) |> should equal true
+        }
+
+    [<Fact>]
+    let ``automatic listener startup stops retrying when canceled between attempts`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let bindFailure = SocketException(int SocketError.AddressAlreadyInUse)
+            let mutable startCount = 0
+            let mutable bodyCount = 0
+            let mutable failure: exn option = None
+
+            try
+                do!
+                    runWithForwarderAndArgumentsUsingPorts
+                        (fun attemptNumber -> 41500 + attemptNumber)
+                        ignore
+                        (fun attemptNumber ->
+                            if attemptNumber = 1 then
+                                timeout.Cancel())
+                        (fun _ _ ->
+                            startCount <- startCount + 1
+                            Task.FromException(bindFailure))
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun _ ->
+                            bodyCount <- bodyCount + 1
+                            Task.FromResult(()))
+            with error ->
+                failure <- Some error
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate cancellation failure, got %O." error
+                | None -> failwith "Expected cancellation to stop automatic-port retry."
+
+            startCount |> should equal 1
+            bodyCount |> should equal 0
+            aggregate.InnerExceptions
+            |> Seq.exists (function
+                | :? OperationCanceledException as error -> error.CancellationToken = timeout.Token
+                | _ -> false)
+            |> should equal true
+            Object.ReferenceEquals(aggregate.InnerExceptions[0], bindFailure) |> should equal true
+        }
+
+    [<Fact>]
+    let ``automatic listener startup observes cancellation during candidate selection before starting forwarder`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            let candidatePorts = [| 41601; 41602 |]
+            let events = ResizeArray<string>()
+            let bindFailure = SocketException(int SocketError.AddressAlreadyInUse)
+            let mutable startCount = 0
+            let mutable bodyCount = 0
+            let mutable firstToken = CancellationToken.None
+            let mutable firstForwarderTask: Task option = None
+            let mutable firstAttemptCleanedUp = false
+            let mutable secondAttemptCleanedUp = false
+            let mutable helperSucceeded = false
+            let mutable failure: exn option = None
+
+            let selectPort attemptNumber =
+                if attemptNumber = 2 then
+                    firstAttemptCleanedUp |> should equal true
+                    events.Add("canceled during candidate 2 selection")
+                    timeout.Cancel()
+
+                candidatePorts[attemptNumber - 1]
+
+            let startForwarder _ cancellationToken =
+                startCount <- startCount + 1
+
+                if startCount = 1 then
+                    firstToken <- cancellationToken
+                    let failed = Task.FromException(bindFailure)
+                    firstForwarderTask <- Some failed
+                    failed
+                else
+                    Task.CompletedTask
+
+            try
+                do!
+                    runWithForwarderAndArgumentsUsingPorts
+                        selectPort
+                        ignore
+                        (fun attemptNumber ->
+                            if attemptNumber = 1 then
+                                firstAttemptCleanedUp <- true
+                                events.Add("attempt 1 cleanup complete")
+                                firstForwarderTask.Value.IsCompleted |> should equal true
+                                firstToken.IsCancellationRequested |> should equal true
+                            elif attemptNumber = 2 then
+                                secondAttemptCleanedUp <- true
+                                events.Add("attempt 2 cleanup complete"))
+                        startForwarder
+                        (reservePort ())
+                        Array.empty
+                        timeout.Token
+                        (fun _ ->
+                            bodyCount <- bodyCount + 1
+                            Task.FromResult(()))
+
+                helperSucceeded <- true
+            with error ->
+                failure <- Some error
+
+            startCount |> should equal 1
+            bodyCount |> should equal 0
+            helperSucceeded |> should equal false
+            firstAttemptCleanedUp |> should equal true
+            secondAttemptCleanedUp |> should equal true
+            firstForwarderTask.Value.IsCompleted |> should equal true
+            firstToken.IsCancellationRequested |> should equal true
+            events.ToArray()
+            |> should equal
+                [| "attempt 1 cleanup complete"
+                   "canceled during candidate 2 selection"
+                   "attempt 2 cleanup complete" |]
+
+            let aggregate =
+                match failure with
+                | Some (:? AggregateException as error) -> error
+                | Some error -> failwithf "Expected an aggregate cancellation failure, got %O." error
+                | None -> failwith "Expected cancellation during selection to stop startup."
+
+            aggregate.Message.Contains("127.0.0.1:41601") |> should equal true
+            aggregate.Message.Contains("127.0.0.1:41602") |> should equal true
+            aggregate.InnerExceptions.Count |> should equal 2
+            Object.ReferenceEquals(aggregate.InnerExceptions[0], bindFailure) |> should equal true
+
+            match aggregate.InnerExceptions[1] with
+            | :? OperationCanceledException as error ->
+                error.CancellationToken |> should equal timeout.Token
+            | error -> failwithf "Expected cancellation from startup guard, got %O." error
+        }
+
+    [<Fact>]
     let ``forwarder helper reports a deterministic listener bind conflict`` () =
         task {
             use timeout = new CancellationTokenSource(10_000: int)
@@ -711,10 +1228,12 @@ module TcpForwarderIntegrationTests =
 
             let listenPort = endpointPort occupiedListener
             let mutable bodyExecuted = false
+            let mutable startCount = 0
             let mutable forwarderTask: Task option = None
             let mutable shutdownToken = CancellationToken.None
 
             let startForwarder configuration cancellationToken =
+                startCount <- startCount + 1
                 shutdownToken <- cancellationToken
 
                 let started =
@@ -747,6 +1266,7 @@ module TcpForwarderIntegrationTests =
 
             aggregate.Message.Contains($"127.0.0.1:{listenPort}") |> should equal true
             bodyExecuted |> should equal false
+            startCount |> should equal 1
 
             let bindFailure =
                 aggregate.InnerExceptions
