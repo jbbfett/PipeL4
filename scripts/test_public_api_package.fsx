@@ -146,21 +146,24 @@ let private verifyMinimumReference output assetsPath =
         fail "Validator's actual minimum-version Fsc reference differs from the signed NuGet.org FSharp.Core 10.0.100 asset."
     printfn "PASS actual minimum-version Fsc reference %s has official SHA-256 %s." assetPath expectedHash
 
-let private makeVersionedFSharpCorePackage sourcePath targetPath version =
-    use input = ZipFile.OpenRead sourcePath
+let private makeFSharpCorePayloadPackage templatePath targetPath payloadPackagePath payloadAsset targetAssets =
+    // Package layouts can differ: use each consumer's resolved asset, never a
+    // destination path as a lookup in the package supplying replacement bytes.
+    use input = ZipFile.OpenRead templatePath
+    use payload = ZipFile.OpenRead payloadPackagePath
+    let replacement =
+        payload.GetEntry(payloadAsset)
+        |> Option.ofObj
+        |> Option.defaultWith (fun () -> fail $"Package asset is missing: {payloadAsset}")
+    for assetPath in targetAssets do
+        if isNull (input.GetEntry assetPath) then fail $"Package asset is missing: {assetPath}"
+    let targetAssets = Set.ofList targetAssets
     use output = new ZipArchive(new FileStream(targetPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None), ZipArchiveMode.Create)
     for entry in input.Entries do
         let target = output.CreateEntry(entry.FullName, CompressionLevel.Optimal)
         use targetStream = target.Open()
-        if entry.FullName.EndsWith(".nuspec", StringComparison.OrdinalIgnoreCase) then
-            use sourceStream = entry.Open()
-            let document = XDocument.Load sourceStream
-            let versionElement = document.Descendants() |> Seq.find (fun element -> element.Name.LocalName = "version")
-            versionElement.Value <- version
-            document.Save(targetStream, SaveOptions.DisableFormatting)
-        else
-            use sourceStream = entry.Open()
-            sourceStream.CopyTo targetStream
+        use sourceStream = (if targetAssets.Contains entry.FullName then replacement else entry).Open()
+        sourceStream.CopyTo targetStream
 
 let private extractPackageEntry (packagePath: string) (entryPath: string) (targetPath: string) =
     use archive = ZipFile.OpenRead packagePath
@@ -169,22 +172,6 @@ let private extractPackageEntry (packagePath: string) (entryPath: string) (targe
     use source = entry.Open()
     use target = File.Create targetPath
     source.CopyTo target
-
-let private makePoisonedMinimumFSharpCorePackage canonicalPath sdkPackPath targetPath =
-    use canonical = ZipFile.OpenRead canonicalPath
-    use sdkPack = ZipFile.OpenRead sdkPackPath
-    use output = new ZipArchive(new FileStream(targetPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None), ZipArchiveMode.Create)
-    let poisonedAssets = set [ "lib/netstandard2.0/FSharp.Core.dll"; "lib/netstandard2.1/FSharp.Core.dll" ]
-    for entry in canonical.Entries do
-        let target = output.CreateEntry(entry.FullName, CompressionLevel.Optimal)
-        use targetStream = target.Open()
-        if poisonedAssets.Contains entry.FullName then
-            let replacement = sdkPack.GetEntry(entry.FullName) |> Option.ofObj |> Option.defaultWith (fun () -> fail $"SDK pack is missing '{entry.FullName}'.")
-            use replacementStream = replacement.Open()
-            replacementStream.CopyTo targetStream
-        else
-            use sourceStream = entry.Open()
-            sourceStream.CopyTo targetStream
 
 let private check label predicate (exitCode: int, diagnostics: string) =
     if not (predicate exitCode diagnostics) then
@@ -292,7 +279,84 @@ let private fixturePackage directory (id: string) (version: string) (dependency:
     XElement(ns + "package", metadata).Save stream
     path
 
+let private testFSharpCoreFixtures () =
+    let directory = Path.Combine(root, "fsharp-core-layouts")
+    Directory.CreateDirectory directory |> ignore
+    let netstandard20 = "lib/netstandard2.0/FSharp.Core.dll"
+    let netstandard21 = "lib/netstandard2.1/FSharp.Core.dll"
+    let net10 = "lib/net10.0/FSharp.Core.dll"
+    let makeLayout version assetPaths selectedAssets =
+        let packagePath = fixturePackage directory "FSharp.Core" version None
+        do
+            use archive = ZipFile.Open(packagePath, ZipArchiveMode.Update)
+            for assetPath in "unchanged.txt" :: assetPaths do
+                use writer = new StreamWriter(archive.CreateEntry(assetPath).Open())
+                writer.Write(version + ":" + assetPath)
+        let assetsPath = Path.Combine(directory, version + ".assets.json")
+        let compile = selectedAssets |> List.map (fun path -> path, {| |}) |> dict
+        let targets = dict [ "net10.0", dict [ "FSharp.Core/" + version, {| compile = compile |} ] ]
+        File.WriteAllText(assetsPath, JsonSerializer.Serialize({| targets = targets |}))
+        packagePath, assetsPath
+    let reject label expected action =
+        let diagnostic =
+            try action (); None
+            with :? InvalidOperationException as error -> Some error.Message
+        if diagnostic <> Some expected then fail $"{label}: expected '{expected}', got {diagnostic}."
+        printfn "PASS %s" label
+    let verifyMutation template mutated payloadHash targetAssets =
+        if packageNuspecIdentity mutated <> packageNuspecIdentity template then fail "Payload fixture changed package identity."
+        use original = ZipFile.OpenRead template
+        use changed = ZipFile.OpenRead mutated
+        let names (archive: ZipArchive) = archive.Entries |> Seq.map (fun entry -> entry.FullName) |> Set.ofSeq
+        if names original <> names changed then fail "Payload fixture changed the package layout."
+        for entry in original.Entries do
+            let originalHash = packageEntryHash template entry.FullName
+            let mutatedHash = packageEntryHash mutated entry.FullName
+            if List.contains entry.FullName targetAssets then
+                if mutatedHash <> payloadHash || mutatedHash = originalHash then
+                    fail $"Payload fixture did not mutate intended asset '{entry.FullName}'."
+            elif mutatedHash <> originalHash then
+                fail $"Payload fixture changed unrelated entry '{entry.FullName}'."
+    let minimum, minimumAssets = makeLayout "10.0.100" [ netstandard20; netstandard21 ] [ netstandard21 ]
+    let minimumAsset = fsharpCoreCompileAsset minimumAssets "10.0.100"
+    if minimumAsset <> netstandard21 then fail "Minimum layout selected the wrong compile asset."
+    let minimumHash = packageEntryHash minimum minimumAsset
+    for label, version, assetPaths, expectedAsset in
+        [ "sdk-10.0.115", "10.0.115", [ netstandard20; netstandard21 ], netstandard21
+          // Only the reported selected asset is needed; disjoint paths catch both
+          // directions of the erroneous cross-package lookup without this SDK.
+          "sdk-10.0.404", "10.1.404", [ net10 ], net10 ] do
+        let sdk, assets = makeLayout version assetPaths [ expectedAsset ]
+        let sdkAsset = fsharpCoreCompileAsset assets version
+        if sdkAsset <> expectedAsset then fail $"{label} selected the wrong compile asset."
+        let sdkHash = packageEntryHash sdk sdkAsset
+        let wrongDefault = Path.Combine(directory, label + "-wrong-default.nupkg")
+        makeFSharpCorePayloadPackage sdk wrongDefault minimum minimumAsset [ sdkAsset ]
+        verifyMutation sdk wrongDefault minimumHash [ sdkAsset ]
+        let poisonMinimum = Path.Combine(directory, label + "-poison-minimum.nupkg")
+        makeFSharpCorePayloadPackage minimum poisonMinimum sdk sdkAsset [ netstandard20; netstandard21 ]
+        verifyMutation minimum poisonMinimum sdkHash [ netstandard20; netstandard21 ]
+        printfn "PASS %s resolved layout and both exact-asset payload mutations." label
+    let missing = "lib/missing/FSharp.Core.dll"
+    let target = Path.Combine(directory, "must-not-be-created.nupkg")
+    reject "missing payload asset cannot fall back to another DLL" $"Package asset is missing: {missing}" (fun () ->
+        makeFSharpCorePayloadPackage minimum target minimum missing [ minimumAsset ])
+    reject "missing destination asset cannot fall back to another DLL" $"Package asset is missing: {net10}" (fun () ->
+        makeFSharpCorePayloadPackage minimum target minimum minimumAsset [ net10 ])
+    if File.Exists target then fail "Invalid asset selection created a payload fixture."
+    let _, noCompileAssets = makeLayout "0.0.1" [ netstandard21 ] []
+    reject "missing compile asset rejected" "Expected one FSharp.Core compile asset, found 0." (fun () ->
+        fsharpCoreCompileAsset noCompileAssets "0.0.1" |> ignore)
+    let _, duplicateCompileAssets = makeLayout "0.0.2" [ netstandard20; netstandard21 ] [ netstandard20; netstandard21 ]
+    reject "ambiguous compile assets rejected" "Expected one FSharp.Core compile asset, found 2." (fun () ->
+        fsharpCoreCompileAsset duplicateCompileAssets "0.0.2" |> ignore)
+    let _, missingCompileAsset = makeLayout "0.0.3" [ netstandard21 ] [ missing ]
+    reject "restore-selected asset must exist in its package" $"Package asset is missing: {missing}" (fun () ->
+        let selected = fsharpCoreCompileAsset missingCompileAsset "0.0.3"
+        makeFSharpCorePayloadPackage minimum target minimum selected [ minimumAsset ])
+
 let private run packagePath =
+    testFSharpCoreFixtures ()
     Directory.CreateDirectory root |> ignore
     let accepted code (output: string) = code = 0 && output.Contains("SDK-default and minimum-version F# consumers compiled.", StringComparison.Ordinal)
     let directory, environment = policyFiles "preserved-policy" [||]
@@ -355,10 +419,12 @@ let private run packagePath =
         |> Seq.find (fun library -> library.Name.StartsWith("FSharp.Core/", StringComparison.Ordinal))
         |> fun library -> library.Name.Substring("FSharp.Core/".Length)
     let sdkDefaultAsset = fsharpCoreCompileAsset sdkAssets sdkDefaultVersion
+    let sdkDefaultPackage = Path.Combine(sdkPath, "FSharp", "library-packs", $"FSharp.Core.{sdkDefaultVersion}.nupkg")
     verifySdkReference (snd result) sdkPath sdkDefaultAsset sdkDefaultVersion
     let minimumAssets = Path.Combine(directory, "assets-10.0.100.json")
     if not (File.Exists minimumAssets) then fail "Minimum-version consumer assets were not captured."
     verifyMinimumReference (snd result) minimumAssets
+    let minimumAsset = fsharpCoreCompileAsset minimumAssets "10.0.100"
     let dllFiles = Directory.GetFiles(directory, "api-*.dll")
     if dllFiles.Length <> 2 then fail "Expected resolved DLL evidence from both consumers."
     for dllPath in dllFiles do
@@ -393,13 +459,14 @@ let private run packagePath =
         let defaultCacheDirectory = Path.Combine(fallbackCache, "fsharp.core", sdkDefaultVersion)
         Directory.CreateDirectory defaultCacheDirectory |> ignore
         let incorrectPayload = Path.Combine(defaultCacheDirectory, $"fsharp.core.{sdkDefaultVersion}.nupkg")
-        makeVersionedFSharpCorePackage minimumPackage incorrectPayload sdkDefaultVersion
+        makeFSharpCorePayloadPackage sdkDefaultPackage incorrectPayload minimumPackage minimumAsset [ sdkDefaultAsset ]
         let incorrectId, incorrectVersion = packageNuspecIdentity incorrectPayload
         if incorrectId <> "FSharp.Core" || incorrectVersion <> sdkDefaultVersion then
             fail $"Wrong-payload negative control has unexpected nuspec identity {incorrectId} {incorrectVersion}."
         let incorrectHash = packageEntryHash incorrectPayload sdkDefaultAsset
-        let expectedHash = packageEntryHash (Path.Combine(sdkPath, "FSharp", "library-packs", $"FSharp.Core.{sdkDefaultVersion}.nupkg")) sdkDefaultAsset
-        if String.Equals(incorrectHash, expectedHash, StringComparison.Ordinal) then
+        let expectedHash = packageEntryHash sdkDefaultPackage sdkDefaultAsset
+        if incorrectHash <> packageEntryHash minimumPackage minimumAsset
+           || String.Equals(incorrectHash, expectedHash, StringComparison.Ordinal) then
             fail "The wrong-payload negative control did not contain different FSharp.Core DLL bytes."
         printfn "Constructed wrong-payload control: FSharp.Core %s metadata with 10.0.100 DLL payload (%s)." sdkDefaultVersion incorrectHash
     let fallbackResult = runValidator packagePath [ "NUGET_PACKAGES", fallbackCache ]
@@ -414,27 +481,27 @@ let private run packagePath =
     verifyMinimumReference fallbackDiagnostics minimumAssets
     printfn "PASS wrong-version metadata cannot make an incorrect FSharp.Core DLL payload pass SDK-default validation."
 
-    let sdkDefaultPackage = Path.Combine(sdkPath, "FSharp", "library-packs", $"FSharp.Core.{sdkDefaultVersion}.nupkg")
     let minimumPoisonCache = Path.Combine(root, "minimum-poison-cache")
     let minimumPoisonPackage = Path.Combine(minimumPoisonCache, "fsharp.core", "10.0.100", "fsharp.core.10.0.100.nupkg")
     Directory.CreateDirectory(Path.GetDirectoryName minimumPoisonPackage) |> ignore
-    makePoisonedMinimumFSharpCorePackage minimumPackage sdkDefaultPackage minimumPoisonPackage
+    let minimumPoisonAssets = [ "lib/netstandard2.0/FSharp.Core.dll"; "lib/netstandard2.1/FSharp.Core.dll" ]
+    makeFSharpCorePayloadPackage minimumPackage minimumPoisonPackage sdkDefaultPackage sdkDefaultAsset minimumPoisonAssets
     let poisonId, poisonVersion = packageNuspecIdentity minimumPoisonPackage
     if poisonId <> "FSharp.Core" || poisonVersion <> "10.0.100" then
         fail $"Minimum poison control changed package identity to {poisonId} {poisonVersion}."
-    for assetPath in [ "lib/netstandard2.0/FSharp.Core.dll"; "lib/netstandard2.1/FSharp.Core.dll" ] do
+    for assetPath in minimumPoisonAssets do
         let poisonedHash = packageEntryHash minimumPoisonPackage assetPath
-        let sdkHash = packageEntryHash sdkDefaultPackage assetPath
+        let sdkHash = packageEntryHash sdkDefaultPackage sdkDefaultAsset
         if not (String.Equals(poisonedHash, sdkHash, StringComparison.Ordinal))
            || String.Equals(poisonedHash, expectedFSharpCore100AssetHash assetPath, StringComparison.Ordinal) then
-            fail $"Minimum poison control did not substitute the FSharp.Core 10.0.115 payload at '{assetPath}'."
+            fail $"Minimum poison control did not substitute the FSharp.Core {sdkDefaultVersion} payload at '{assetPath}'."
     let minimumPoisonCode, minimumPoisonOutput = runValidator packagePath [ "NUGET_PACKAGES", minimumPoisonCache ]
     if minimumPoisonCode = 0
        || not (minimumPoisonOutput.Contains("Consumer scenario requires FSharp.Core 10.0.100.", StringComparison.Ordinal))
        || not (minimumPoisonOutput.Contains("FSharp.Core 10.0.100 package SHA-512 does not match the trusted NuGet.org package fingerprint", StringComparison.Ordinal))
        || not (minimumPoisonOutput.Contains("Verified actual Fsc reference", StringComparison.Ordinal)) then
         fail $"The production validator did not reject the identity-preserving minimum DLL substitution at the package-integrity check: {minimumPoisonOutput}"
-    printfn "PASS production validator rejected FSharp.Core 10.0.100 metadata carrying 10.0.115 DLL payloads."
+    printfn "PASS production validator rejected FSharp.Core 10.0.100 metadata carrying %s DLL payloads." sdkDefaultVersion
 
     let substitutionEvidence = Path.Combine(root, "fsc-reference-substitution-evidence")
     Directory.CreateDirectory substitutionEvidence |> ignore
@@ -818,8 +885,9 @@ let exitStatus =
     try
         try
             match fsi.CommandLineArgs |> Array.skip 1 with
+            | [| "--test-fsharp-core-fixtures" |] -> testFSharpCoreFixtures (); 0
             | [| packagePath |] -> run (Path.GetFullPath packagePath); 0
-            | _ -> fail "Usage: dotnet fsi scripts/test_public_api_package.fsx <PipeL4.Plugins-package.nupkg>"
+            | _ -> fail "Usage: dotnet fsi scripts/test_public_api_package.fsx <PipeL4.Plugins-package.nupkg> | --test-fsharp-core-fixtures"
         with error ->
             eprintfn "Public API package regressions failed: %s" error.Message
             1
