@@ -16,6 +16,9 @@ jobs:
   produce_canonical:
     name: Produce packages (.NET SDK 10.0.115; canonical)
     runs-on: ubuntu-24.04
+    outputs:
+      artifact_name: ${{ steps.published.outputs.artifact_name }}
+      producer_attempt: ${{ steps.published.outputs.producer_attempt }}
     env:
       SDK_VERSION: '10.0.115'
       PRODUCER_ROLE: canonical
@@ -53,7 +56,10 @@ jobs:
             exit 1
           fi
           mkdir -p "$artifact_root/packages/PipeL4" "$artifact_root/packages/PipeL4.Plugins"
+          artifact_name="PipeL4-${PRODUCER_ROLE}-sdk-${SDK_VERSION}-source-${GITHUB_SHA}-attempt-${GITHUB_RUN_ATTEMPT}"
           printf 'root=%s\n' "$artifact_root" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=%s\n' "$artifact_name" >> "$GITHUB_OUTPUT"
+          printf 'producer_attempt=%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Select and verify exact .NET SDK
         env:
@@ -197,30 +203,6 @@ jobs:
           printf 'tool_package_path=%s\n' "$(realpath "$tool_package")" >> "$GITHUB_OUTPUT"
           printf 'public_api_package_path=%s\n' "$(realpath "$api_package")" >> "$GITHUB_OUTPUT"
 
-      - name: Verify public API consumer compilation failure handling
-        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
-        env:
-          PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
-        run: dotnet fsi scripts/test_public_api_consumer.fsx "$PUBLIC_API_PACKAGE_PATH"
-
-      - name: Verify public API package consumer regressions
-        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
-        env:
-          PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
-        run: dotnet fsi scripts/test_public_api_package.fsx "$PUBLIC_API_PACKAGE_PATH"
-
-      - name: Verify FSI authoring dependency-manager cache isolation
-        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
-        env:
-          PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
-        run: dotnet fsi scripts/test_fsi_authoring_cache.fsx "$PUBLIC_API_PACKAGE_PATH" examples/AsciiUppercase.fsx
-
-      - name: Validate F# Interactive authoring with the local API candidate
-        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
-        env:
-          PUBLIC_API_PACKAGE_PATH: ${{ steps.package.outputs.public_api_package_path }}
-        run: dotnet fsi scripts/validate_fsi_authoring.fsx "$PUBLIC_API_PACKAGE_PATH" examples/AsciiUppercase.fsx
-
       - name: Run regression suite against canonical release candidate
         if: ${{ env.PRODUCER_ROLE == 'canonical' }}
         env:
@@ -269,6 +251,7 @@ jobs:
             --arg sdk "$SDK_VERSION" \
             --arg role "$PRODUCER_ROLE" \
             --arg tested_sha "$TESTED_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
             --arg attempt "$GITHUB_RUN_ATTEMPT" \
             --arg version "$PACKAGE_VERSION" \
             --arg tool_path "$tool_relative_path" \
@@ -282,6 +265,7 @@ jobs:
             '{
               format_version: 1,
               producer: { sdk: $sdk, role: $role },
+              run_id: ($run_id | tonumber),
               run_attempt: ($attempt | tonumber),
               tested_checkout_sha: $tested_sha,
               packages: [
@@ -303,17 +287,35 @@ jobs:
             --arg sdk "$SDK_VERSION" \
             --arg role "$PRODUCER_ROLE" \
             --arg tested_sha "$TESTED_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg attempt "$GITHUB_RUN_ATTEMPT" \
             --arg tool_sha "$tool_sha256" \
             --arg api_sha "$api_sha256" \
-            '.producer.sdk == $sdk and .producer.role == $role and .tested_checkout_sha == $tested_sha and .packages[0].sha256 == $tool_sha and .packages[1].sha256 == $api_sha' \
+            '.producer.sdk == $sdk and .producer.role == $role and .run_id == ($run_id | tonumber) and .run_attempt == ($attempt | tonumber) and .tested_checkout_sha == $tested_sha and .packages[0].sha256 == $tool_sha and .packages[1].sha256 == $api_sha' \
             "$ARTIFACT_ROOT/manifest.json" > /dev/null
 
       - name: Upload producer packages and provenance
+        id: upload
         uses: actions/upload-artifact@v7
         with:
-          name: PipeL4-${{ env.PRODUCER_ROLE }}-sdk-${{ env.SDK_VERSION }}-source-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          name: ${{ steps.artifacts.outputs.artifact_name }}
           path: ${{ steps.artifacts.outputs.root }}/
           if-no-files-found: error
+
+      - name: Publish uploaded producer artifact identity
+        id: published
+        env:
+          ARTIFACT_NAME: ${{ steps.artifacts.outputs.artifact_name }}
+          PRODUCER_ATTEMPT: ${{ steps.artifacts.outputs.producer_attempt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$ARTIFACT_NAME" || -z "$PRODUCER_ATTEMPT" ]]; then
+            echo "Uploaded producer artifact identity is missing." >&2
+            exit 1
+          fi
+          printf 'artifact_name=%s\n' "$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
+          printf 'producer_attempt=%s\n' "$PRODUCER_ATTEMPT" >> "$GITHUB_OUTPUT"
 
       - name: Restore SDK policy and verify dependency files are unchanged
         if: always()
@@ -328,25 +330,347 @@ jobs:
   produce_compatibility:
     name: Produce packages (.NET SDK 10.0.404; compatibility)
     runs-on: ubuntu-24.04
+    outputs:
+      artifact_name: ${{ steps.published.outputs.artifact_name }}
+      producer_attempt: ${{ steps.published.outputs.producer_attempt }}
     env:
       SDK_VERSION: '10.0.404'
       PRODUCER_ROLE: compatibility
     steps: *producer_steps
 
-  validate:
-    name: Build and validate distributable packages
-    needs: [produce_canonical, produce_compatibility]
-    if: ${{ always() }}
+  consume_115_from_115:
+    name: Consume canonical packages with .NET SDK 10.0.115 from producer SDK 10.0.115
     runs-on: ubuntu-24.04
-    steps:
-      - name: Require both independent producer jobs to succeed
+    needs: produce_canonical
+    env:
+      SDK_VERSION: '10.0.115'
+      PRODUCER_SDK: '10.0.115'
+      PRODUCER_ROLE: canonical
+      PRODUCER_ARTIFACT_NAME: ${{ needs.produce_canonical.outputs.artifact_name }}
+      PRODUCER_ARTIFACT_ATTEMPT: ${{ needs.produce_canonical.outputs.producer_attempt }}
+    steps: &consumer_steps
+      - name: Check out tested source revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install both supported .NET SDKs
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            10.0.115
+            10.0.404
+
+      - name: Pin and verify exact consumer SDK
         env:
-          CANONICAL_RESULT: ${{ needs.produce_canonical.result }}
-          COMPATIBILITY_RESULT: ${{ needs.produce_compatibility.result }}
+          SDK_VERSION: ${{ env.SDK_VERSION }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$CANONICAL_RESULT" != "success" || "$COMPATIBILITY_RESULT" != "success" ]]; then
-            echo "Distribution producers must both succeed; canonical=$CANONICAL_RESULT, compatibility=$COMPATIBILITY_RESULT." >&2
+          cp global.json "$RUNNER_TEMP/pipel4-global.json"
+          jq --arg sdk "$SDK_VERSION" '.sdk.version = $sdk | .sdk.rollForward = "disable"' \
+            global.json > "$RUNNER_TEMP/pipel4-consumer-global.json"
+          cp "$RUNNER_TEMP/pipel4-consumer-global.json" global.json
+          selected_sdk="$(dotnet --version)"
+          printf 'Requested consumer .NET SDK: %s; selected .NET SDK: %s\n' "$SDK_VERSION" "$selected_sdk"
+          if [[ "$selected_sdk" != "$SDK_VERSION" ]]; then
+            echo "Consumer SDK selection failed: expected $SDK_VERSION, got $selected_sdk." >&2
             exit 1
           fi
+          dotnet --info | tee "$RUNNER_TEMP/pipel4-consumer-dotnet-info.txt"
+          dotnet --list-sdks | tee "$RUNNER_TEMP/pipel4-consumer-installed-sdks.txt"
+          other_sdk=10.0.115
+          if [[ "$SDK_VERSION" == "10.0.115" ]]; then other_sdk=10.0.404; fi
+          grep -F "$SDK_VERSION [" "$RUNNER_TEMP/pipel4-consumer-installed-sdks.txt"
+          grep -F "$other_sdk [" "$RUNNER_TEMP/pipel4-consumer-installed-sdks.txt"
+
+      - name: Verify checked out source revision and prepare isolated caches
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          tested_sha="$(git rev-parse HEAD)"
+          if [[ "$tested_sha" != "$GITHUB_SHA" ]]; then
+            echo "Checkout provenance mismatch: HEAD is $tested_sha; GITHUB_SHA is $GITHUB_SHA." >&2
+            exit 1
+          fi
+          consumer_root="$RUNNER_TEMP/pipel4-consumer-${SDK_VERSION}-from-${PRODUCER_SDK}"
+          package_cache="$consumer_root/outer-packages"
+          http_cache="$consumer_root/outer-http-cache"
+          cli_home="$consumer_root/cli-home"
+          mkdir -p "$consumer_root" "$package_cache" "$http_cache" "$cli_home"
+          printf 'NUGET_PACKAGES=%s\n' "$package_cache" >> "$GITHUB_ENV"
+          printf 'NUGET_HTTP_CACHE_PATH=%s\n' "$http_cache" >> "$GITHUB_ENV"
+          printf 'DOTNET_CLI_HOME=%s\n' "$cli_home" >> "$GITHUB_ENV"
+          printf 'root=%s\n' "$consumer_root" >> "$GITHUB_OUTPUT"
+
+      - name: Validate trusted producer artifact outputs
+        id: producer_identity
+        env:
+          PRODUCER_ARTIFACT_NAME: ${{ env.PRODUCER_ARTIFACT_NAME }}
+          PRODUCER_ARTIFACT_ATTEMPT: ${{ env.PRODUCER_ARTIFACT_ATTEMPT }}
+        run: >-
+          dotnet fsi --exec scripts/distribution_validation.fsx select-artifact
+          --artifact-name "$PRODUCER_ARTIFACT_NAME"
+          --producer-attempt "$PRODUCER_ARTIFACT_ATTEMPT"
+          --producer-sdk "$PRODUCER_SDK"
+          --tested-sha "$GITHUB_SHA"
+          --run-id "$GITHUB_RUN_ID"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Download only the selected producer artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ steps.producer_identity.outputs.artifact_name }}
+          path: ${{ runner.temp }}/pipel4-distribution-${{ env.SDK_VERSION }}-from-${{ env.PRODUCER_SDK }}
+
+      - name: Verify artifact provenance and candidate package bytes
+        id: candidate
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/pipel4-distribution-${{ env.SDK_VERSION }}-from-${{ env.PRODUCER_SDK }}
+          PRODUCER_ARTIFACT_ATTEMPT: ${{ steps.producer_identity.outputs.producer_attempt }}
+        run: >-
+          dotnet fsi --exec scripts/distribution_validation.fsx artifact
+          --artifact-root "$ARTIFACT_ROOT"
+          --consumer-sdk "$SDK_VERSION"
+          --producer-sdk "$PRODUCER_SDK"
+          --tested-sha "$GITHUB_SHA"
+          --run-id "$GITHUB_RUN_ID"
+          --producer-attempt "$PRODUCER_ARTIFACT_ATTEMPT"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Test distribution rejection controls
+        if: ${{ env.SDK_VERSION == '10.0.115' && env.PRODUCER_ROLE == 'canonical' }}
+        run: dotnet fsi --exec scripts/distribution_validation.fsx self-test
+
+      - name: Restore trusted FSharp.Core minimum package in a fresh cache
+        env:
+          CONSUMER_ROOT: ${{ steps.prepare.outputs.root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          prerequisite="$CONSUMER_ROOT/fsharp-core-prerequisite"
+          mkdir -p "$prerequisite"
+          cat > "$prerequisite/FSharpCorePrerequisite.fsproj" <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <TargetFramework>net10.0</TargetFramework>
+              <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
+            </PropertyGroup>
+            <ItemGroup>
+              <PackageReference Include="FSharp.Core" Version="10.0.100" />
+            </ItemGroup>
+          </Project>
+          EOF
+          cat > "$prerequisite/NuGet.Config" <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="NuGet.org" value="https://api.nuget.org/v3/index.json" />
+            </packageSources>
+          </configuration>
+          EOF
+          dotnet restore "$prerequisite/FSharpCorePrerequisite.fsproj" \
+            --configfile "$prerequisite/NuGet.Config" \
+            --packages "$NUGET_PACKAGES"
+          test -s "$NUGET_PACKAGES/fsharp.core/10.0.100/fsharp.core.10.0.100.nupkg"
+          jq -e '.source == "https://api.nuget.org/v3/index.json"' \
+            "$NUGET_PACKAGES/fsharp.core/10.0.100/.nupkg.metadata" > /dev/null
+
+      - name: Validate downloaded tool package
+        env:
+          TOOL_PACKAGE_PATH: ${{ steps.candidate.outputs.tool_package_path }}
+        run: dotnet fsi scripts/validate_package.fsx "$TOOL_PACKAGE_PATH"
+
+      - name: Validate downloaded public API package and independent consumers
+        env:
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.candidate.outputs.api_package_path }}
+        run: dotnet fsi scripts/validate_public_api_package.fsx "$PUBLIC_API_PACKAGE_PATH"
+
+      - name: Verify public API consumer compilation failure handling
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
+        env:
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.candidate.outputs.api_package_path }}
+        run: dotnet fsi scripts/test_public_api_consumer.fsx "$PUBLIC_API_PACKAGE_PATH"
+
+      - name: Verify public API package consumer regressions
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
+        env:
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.candidate.outputs.api_package_path }}
+        run: dotnet fsi scripts/test_public_api_package.fsx "$PUBLIC_API_PACKAGE_PATH"
+
+      - name: Verify FSI authoring dependency-manager cache isolation
+        if: ${{ env.PRODUCER_ROLE == 'canonical' }}
+        env:
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.candidate.outputs.api_package_path }}
+        run: dotnet fsi scripts/test_fsi_authoring_cache.fsx "$PUBLIC_API_PACKAGE_PATH" examples/AsciiUppercase.fsx
+
+      - name: Validate F# Interactive authoring with the downloaded API candidate
+        env:
+          PUBLIC_API_PACKAGE_PATH: ${{ steps.candidate.outputs.api_package_path }}
+        run: dotnet fsi scripts/validate_fsi_authoring.fsx "$PUBLIC_API_PACKAGE_PATH" examples/AsciiUppercase.fsx
+
+      - name: Install and smoke test the downloaded tool package
+        env:
+          TOOL_PACKAGE_PATH: ${{ steps.candidate.outputs.tool_package_path }}
+          PACKAGE_VERSION: ${{ steps.candidate.outputs.package_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/pipel4-consumer-${SDK_VERSION}-from-${PRODUCER_SDK}/tool-install"
+          tool_config="$RUNNER_TEMP/pipel4-consumer-${SDK_VERSION}-from-${PRODUCER_SDK}/tool-NuGet.Config"
+          if [[ -e "$tool_root" ]]; then
+            echo "Tool install directory is not fresh: $tool_root" >&2
+            exit 1
+          fi
+          mkdir -p "$tool_root"
+          cat > "$tool_config" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <configuration>
+            <packageSources>
+              <clear />
+              <add key="selected producer candidate" value="$(dirname "$TOOL_PACKAGE_PATH")" />
+            </packageSources>
+          </configuration>
+          EOF
+          dotnet tool install PipeL4 \
+            --tool-path "$tool_root" \
+            --version "$PACKAGE_VERSION" \
+            --configfile "$tool_config"
+          dotnet tool list --tool-path "$tool_root" | grep -iE "^PipeL4[[:space:]]+${PACKAGE_VERSION}[[:space:]]"
+          "$tool_root/pipel4" --help > "$RUNNER_TEMP/pipel4-tool-help.txt"
+          version_output="$("$tool_root/pipel4" --version)"
+          printf '%s\n' "$version_output"
+          grep -F "$PACKAGE_VERSION" <<< "$version_output"
+          "$tool_root/pipel4" examples list > "$RUNNER_TEMP/pipel4-tool-examples.txt"
+          grep -F AsciiUppercase "$RUNNER_TEMP/pipel4-tool-examples.txt"
+          examples_root="$RUNNER_TEMP/pipel4-consumer-${SDK_VERSION}-from-${PRODUCER_SDK}/examples-copy"
+          mkdir -p "$examples_root"
+          "$tool_root/pipel4" examples copy AsciiUppercase --output-dir "$examples_root"
+          test -s "$examples_root/AsciiUppercase.fsx"
+
+      - name: Reverify artifact hashes after consumer validation
+        if: always()
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/pipel4-distribution-${{ env.SDK_VERSION }}-from-${{ env.PRODUCER_SDK }}
+          PRODUCER_ARTIFACT_ATTEMPT: ${{ steps.producer_identity.outputs.producer_attempt }}
+        run: >-
+          dotnet fsi --exec scripts/distribution_validation.fsx artifact
+          --artifact-root "$ARTIFACT_ROOT"
+          --consumer-sdk "$SDK_VERSION"
+          --producer-sdk "$PRODUCER_SDK"
+          --tested-sha "$GITHUB_SHA"
+          --run-id "$GITHUB_RUN_ID"
+          --producer-attempt "$PRODUCER_ARTIFACT_ATTEMPT"
+
+      - name: Restore SDK policy and verify dependency files are unchanged
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/pipel4-global.json" ]]; then
+            cp "$RUNNER_TEMP/pipel4-global.json" global.json
+          fi
+          git diff --exit-code -- global.json paket.dependencies paket.lock
+
+  consume_404_from_115:
+    name: Consume canonical packages with .NET SDK 10.0.404 from producer SDK 10.0.115
+    runs-on: ubuntu-24.04
+    needs: produce_canonical
+    env:
+      SDK_VERSION: '10.0.404'
+      PRODUCER_SDK: '10.0.115'
+      PRODUCER_ROLE: canonical
+      PRODUCER_ARTIFACT_NAME: ${{ needs.produce_canonical.outputs.artifact_name }}
+      PRODUCER_ARTIFACT_ATTEMPT: ${{ needs.produce_canonical.outputs.producer_attempt }}
+    steps: *consumer_steps
+
+  consume_115_from_404:
+    name: Consume compatibility packages with .NET SDK 10.0.115 from producer SDK 10.0.404
+    runs-on: ubuntu-24.04
+    needs: produce_compatibility
+    env:
+      SDK_VERSION: '10.0.115'
+      PRODUCER_SDK: '10.0.404'
+      PRODUCER_ROLE: compatibility
+      PRODUCER_ARTIFACT_NAME: ${{ needs.produce_compatibility.outputs.artifact_name }}
+      PRODUCER_ARTIFACT_ATTEMPT: ${{ needs.produce_compatibility.outputs.producer_attempt }}
+    steps: *consumer_steps
+
+  consume_404_from_404:
+    name: Consume compatibility packages with .NET SDK 10.0.404 from producer SDK 10.0.404
+    runs-on: ubuntu-24.04
+    needs: produce_compatibility
+    env:
+      SDK_VERSION: '10.0.404'
+      PRODUCER_SDK: '10.0.404'
+      PRODUCER_ROLE: compatibility
+      PRODUCER_ARTIFACT_NAME: ${{ needs.produce_compatibility.outputs.artifact_name }}
+      PRODUCER_ARTIFACT_ATTEMPT: ${{ needs.produce_compatibility.outputs.producer_attempt }}
+    steps: *consumer_steps
+
+  validate:
+    name: Build and validate distributable packages
+    needs:
+      - produce_canonical
+      - produce_compatibility
+      - consume_115_from_115
+      - consume_404_from_115
+      - consume_115_from_404
+      - consume_404_from_404
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out workflow revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install aggregate validation SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.115'
+
+      - name: Pin and verify aggregate validation SDK
+        env:
+          SDK_VERSION: '10.0.115'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp global.json "$RUNNER_TEMP/pipel4-global.json"
+          jq --arg sdk "$SDK_VERSION" '.sdk.version = $sdk | .sdk.rollForward = "disable"' \
+            global.json > "$RUNNER_TEMP/pipel4-aggregate-global.json"
+          cp "$RUNNER_TEMP/pipel4-aggregate-global.json" global.json
+          selected_sdk="$(dotnet --version)"
+          printf 'Requested aggregate validation SDK: %s; selected .NET SDK: %s\n' "$SDK_VERSION" "$selected_sdk"
+          test "$selected_sdk" = "$SDK_VERSION"
+          dotnet --info
+          dotnet --list-sdks
+
+      - name: Require every producer and consumer job to succeed
+        env:
+          PRODUCE_CANONICAL_RESULT: ${{ needs.produce_canonical.result }}
+          PRODUCE_COMPATIBILITY_RESULT: ${{ needs.produce_compatibility.result }}
+          CONSUME_115_FROM_115_RESULT: ${{ needs.consume_115_from_115.result }}
+          CONSUME_404_FROM_115_RESULT: ${{ needs.consume_404_from_115.result }}
+          CONSUME_115_FROM_404_RESULT: ${{ needs.consume_115_from_404.result }}
+          CONSUME_404_FROM_404_RESULT: ${{ needs.consume_404_from_404.result }}
+        run: >-
+          dotnet fsi --exec scripts/distribution_validation.fsx aggregate
+          --produce-canonical "$PRODUCE_CANONICAL_RESULT"
+          --produce-compatibility "$PRODUCE_COMPATIBILITY_RESULT"
+          --consume-115-from-115 "$CONSUME_115_FROM_115_RESULT"
+          --consume-404-from-115 "$CONSUME_404_FROM_115_RESULT"
+          --consume-115-from-404 "$CONSUME_115_FROM_404_RESULT"
+          --consume-404-from-404 "$CONSUME_404_FROM_404_RESULT"
+
+      - name: Restore SDK policy and verify dependency files are unchanged
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/pipel4-global.json" ]]; then
+            cp "$RUNNER_TEMP/pipel4-global.json" global.json
+          fi
+          git diff --exit-code -- global.json paket.dependencies paket.lock

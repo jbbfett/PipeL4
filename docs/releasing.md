@@ -26,32 +26,50 @@ and uploads its newly built candidate artifacts.
 
 ## Distribution producer SDK policy
 
-Distribution validation runs two independent jobs: `produce_canonical` with SDK `10.0.115` and
-`produce_compatibility` with SDK `10.0.404`. The canonical producer is the only producer whose
-artifacts may be selected as public release candidates. Compatibility packages are diagnostic
-artifacts and are never an alternative public release. The current workflow does not run a four-way
-cross-SDK consumer matrix.
+Distribution validation runs two independent producers: `produce_canonical` with SDK `10.0.115` and
+`produce_compatibility` with SDK `10.0.404`. Four independent consumers validate each producer's
+packages with both SDKs: `consume_115_from_115`, `consume_404_from_115`, `consume_115_from_404`,
+and `consume_404_from_404`. Consumers download the selected producer artifact and do not rebuild or
+repack PipeL4. They validate the tool and public API packages, compile independent public API
+consumers, run F# Interactive authoring checks, and install and smoke-test the tool. The public API
+and FSI regression harnesses run once per consumer SDK against the canonical producer package; the
+full package-backed solution suite remains in the canonical producer. The canonical producer is
+the only producer whose artifacts may be selected as public release candidates. Compatibility
+packages are diagnostic artifacts and are never an alternative public release.
 
 The checked-in [`global.json`](../global.json) continues to request SDK `10.0.112` for ordinary
 repository commands. CI and Distribution install and select their exact workflow SDKs separately;
 Distribution reuses CI's existing selection pattern. Each Distribution producer saves the checked-in
 file, changes only the SDK version and `rollForward` setting for its job, disables roll-forward, and
-requires `dotnet --version` to equal its configured SDK exactly. An `always()` cleanup step restores
-the saved policy. This gives Distribution explicit producer SDKs without changing repository-wide
-SDK selection.
+requires `dotnet --version` to equal its configured SDK exactly. Consumers install both supported
+SDKs for cross-SDK regression controls and pin the requested consumer SDK the same way. The aggregate
+job selects SDK `10.0.115` to evaluate results. An `always()` cleanup step restores the saved policy
+in each job. This gives Distribution explicit SDK selection without changing repository-wide SDK
+policy.
 
-Each uploaded artifact name and manifest identifies the SDK, canonical or compatibility role,
-tested checkout SHA, and run attempt. The artifact includes both packages in separate directories,
-separate `source-revision.txt` files, a manifest with package IDs, versions, paths, and SHA-256
-digests, and `SHA256SUMS`. The workflow verifies both package repository commit attributes and both
-source revision files against the tested checkout before upload. Do not select a compatibility
-artifact for release or mix packages from separate producer artifacts.
+Each successful producer exports the exact uploaded artifact name and its producer attempt as job
+outputs. Each consumer uses outputs from its declared producer, checks the SDK, canonical or
+compatibility role, checkout SHA, and attempt encoded in that name, then downloads only that
+artifact. The manifest is checked against the producer attempt and the current workflow run ID and
+checkout SHA. This lets a consumer rerun use the artifact from a producer job that succeeded in an
+earlier attempt. [GitHub documents that jobs excluded from a rerun retain their outputs for jobs
+that are rerun](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs);
+local self-tests verify the identity checks but cannot exercise hosted artifact availability or rerun
+scheduling. A producer rerun refreshes its outputs, and its dependent consumers use the newly uploaded
+artifact. A failed producer prevents dependent consumers from running.
 
-The required `Build and validate distributable packages` check waits for both explicitly named
-producer jobs and succeeds only when each job result is `success`. Its `always()` condition lets it
-report failed, skipped, or canceled producer outcomes while the workflow is still active. GitHub can
-terminate a workflow that is canceled in its entirety before the aggregate runs or completes; such a
-run is not a successful aggregate check.
+Artifact names identify the SDK, canonical or compatibility role, tested checkout SHA, and producer
+attempt. Manifests also record the workflow run ID. Each artifact includes both packages in separate
+directories, separate `source-revision.txt` files, a manifest with package IDs, versions, paths, and
+SHA-256 digests, and `SHA256SUMS`. The workflow verifies both package repository commit attributes
+and both source revision files against the tested checkout before upload. Do not select a
+compatibility artifact for release or mix packages from separate producer artifacts.
+
+The required `Build and validate distributable packages` check waits for both producers and all four
+consumers. It succeeds only when each of the six independent job results is `success`. Its `always()`
+condition lets it report failed, skipped, or canceled job outcomes while the workflow is still
+active. GitHub can terminate a workflow that is canceled in its entirety before the aggregate runs
+or completes; such a run is not a successful aggregate check.
 
 ## 0.1.0-alpha.2 release procedure
 
@@ -338,12 +356,14 @@ from the pre-merge pull request checks in step 4a:
 - [CI](../.github/workflows/ci.yml) restores, builds, tests, packs, and validates the `PipeL4` tool
   package. It does not validate the `PipeL4.Plugins` distribution by itself.
 - [Distribution validation](../.github/workflows/distribution-validation.yml) runs independent
-  exact-SDK producers for `10.0.115` (canonical) and `10.0.404` (compatibility). Both produce and
+  exact-SDK producers for `10.0.115` (canonical) and `10.0.404` (compatibility). Both build and
   validate the lockstep packages and record package and source provenance. The canonical producer
-  also runs the existing regression harnesses, FSI authoring checks, and package-backed solution
-  suite. Each producer uploads a separately named artifact with its role, SDK, source SHA, run
-  attempt, manifest, checksums, and per-package `source-revision.txt` files. Only the `10.0.115`
-  canonical artifact is eligible for public release review.
+  runs the full package-backed solution suite. All four consumer jobs validate the package, Public
+  API, FSI authoring, and tool smoke behavior. Consumers of the canonical artifact also run the
+  API and FSI regression harnesses once per consumer SDK. Each producer uploads a separately named
+  artifact with its role, SDK, source SHA, run attempt, manifest, checksums, and per-package
+  `source-revision.txt` files. Only the `10.0.115` canonical artifact is eligible for public release
+  review.
 
 Both workflows run on pushes and pull requests targeting `master` and support manual dispatch.
 Neither workflow publishes NuGet packages, creates a Git tag, or publishes a GitHub Release. Save
