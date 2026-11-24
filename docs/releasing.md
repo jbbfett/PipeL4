@@ -331,7 +331,8 @@ Stop for an unresolved finding.
 Before squash-merging, require both GitHub Actions checks to succeed for the latest pull request
 revision:
 
-- `CI / Build and test`
+- `CI / Build and test (.NET SDK 10.0.115)`
+- `CI / Build and test (.NET SDK 10.0.404)`
 - `Distribution validation / Build and validate distributable packages`
 
 Confirm each run belongs to this pull request and corresponds to its current head and base
