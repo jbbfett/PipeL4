@@ -26,11 +26,28 @@ type private AdapterClassProcessor(generated: bool) =
 
             ValueTask<PipeL4.Plugins.ProcessorResult>(releaseAll)
 
+type private StatefulAdapterClassProcessor(generated: bool) =
+    let mutable total = 0L
+
+    interface PipeL4.Plugins.IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            total <- total + input.Bytes.Length
+            if generated then
+                for segment in input.Bytes do
+                    segment.Span.CopyTo(output.GetSpan(segment.Length))
+                    output.Advance(segment.Length)
+            else
+                output.AppendInput(0L, input.Bytes.Length)
+
+            ValueTask<PipeL4.Plugins.ProcessorResult>(releaseAll)
+
 /// Matched public class/functional adapters through the production executor, without sockets.
 [<MemoryDiagnoser>]
 type FunctionalProcessorAdapterBenchmarks() =
     let mutable classPipeline = Unchecked.defaultof<ProcessorPipeline>
     let mutable functionalPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable statefulClassPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable statefulFunctionalPipeline = Unchecked.defaultof<ProcessorPipeline>
     let state = new ConnectionState()
 
     [<Params(false, true)>]
@@ -60,7 +77,31 @@ type FunctionalProcessorAdapterBenchmarks() =
                 MemoryPool<byte>.Shared
             )
 
-        for name, pipeline in [ "class", classPipeline; "functional", functionalPipeline ] do
+        statefulClassPipeline <-
+            new ProcessorPipeline(
+                [| ScriptProcessorAdapter(StatefulAdapterClassProcessor(this.Generated)) |],
+                FunctionalAdapterSink(),
+                MemoryPool<byte>.Shared
+            )
+        statefulFunctionalPipeline <-
+            new ProcessorPipeline(
+                [| new FunctionalProcessorAdapter<int64 ref>(
+                       (fun _ -> ref 0L),
+                       (fun ctx total ->
+                           total.Value <- total.Value + ctx.Input.Length
+                           handle ctx),
+                       None,
+                       publicState
+                   ) |],
+                FunctionalAdapterSink(),
+                MemoryPool<byte>.Shared
+            )
+
+        for name, pipeline in
+            [ "class", classPipeline
+              "functional", functionalPipeline
+              "stateful class", statefulClassPipeline
+              "stateful functional", statefulFunctionalPipeline ] do
             let owner = MemoryPool<byte>.Shared.Rent(4096)
             pipeline.PushAsync(owner, 4096, CancellationToken.None).GetAwaiter().GetResult()
             let metrics = pipeline.GetStageMetricsSnapshot() |> List.exactlyOne
@@ -82,6 +123,10 @@ type FunctionalProcessorAdapterBenchmarks() =
             (classPipeline :> IDisposable).Dispose()
         if not (obj.ReferenceEquals(functionalPipeline, null)) then
             (functionalPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(statefulClassPipeline, null)) then
+            (statefulClassPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(statefulFunctionalPipeline, null)) then
+            (statefulFunctionalPipeline :> IDisposable).Dispose()
         (state :> IAsyncDisposable).DisposeAsync().GetAwaiter().GetResult()
 
     [<Benchmark(Baseline = true)>]
@@ -93,3 +138,13 @@ type FunctionalProcessorAdapterBenchmarks() =
     member _.Functional4KiB() =
         let owner = MemoryPool<byte>.Shared.Rent(4096)
         functionalPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.StatefulClass4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        statefulClassPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.StatefulFunctional4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        statefulFunctionalPipeline.PushAsync(owner, 4096, CancellationToken.None)

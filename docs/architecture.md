@@ -257,8 +257,9 @@ The host also has an internal typed adapter for a synchronous
 flag, runtime output writer through the same non-owning writer adapter, cancellation token, and
 connection-state view to each invocation, returning a completed core value task. Typed stage
 construction creates a fresh adapter for each configured stage, direction, and connection through
-the existing pipeline builder. Functional script discovery, local-state creation, functional
-disposal, and asynchronous functional handlers are not implemented.
+the existing pipeline builder. Typed local-state creation and synchronous functional disposal are
+described under State below. Functional script discovery and asynchronous functional handlers
+are not implemented.
 
 Each compiled script must contain exactly one visible, concrete, non-generic class that implements
 `PipeL4.Plugins.IByteStreamProcessor` and has either a public parameterless constructor or a public
@@ -301,6 +302,25 @@ unchanged, and parameterless processors do not need state-related boilerplate.
 
 Processor instance fields remain the natural place for stage-local state. The runtime does not
 provide additional per-stage, per-direction, per-plugin, per-listener, or process-wide registries.
+
+Internally configured synchronous functional stages may instead create a typed local state value.
+Creation accepts `unit` or `CreateContext` and runs exactly once during processor construction,
+before processing, even when the stage never receives input. The context carries the same
+non-owning connection-state view used by the other stages in both directions. Each constructed
+adapter stores its own creation result and passes that value to every handler invocation and to
+optional synchronous `dispose state` cleanup. Creation functions must allocate any local mutable
+state that needs isolation; the host does not clone values returned by user code. Stateless stages
+continue to use `handle ctx`; stateful stages use `handle ctx state`.
+
+Local state is not automatically disposed, even if it implements a disposal interface; fields are
+not recursively disposed. Only an explicitly supplied cleanup function runs, through the existing
+processor lifetime mechanism, in reverse stage order within each direction. Cleanup must respect
+connection-resource and runtime-memory ownership. A throwing creation function never yields a
+successfully constructed processor and receives no local cleanup callback; previously constructed
+stages still receive cleanup attempts. Handler and cleanup failures retain the existing contextual
+diagnostics and failure ordering. Typed functional construction remains internal; script discovery
+still selects class processors, and asynchronous functional creation, handling, and cleanup are
+unsupported.
 
 Connection state uses ordinal string keys and exact declared .NET types. A key publishes at most
 one value through thread-safe `GetOrAdd` initialization; concurrent first access executes the

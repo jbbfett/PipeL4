@@ -479,6 +479,113 @@ module ScriptTcpForwarderIntegrationTests =
             testCancellationToken
             body
 
+    let rec private functionalFailureCauses (error: exn) =
+        seq {
+            yield error
+            match error with
+            | :? AggregateException as aggregate ->
+                for inner in aggregate.InnerExceptions do yield! functionalFailureCauses inner
+            | _ ->
+                match Option.ofObj error.InnerException with
+                | Some inner -> yield! functionalFailureCauses inner
+                | None -> ()
+        }
+
+    [<Theory>]
+    [<InlineData("failure", false)>]
+    [<InlineData("failure", true)>]
+    [<InlineData("cancellation", false)>]
+    [<InlineData("cancellation", true)>]
+    [<InlineData("eof", true)>]
+    let ``functional stages use production terminal cleanup and preserve failure precedence`` outcome cleanupFails =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let listenPort = reservePort ()
+            let configuration = createConfiguration listenPort (endpointPort backendListener) Array.empty Array.empty
+            let logger = RecordingLogger()
+            let events = ConcurrentQueue<string>()
+            let constructed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let connectionDisposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let handlerFailure = InvalidOperationException("functional handle failed")
+            let cleanupFailure = InvalidOperationException("functional dispose failed")
+            let stage name =
+                ConfiguredScriptStage.CreateFunctional(
+                    $"{name}.fsx",
+                    (fun (ctx: CreateContext) ->
+                        ctx.ConnectionState.GetOrAdd(
+                            "owned",
+                            fun () ->
+                                { new IDisposable with
+                                    member _.Dispose() =
+                                        events.Enqueue "connection"
+                                        connectionDisposed.TrySetResult(()) |> ignore }
+                        ) |> ignore
+                        if name = "server" then constructed.TrySetResult(()) |> ignore
+                        ctx.ConnectionState),
+                    (fun ctx state ->
+                        Assert.Same(state, ctx.ConnectionState)
+                        if outcome = "failure" && name = "client" && not ctx.Input.IsEmpty then
+                            raise handlerFailure
+                        emitInput ctx 0L ctx.Input.Length
+                        releaseAll),
+                    dispose = (fun (state: IConnectionState) ->
+                        Assert.True(state.TryGet<IDisposable>("owned").IsSome)
+                        events.Enqueue name
+                        if cleanupFails && name = "client" then raise cleanupFailure)
+                )
+            let definition = ScriptPipelineDefinition([| stage "client" |], [| stage "server" |])
+            do!
+                runWithForwarder
+                    (fun token ->
+                        TcpForwarder.runWithOptionalProcessorPipelineFactoryAsync
+                            configuration definition.CreateProcessorPipelinesAsync logger token)
+                    listenPort
+                    timeout.Token
+                    (fun proxy ->
+                        task {
+                            let accepted = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                            use! client = connect listenPort timeout.Token
+                            use! backend = accepted
+                            let clientStream = client.GetStream()
+                            let backendStream = backend.GetStream()
+                            do! constructed.Task.WaitAsync(timeout.Token)
+                            match outcome with
+                            | "cancellation" -> proxy.Shutdown.Cancel()
+                            | "eof" ->
+                                client.Client.Shutdown(SocketShutdown.Send)
+                                backend.Client.Shutdown(SocketShutdown.Send)
+                            | _ -> do! clientStream.WriteAsync([| 1uy |], timeout.Token)
+                            do! connectionDisposed.Task.WaitAsync(timeout.Token)
+                            do! expectDisconnect clientStream timeout.Token
+                            do! expectDisconnect backendStream timeout.Token
+                        })
+            let cleanupEvents = events.ToArray()
+            cleanupEvents.Length |> should equal 3
+            cleanupEvents[2] |> should equal "connection"
+            cleanupEvents |> Array.filter ((=) "client") |> Array.length |> should equal 1
+            cleanupEvents |> Array.filter ((=) "server") |> Array.length |> should equal 1
+            let reported = logger.Failures |> Seq.collect functionalFailureCauses |> Seq.toArray
+            if outcome = "failure" then
+                Assert.Contains(reported, fun error -> obj.ReferenceEquals(error, handlerFailure))
+            if cleanupFails then
+                Assert.Contains(reported, fun error -> obj.ReferenceEquals(error, cleanupFailure))
+            if outcome = "failure" && cleanupFails then
+                let aggregate =
+                    reported
+                    |> Array.pick (function
+                        | :? AggregateException as error
+                            when error.Message.StartsWith("Processor pipeline execution and disposal both failed.") -> Some error
+                        | _ -> None)
+                let primary = Assert.IsType<ScriptProcessorFailureException>(aggregate.InnerExceptions[0])
+                let secondary = Assert.IsType<ScriptProcessorFailureException>(aggregate.InnerExceptions[1])
+                Assert.Same(handlerFailure, primary.InnerException)
+                Assert.Same(cleanupFailure, secondary.InnerException)
+            elif outcome = "cancellation" && not cleanupFails then
+                logger.Failures |> should be Empty
+        }
+
     let private runWithObservedCompiledProxy
         (clientPlugins: CompiledScriptProcessor array)
         (serverPlugins: CompiledScriptProcessor array)

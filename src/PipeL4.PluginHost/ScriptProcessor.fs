@@ -83,6 +83,53 @@ type internal FunctionalProcessorAdapter
                 ({ RetainedLength = result.RetainedLength }: PipeL4.Core.ProcessorResult)
             )
 
+/// Owns one eagerly created, strongly typed local state value. Only explicit user cleanup runs.
+type internal FunctionalProcessorAdapter<'State>
+    (
+        create: CreateContext -> 'State,
+        handle: ProcessContext -> 'State -> ProcessorResult,
+        dispose: ('State -> unit) option,
+        connectionState: IConnectionState
+    ) =
+    do
+        if obj.ReferenceEquals(create, null) then
+            nullArg (nameof create)
+
+        if obj.ReferenceEquals(handle, null) then
+            nullArg (nameof handle)
+
+        if obj.ReferenceEquals(connectionState, null) then
+            nullArg (nameof connectionState)
+
+        match dispose with
+        | Some cleanup when obj.ReferenceEquals(cleanup, null) -> nullArg (nameof dispose)
+        | _ -> ()
+
+    // Adapt once, avoiding a partially applied handler allocation on each invocation.
+    let invoke = OptimizedClosures.FSharpFunc<ProcessContext, 'State, ProcessorResult>.Adapt handle
+    let state = create { ConnectionState = connectionState }
+
+    interface PipeL4.Core.IByteStreamProcessor with
+        member _.ProcessAsync(input, output, cancellationToken) =
+            let context =
+                { Input = input.Bytes
+                  IsCompleted = input.IsCompleted
+                  Output = ProcessorOutputAdapter(output) :> IProcessorOutput
+                  CancellationToken = cancellationToken
+                  ConnectionState = connectionState }
+
+            let result = invoke.Invoke(context, state)
+
+            ValueTask<PipeL4.Core.ProcessorResult>(
+                ({ RetainedLength = result.RetainedLength }: PipeL4.Core.ProcessorResult)
+            )
+
+    interface IDisposable with
+        member _.Dispose() =
+            match dispose with
+            | Some cleanup -> cleanup state
+            | None -> ()
+
 [<NoEquality; NoComparison>]
 type internal ProcessorConstructor =
     | Parameterless of ConstructorInfo

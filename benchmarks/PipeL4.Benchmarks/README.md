@@ -103,6 +103,34 @@ this short run demonstrates matching allocation and accounting observations, not
 improvement or throughput equivalence. Benchmark process priority elevation was unavailable,
 and test compilation overlapped part of the run.
 
+The fixture also compares typed local state (`int64 ref`) with a class instance counter. Both
+update the counter on each invocation. State creation is in setup, outside measured pushes:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
+  --filter '*FunctionalProcessorAdapterBenchmarks.Stateful*' --job short
+```
+
+Stateful observation on 2026-11-24 on the same host/runtime described above, SDK 10.0.115,
+BenchmarkDotNet 0.15.8 ShortRun, three measured iterations:
+
+| Output | Stateful adapter | Mean push latency | 99.9% margin | Derived MiB/s | Managed allocation/push |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Input-backed | Class | 1.304 us | 1.101 us | 2,995.6 | 1.51 KiB |
+| Input-backed | Functional | 1.429 us | 2.540 us | 2,733.6 | 1.51 KiB |
+| Generated copy | Class | 1.842 us | 1.524 us | 2,120.7 | 1.76 KiB |
+| Generated copy | Functional | 1.468 us | 1.830 us | 2,660.9 | 1.76 KiB |
+
+All four adapter preflights again reported zero copied payload bytes / ratio 0 for input-backed
+output and 4 KiB / ratio 1 for generated output. Logical peaks were 8 KiB in both modes; physical
+reserved-memory peaks were 4 KiB and 8 KiB respectively, with zero terminal occupancy. The generic
+stateful adapter matched the class adapter's measured allocation per push; adapting the curried
+handler once avoids a new partial application on each invocation. Wide confidence margins,
+unavailable process priority elevation, and overlapping test compilation limit latency and
+throughput interpretation. This run does not establish a speed improvement or throughput
+equivalence. The retained run log is `/tmp/pipel4-func03-benchmark.log`; normal BenchmarkDotNet
+reports are under the ignored `BenchmarkDotNet.Artifacts/results/` directory.
+
 Run the full-job internal diagnostics allocation comparison:
 
 ```sh

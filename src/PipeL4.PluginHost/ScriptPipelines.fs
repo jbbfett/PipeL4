@@ -119,6 +119,34 @@ type internal ConfiguredScriptStage private
             fun state -> FunctionalProcessorAdapter(handle, state) :> PipeL4.Core.IByteStreamProcessor
         )
 
+    static member CreateFunctional<'State>
+        (
+            scriptPath: string,
+            create: CreateContext -> 'State,
+            handle: ProcessContext -> 'State -> PipeL4.Plugins.ProcessorResult,
+            ?dispose: 'State -> unit
+        ) =
+        ConfiguredScriptStage(
+            scriptPath,
+            fun connectionState ->
+                new FunctionalProcessorAdapter<'State>(create, handle, dispose, connectionState)
+                :> PipeL4.Core.IByteStreamProcessor
+        )
+
+    static member CreateFunctional<'State>
+        (
+            scriptPath: string,
+            create: unit -> 'State,
+            handle: ProcessContext -> 'State -> PipeL4.Plugins.ProcessorResult,
+            ?dispose: 'State -> unit
+        ) =
+        ConfiguredScriptStage.CreateFunctional(
+            scriptPath,
+            (fun (_: CreateContext) -> create ()),
+            handle,
+            ?dispose = dispose
+        )
+
     member _.ScriptPath = scriptPath
 
     member _.CreateProcessor(connectionState, direction, stageNumber) =
