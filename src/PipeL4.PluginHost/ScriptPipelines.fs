@@ -119,6 +119,44 @@ type internal ConfiguredScriptStage private
             fun state -> FunctionalProcessorAdapter(handle, state) :> PipeL4.Core.IByteStreamProcessor
         )
 
+    new(scriptPath: string, handle: ProcessContext -> Task<PipeL4.Plugins.ProcessorResult>) =
+        ConfiguredScriptStage(
+            scriptPath,
+            fun state -> FunctionalProcessorAdapter(handle, state) :> PipeL4.Core.IByteStreamProcessor
+        )
+
+    new(scriptPath: string, handle: ProcessContext -> ValueTask<PipeL4.Plugins.ProcessorResult>) =
+        ConfiguredScriptStage(
+            scriptPath,
+            fun state -> FunctionalProcessorAdapter(handle, state) :> PipeL4.Core.IByteStreamProcessor
+        )
+
+    // Typed normalization avoids a cross product of handler/create/cleanup return-type overloads.
+    static member CreateFunctional<'State>
+        (
+            scriptPath: string,
+            create: CreateContext -> 'State,
+            handle: FunctionalHandler<'State>,
+            ?dispose: FunctionalDisposal<'State>
+        ) =
+        ConfiguredScriptStage(
+            scriptPath,
+            fun connectionState ->
+                new FunctionalProcessorAdapter<'State>(create, handle, dispose, connectionState)
+                :> PipeL4.Core.IByteStreamProcessor
+        )
+
+    static member CreateFunctional<'State>
+        (
+            scriptPath: string,
+            create: unit -> 'State,
+            handle: FunctionalHandler<'State>,
+            ?dispose: FunctionalDisposal<'State>
+        ) =
+        ConfiguredScriptStage.CreateFunctional(
+            scriptPath, (fun (_: CreateContext) -> create ()), handle, ?dispose = dispose
+        )
+
     static member CreateFunctional<'State>
         (
             scriptPath: string,

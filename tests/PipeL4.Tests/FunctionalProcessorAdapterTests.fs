@@ -246,7 +246,7 @@ module FunctionalProcessorAdapterTests =
             | _ -> ()
         }
 
-    let private adapt functional state action =
+    let private adapt functional state (action: ProcessContext -> PipeL4.Plugins.ProcessorResult) =
         if functional then
             FunctionalProcessorAdapter(action, state) :> PipeL4.Core.IByteStreamProcessor
         else

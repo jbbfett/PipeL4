@@ -492,12 +492,17 @@ module ScriptTcpForwarderIntegrationTests =
         }
 
     [<Theory>]
-    [<InlineData("failure", false)>]
-    [<InlineData("failure", true)>]
-    [<InlineData("cancellation", false)>]
-    [<InlineData("cancellation", true)>]
-    [<InlineData("eof", true)>]
-    let ``functional stages use production terminal cleanup and preserve failure precedence`` outcome cleanupFails =
+    [<InlineData("failure", false, false)>]
+    [<InlineData("failure", false, true)>]
+    [<InlineData("failure", true, false)>]
+    [<InlineData("failure", true, true)>]
+    [<InlineData("cancellation", false, false)>]
+    [<InlineData("cancellation", false, true)>]
+    [<InlineData("cancellation", true, false)>]
+    [<InlineData("cancellation", true, true)>]
+    [<InlineData("eof", true, false)>]
+    [<InlineData("eof", true, true)>]
+    let ``functional stages use production terminal cleanup and preserve failure precedence`` outcome cleanupFails asynchronous =
         task {
             use timeout = new CancellationTokenSource(10_000: int)
             use backendListener = new TcpListener(loopback, 0)
@@ -510,31 +515,47 @@ module ScriptTcpForwarderIntegrationTests =
             let connectionDisposed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
             let handlerFailure = InvalidOperationException("functional handle failed")
             let cleanupFailure = InvalidOperationException("functional dispose failed")
+            let signal () = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+            let handlerStarted, resumeHandler = signal (), signal ()
+            let cleanupStarted, resumeCleanup = signal (), signal ()
             let stage name =
-                ConfiguredScriptStage.CreateFunctional(
-                    $"{name}.fsx",
-                    (fun (ctx: CreateContext) ->
-                        ctx.ConnectionState.GetOrAdd(
-                            "owned",
-                            fun () ->
-                                { new IDisposable with
-                                    member _.Dispose() =
-                                        events.Enqueue "connection"
-                                        connectionDisposed.TrySetResult(()) |> ignore }
-                        ) |> ignore
-                        if name = "server" then constructed.TrySetResult(()) |> ignore
-                        ctx.ConnectionState),
-                    (fun ctx state ->
-                        Assert.Same(state, ctx.ConnectionState)
-                        if outcome = "failure" && name = "client" && not ctx.Input.IsEmpty then
-                            raise handlerFailure
-                        emitInput ctx 0L ctx.Input.Length
-                        releaseAll),
-                    dispose = (fun (state: IConnectionState) ->
-                        Assert.True(state.TryGet<IDisposable>("owned").IsSome)
-                        events.Enqueue name
-                        if cleanupFails && name = "client" then raise cleanupFailure)
-                )
+                let create (ctx: CreateContext) =
+                    ctx.ConnectionState.GetOrAdd(
+                        "owned",
+                        fun () ->
+                            { new IDisposable with
+                                member _.Dispose() =
+                                    events.Enqueue "connection"
+                                    connectionDisposed.TrySetResult(()) |> ignore }
+                    ) |> ignore
+                    if name = "server" then constructed.TrySetResult(()) |> ignore
+                    ctx.ConnectionState
+                let handle ctx state =
+                    Assert.Same(state, ctx.ConnectionState)
+                    if outcome = "failure" && name = "client" && not ctx.Input.IsEmpty then
+                        raise handlerFailure
+                    emitInput ctx 0L ctx.Input.Length
+                    releaseAll
+                let cleanup (state: IConnectionState) =
+                    Assert.True(state.TryGet<IDisposable>("owned").IsSome)
+                    events.Enqueue name
+                    if cleanupFails && name = "client" then raise cleanupFailure
+                if asynchronous then
+                    ConfiguredScriptStage.CreateFunctional(
+                        $"{name}.fsx", create,
+                        FunctionalHandler<IConnectionState>.Create(fun ctx state -> task {
+                            if name = "client" && not ctx.Input.IsEmpty then
+                                handlerStarted.TrySetResult(()) |> ignore
+                                do! resumeHandler.Task.WaitAsync(ctx.CancellationToken)
+                            return handle ctx state
+                        }),
+                        dispose = FunctionalDisposal<IConnectionState>.Create(fun state -> task {
+                            cleanupStarted.TrySetResult(()) |> ignore
+                            do! resumeCleanup.Task.WaitAsync(timeout.Token)
+                            cleanup state
+                        }))
+                else
+                    ConfiguredScriptStage.CreateFunctional($"{name}.fsx", create, handle, dispose = cleanup)
             let definition = ScriptPipelineDefinition([| stage "client" |], [| stage "server" |])
             do!
                 runWithForwarder
@@ -552,11 +573,23 @@ module ScriptTcpForwarderIntegrationTests =
                             let backendStream = backend.GetStream()
                             do! constructed.Task.WaitAsync(timeout.Token)
                             match outcome with
-                            | "cancellation" -> proxy.Shutdown.Cancel()
+                            | "cancellation" ->
+                                if asynchronous then
+                                    do! clientStream.WriteAsync([| 1uy |], timeout.Token)
+                                    do! handlerStarted.Task.WaitAsync(timeout.Token)
+                                proxy.Shutdown.Cancel()
                             | "eof" ->
                                 client.Client.Shutdown(SocketShutdown.Send)
                                 backend.Client.Shutdown(SocketShutdown.Send)
-                            | _ -> do! clientStream.WriteAsync([| 1uy |], timeout.Token)
+                            | _ ->
+                                do! clientStream.WriteAsync([| 1uy |], timeout.Token)
+                                if asynchronous then
+                                    do! handlerStarted.Task.WaitAsync(timeout.Token)
+                                    resumeHandler.SetResult(())
+                            if asynchronous then
+                                do! cleanupStarted.Task.WaitAsync(timeout.Token)
+                                Assert.False(connectionDisposed.Task.IsCompleted)
+                                resumeCleanup.SetResult(())
                             do! connectionDisposed.Task.WaitAsync(timeout.Token)
                             do! expectDisconnect clientStream timeout.Token
                             do! expectDisconnect backendStream timeout.Token

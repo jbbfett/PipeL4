@@ -48,6 +48,8 @@ type FunctionalProcessorAdapterBenchmarks() =
     let mutable functionalPipeline = Unchecked.defaultof<ProcessorPipeline>
     let mutable statefulClassPipeline = Unchecked.defaultof<ProcessorPipeline>
     let mutable statefulFunctionalPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable valueTaskPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable statefulValueTaskPipeline = Unchecked.defaultof<ProcessorPipeline>
     let state = new ConnectionState()
 
     [<Params(false, true)>]
@@ -97,11 +99,27 @@ type FunctionalProcessorAdapterBenchmarks() =
                 MemoryPool<byte>.Shared
             )
 
+        valueTaskPipeline <-
+            new ProcessorPipeline(
+                [| FunctionalProcessorAdapter((fun ctx -> ValueTask<PipeL4.Plugins.ProcessorResult>(handle ctx)), publicState) |],
+                FunctionalAdapterSink(), MemoryPool<byte>.Shared)
+        statefulValueTaskPipeline <-
+            new ProcessorPipeline(
+                [| new FunctionalProcessorAdapter<int64 ref>(
+                       (fun _ -> ref 0L),
+                       FunctionalHandler<int64 ref>.Create(fun ctx total ->
+                           total.Value <- total.Value + ctx.Input.Length
+                           ValueTask<PipeL4.Plugins.ProcessorResult>(handle ctx)),
+                       None, publicState) |],
+                FunctionalAdapterSink(), MemoryPool<byte>.Shared)
+
         for name, pipeline in
             [ "class", classPipeline
               "functional", functionalPipeline
               "stateful class", statefulClassPipeline
-              "stateful functional", statefulFunctionalPipeline ] do
+              "stateful functional", statefulFunctionalPipeline
+              "completed ValueTask", valueTaskPipeline
+              "stateful completed ValueTask", statefulValueTaskPipeline ] do
             let owner = MemoryPool<byte>.Shared.Rent(4096)
             pipeline.PushAsync(owner, 4096, CancellationToken.None).GetAwaiter().GetResult()
             let metrics = pipeline.GetStageMetricsSnapshot() |> List.exactlyOne
@@ -127,6 +145,10 @@ type FunctionalProcessorAdapterBenchmarks() =
             (statefulClassPipeline :> IDisposable).Dispose()
         if not (obj.ReferenceEquals(statefulFunctionalPipeline, null)) then
             (statefulFunctionalPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(valueTaskPipeline, null)) then
+            (valueTaskPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(statefulValueTaskPipeline, null)) then
+            (statefulValueTaskPipeline :> IDisposable).Dispose()
         (state :> IAsyncDisposable).DisposeAsync().GetAwaiter().GetResult()
 
     [<Benchmark(Baseline = true)>]
@@ -148,3 +170,13 @@ type FunctionalProcessorAdapterBenchmarks() =
     member _.StatefulFunctional4KiB() =
         let owner = MemoryPool<byte>.Shared.Rent(4096)
         statefulFunctionalPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.CompletedValueTask4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        valueTaskPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.StatefulCompletedValueTask4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        statefulValueTaskPipeline.PushAsync(owner, 4096, CancellationToken.None)

@@ -131,6 +131,48 @@ throughput interpretation. This run does not establish a speed improvement or th
 equivalence. The retained run log is `/tmp/pipel4-func03-benchmark.log`; normal BenchmarkDotNet
 reports are under the ignored `BenchmarkDotNet.Artifacts/results/` directory.
 
+The same fixture includes stateless and typed stateful handlers returning an already completed
+`ValueTask<ProcessorResult>`. Their setup, output accounting, payload, and production executor are
+identical to the synchronous and class cases. Run all six implementations in both output modes:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
+  --filter '*FunctionalProcessorAdapterBenchmarks*' --job short
+```
+
+Asynchronous adapter observation on 2026-11-24 (Ubuntu 24.04.5, Intel Core i5-8365U, SDK 10.0.115,
+.NET 10.0.15, BenchmarkDotNet 0.15.8 ShortRun, three warmups and three measured iterations):
+
+| Output | Adapter | Mean push latency (us) | 99.9% margin (us) | Derived MiB/s | Managed KiB/push |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Input-backed | Class | 1.304 | 1.974 | 2,994.9 | 1.51 |
+| Input-backed | Synchronous functional | 1.373 | 1.599 | 2,845.0 | 1.51 |
+| Input-backed | Stateful class | 1.009 | 0.699 | 3,872.9 | 1.51 |
+| Input-backed | Stateful synchronous functional | 1.037 | 2.345 | 3,766.5 | 1.51 |
+| Input-backed | Completed ValueTask | 0.984 | 0.067 | 3,968.6 | 1.51 |
+| Input-backed | Stateful completed ValueTask | 1.044 | 0.648 | 3,740.2 | 1.51 |
+| Generated copy | Class | 1.671 | 3.965 | 2,338.2 | 1.76 |
+| Generated copy | Synchronous functional | 1.445 | 1.696 | 2,704.0 | 1.76 |
+| Generated copy | Stateful class | 1.317 | 0.806 | 2,966.5 | 1.76 |
+| Generated copy | Stateful synchronous functional | 1.313 | 0.247 | 2,975.3 | 1.76 |
+| Generated copy | Completed ValueTask | 1.307 | 1.091 | 2,988.5 | 1.76 |
+| Generated copy | Stateful completed ValueTask | 1.307 | 0.959 | 2,988.9 | 1.76 |
+
+All six implementations matched the preceding synchronous allocation observations: completed
+value tasks add no measured allocation per push. Input-backed preflights copied zero payload
+bytes (ratio 0), with an 8 KiB logical peak and 4 KiB active physical-capacity peak. Generated
+preflights copied 4 KiB (ratio 1), with 8 KiB logical and physical peaks. Every preflight ended
+with zero logical and physical occupancy. These metrics describe runtime-owned storage and the
+fixture's explicit payload copies, not process memory or all runtime metadata copying.
+
+The generated benchmark runner used Release configuration. No build or test run overlapped the
+measurements. Process priority elevation was unavailable, and the wide ShortRun confidence
+margins do not establish latency or throughput equivalence or improvement. Suspended handlers
+are covered by deterministic correctness tests; these measurements cover completed operations.
+The initial sandboxed attempt failed to restore the generated runner and executed no benchmarks;
+the successful run outside that sandbox completed all 12 cases. Its retained log is
+`/tmp/pipel4-func04-benchmark.log`; normal reports are under `BenchmarkDotNet.Artifacts/results/`.
+
 Run the full-job internal diagnostics allocation comparison:
 
 ```sh

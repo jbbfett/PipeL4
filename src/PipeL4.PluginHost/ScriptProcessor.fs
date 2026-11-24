@@ -58,15 +58,84 @@ type internal ScriptProcessorAdapter(processor: IByteStreamProcessor) =
                 ValueTask()
             | _ -> ValueTask()
 
-/// Bridges a synchronous handle to the same executor and writer used by class processors.
+/// Construction-time normalization; the synchronous case never creates a task.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type internal FunctionalHandler<'State> =
+    private
+    | Synchronous of OptimizedClosures.FSharpFunc<ProcessContext, 'State, ProcessorResult>
+    | Asynchronous of OptimizedClosures.FSharpFunc<ProcessContext, 'State, ValueTask<ProcessorResult>>
+
+    static member Create(handle: ProcessContext -> 'State -> ProcessorResult) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        Synchronous(OptimizedClosures.FSharpFunc<_, _, _>.Adapt handle)
+
+    static member Create(handle: ProcessContext -> 'State -> ValueTask<ProcessorResult>) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        Asynchronous(OptimizedClosures.FSharpFunc<_, _, _>.Adapt handle)
+
+    static member Create(handle: ProcessContext -> 'State -> Task<ProcessorResult>) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        let invoke = OptimizedClosures.FSharpFunc<_, _, _>.Adapt handle
+        FunctionalHandler<'State>.Create(fun ctx state -> ValueTask<ProcessorResult>(invoke.Invoke(ctx, state)))
+
+    member this.Invoke(context, state) =
+        let adapt (result: ProcessorResult) : PipeL4.Core.ProcessorResult =
+            { RetainedLength = result.RetainedLength }
+
+        match this with
+        | Synchronous invoke ->
+            ValueTask<PipeL4.Core.ProcessorResult>(adapt (invoke.Invoke(context, state)))
+        | Asynchronous invoke ->
+            let operation = invoke.Invoke(context, state)
+            if operation.IsCompletedSuccessfully then
+                ValueTask<PipeL4.Core.ProcessorResult>(adapt operation.Result)
+            else
+                ValueTask<PipeL4.Core.ProcessorResult>(task {
+                    let! result = operation.AsTask()
+                    return adapt result
+                })
+
+/// Only explicitly supplied cleanup is normalized, once, to the existing async lifecycle.
+type internal FunctionalDisposal<'State> private (invoke: 'State -> ValueTask) =
+    member _.Invoke(state) = invoke state
+
+    static member Create(dispose: 'State -> unit) =
+        if obj.ReferenceEquals(dispose, null) then nullArg (nameof dispose)
+        FunctionalDisposal(fun state -> dispose state; ValueTask())
+
+    static member Create(dispose: 'State -> ValueTask) =
+        if obj.ReferenceEquals(dispose, null) then nullArg (nameof dispose)
+        FunctionalDisposal(dispose)
+
+    static member Create(dispose: 'State -> Task<unit>) =
+        if obj.ReferenceEquals(dispose, null) then nullArg (nameof dispose)
+        FunctionalDisposal(fun state -> ValueTask(dispose state :> Task))
+
+    static member Create(dispose: 'State -> ValueTask<unit>) =
+        if obj.ReferenceEquals(dispose, null) then nullArg (nameof dispose)
+        FunctionalDisposal(fun state -> ValueTask(task { do! dispose state }))
+
+/// Bridges typed handlers to the same executor and writer used by class processors.
 type internal FunctionalProcessorAdapter
-    (handle: ProcessContext -> ProcessorResult, connectionState: IConnectionState) =
+    private (handle: FunctionalHandler<unit>, connectionState: IConnectionState) =
     do
         if obj.ReferenceEquals(handle, null) then
             nullArg (nameof handle)
 
         if obj.ReferenceEquals(connectionState, null) then
             nullArg (nameof connectionState)
+
+    new(handle: ProcessContext -> ProcessorResult, connectionState) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        FunctionalProcessorAdapter(FunctionalHandler<unit>.Create(fun ctx () -> handle ctx), connectionState)
+
+    new(handle: ProcessContext -> Task<ProcessorResult>, connectionState) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        FunctionalProcessorAdapter(FunctionalHandler<unit>.Create(fun ctx () -> handle ctx), connectionState)
+
+    new(handle: ProcessContext -> ValueTask<ProcessorResult>, connectionState) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        FunctionalProcessorAdapter(FunctionalHandler<unit>.Create(fun ctx () -> handle ctx), connectionState)
 
     interface PipeL4.Core.IByteStreamProcessor with
         member _.ProcessAsync(input, output, cancellationToken) =
@@ -77,18 +146,14 @@ type internal FunctionalProcessorAdapter
                   CancellationToken = cancellationToken
                   ConnectionState = connectionState }
 
-            let result = handle context
-
-            ValueTask<PipeL4.Core.ProcessorResult>(
-                ({ RetainedLength = result.RetainedLength }: PipeL4.Core.ProcessorResult)
-            )
+            handle.Invoke(context, ())
 
 /// Owns one eagerly created, strongly typed local state value. Only explicit user cleanup runs.
 type internal FunctionalProcessorAdapter<'State>
     (
         create: CreateContext -> 'State,
-        handle: ProcessContext -> 'State -> ProcessorResult,
-        dispose: ('State -> unit) option,
+        handle: FunctionalHandler<'State>,
+        dispose: FunctionalDisposal<'State> option,
         connectionState: IConnectionState
     ) =
     do
@@ -105,9 +170,12 @@ type internal FunctionalProcessorAdapter<'State>
         | Some cleanup when obj.ReferenceEquals(cleanup, null) -> nullArg (nameof dispose)
         | _ -> ()
 
-    // Adapt once, avoiding a partially applied handler allocation on each invocation.
-    let invoke = OptimizedClosures.FSharpFunc<ProcessContext, 'State, ProcessorResult>.Adapt handle
     let state = create { ConnectionState = connectionState }
+
+    new(create, handle: ProcessContext -> 'State -> ProcessorResult, dispose: ('State -> unit) option, connectionState) =
+        new FunctionalProcessorAdapter<'State>(
+            create, FunctionalHandler<'State>.Create(handle),
+            Option.map (fun (cleanup: 'State -> unit) -> FunctionalDisposal<'State>.Create(cleanup)) dispose, connectionState)
 
     interface PipeL4.Core.IByteStreamProcessor with
         member _.ProcessAsync(input, output, cancellationToken) =
@@ -118,17 +186,13 @@ type internal FunctionalProcessorAdapter<'State>
                   CancellationToken = cancellationToken
                   ConnectionState = connectionState }
 
-            let result = invoke.Invoke(context, state)
+            handle.Invoke(context, state)
 
-            ValueTask<PipeL4.Core.ProcessorResult>(
-                ({ RetainedLength = result.RetainedLength }: PipeL4.Core.ProcessorResult)
-            )
-
-    interface IDisposable with
-        member _.Dispose() =
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
             match dispose with
-            | Some cleanup -> cleanup state
-            | None -> ()
+            | Some cleanup -> cleanup.Invoke(state)
+            | None -> ValueTask()
 
 [<NoEquality; NoComparison>]
 type internal ProcessorConstructor =
