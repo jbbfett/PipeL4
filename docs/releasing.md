@@ -19,6 +19,58 @@ checkout identifies both alpha.2 packages as local release candidates. Verify th
 status and publishing account ownership before release. The commands below build and validate both
 packages; CI and Distribution validation do not publish them.
 
+The already published alpha.2 package files are immutable NuGet artifacts. A package rebuilt from
+this checkout is a separate local or CI candidate, even when it has the same package ID and version;
+it does not replace or represent the bytes already published. Distribution validation only checks
+and uploads its newly built candidate artifacts.
+
+## Distribution producer SDK policy
+
+Distribution validation runs two independent producers: `produce_canonical` with SDK `10.0.115` and
+`produce_compatibility` with SDK `10.0.404`. Four independent consumers validate each producer's
+packages with both SDKs: `consume_115_from_115`, `consume_404_from_115`, `consume_115_from_404`,
+and `consume_404_from_404`. Consumers download the selected producer artifact and do not rebuild or
+repack PipeL4. They validate the tool and public API packages, compile independent public API
+consumers, run F# Interactive authoring checks, and install and smoke-test the tool. The public API
+and FSI regression harnesses run once per consumer SDK against the canonical producer package; the
+full package-backed solution suite remains in the canonical producer. The canonical producer is
+the only producer whose artifacts may be selected as public release candidates. Compatibility
+packages are diagnostic artifacts and are never an alternative public release.
+
+The checked-in [`global.json`](../global.json) continues to request SDK `10.0.112` for ordinary
+repository commands. CI and Distribution install and select their exact workflow SDKs separately;
+Distribution reuses CI's existing selection pattern. Each Distribution producer saves the checked-in
+file, changes only the SDK version and `rollForward` setting for its job, disables roll-forward, and
+requires `dotnet --version` to equal its configured SDK exactly. Consumers install both supported
+SDKs for cross-SDK regression controls and pin the requested consumer SDK the same way. The aggregate
+job selects SDK `10.0.115` to evaluate results. An `always()` cleanup step restores the saved policy
+in each job. This gives Distribution explicit SDK selection without changing repository-wide SDK
+policy.
+
+Each successful producer exports the exact uploaded artifact name and its producer attempt as job
+outputs. Each consumer uses outputs from its declared producer, checks the SDK, canonical or
+compatibility role, checkout SHA, and attempt encoded in that name, then downloads only that
+artifact. The manifest is checked against the producer attempt and the current workflow run ID and
+checkout SHA. This lets a consumer rerun use the artifact from a producer job that succeeded in an
+earlier attempt. [GitHub documents that jobs excluded from a rerun retain their outputs for jobs
+that are rerun](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs);
+local self-tests verify the identity checks but cannot exercise hosted artifact availability or rerun
+scheduling. A producer rerun refreshes its outputs, and its dependent consumers use the newly uploaded
+artifact. A failed producer prevents dependent consumers from running.
+
+Artifact names identify the SDK, canonical or compatibility role, tested checkout SHA, and producer
+attempt. Manifests also record the workflow run ID. Each artifact includes both packages in separate
+directories, separate `source-revision.txt` files, a manifest with package IDs, versions, paths, and
+SHA-256 digests, and `SHA256SUMS`. The workflow verifies both package repository commit attributes
+and both source revision files against the tested checkout before upload. Do not select a
+compatibility artifact for release or mix packages from separate producer artifacts.
+
+The required `Build and validate distributable packages` check waits for both producers and all four
+consumers. It succeeds only when each of the six independent job results is `success`. Its `always()`
+condition lets it report failed, skipped, or canceled job outcomes while the workflow is still
+active. GitHub can terminate a workflow that is canceled in its entirety before the aggregate runs
+or completes; such a run is not a successful aggregate check.
+
 ## 0.1.0-alpha.2 release procedure
 
 ### Package model and compatibility
@@ -52,11 +104,11 @@ host compiles the guarded reference out and uses its bundled contract assembly. 
 should use the same released version of `PipeL4.Plugins` as the tool. A NuGet package version that
 has already been published cannot be replaced.
 
-F# Interactive also resolves an implicit `FSharp.Core` package. If its SDK-selected version is
-older than the dependency declared by `PipeL4.Plugins`, restore can report `NU1605`. Set
-`FSharpCoreImplicitPackageVersion` to the package's declared dependency version before launching
-FSI or VS Code/Ionide. For alpha.2, the package declares `FSharp.Core` `10.1.401`; this setting
-does not add another script reference or change PipeL4's runtime loading path.
+F# Interactive also resolves an implicit `FSharp.Core` package. The published alpha.2 package
+requires `FSharp.Core` `10.1.401`; set `FSharpCoreImplicitPackageVersion=10.1.401` when authoring
+against that published package with an older SDK default, as described in the README. The local
+candidate built from this checkout declares `10.0.100` and must be checked with the SDK default,
+without that override. The setting does not change PipeL4's runtime loading path.
 
 ### 1. Local source validation
 
@@ -166,47 +218,105 @@ Repeat checks affected by changes to source, package metadata, or package conten
 
 Before approving the pre-merge candidate, a reviewer must perform this check in VS Code with the
 Ionide F# extension and the .NET 10 SDK installed. Start with the
-[README authoring instructions](../README.md#f-script-authoring). Build the local
-`PipeL4.Plugins.0.1.0-alpha.2.nupkg` in step 2 first. On a Unix-like workstation, launch a fresh
-VS Code window with a disposable external workspace and isolated NuGet and FSI caches:
+[README authoring instructions](../README.md#f-script-authoring). Complete the build in step 1
+first. Run the following block from the repository root as one fail-fast shell sequence. It packs
+a fresh candidate into a new, empty directory, validates that exact file, and keeps it in place
+through the manual editor check. The external workspace pins the SDK actually selected in the
+repository, with roll-forward disabled. Stage that SDK's default `FSharp.Core` package in the
+local feed; if it is absent from the normal package cache, a disposable F# project fetches it
+from NuGet.org first:
 
 ```sh
+set -euo pipefail
+repo_root="$(pwd)"
+repo_sdk="$(dotnet --version)"
 ide_root="$(mktemp -d)"
-mkdir -p "$ide_root/workspace" "$ide_root/home" "$ide_root/packages" "$ide_root/http-cache" "$ide_root/dotnet-home"
+candidate_dir="$ide_root/candidate"
+api_package="$candidate_dir/PipeL4.Plugins.0.1.0-alpha.2.nupkg"
+api_feed="$ide_root/feed"
+extensions_dir="$HOME/.vscode/extensions"
+sdk_fsharp_version="$(dotnet msbuild src/PipeL4.Plugins/PipeL4.Plugins.fsproj -getProperty:FSCorePackageVersion)"
+global_packages="$(dotnet nuget locals global-packages --list | sed -n 's/^global-packages: //p')"
+fsharp_package="$global_packages/fsharp.core/$sdk_fsharp_version/fsharp.core.$sdk_fsharp_version.nupkg"
+mkdir -p "$candidate_dir" "$ide_root/workspace" "$api_feed" "$ide_root/home" "$ide_root/packages" "$ide_root/http-cache" "$ide_root/dotnet-home" "$ide_root/runtime"
+dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj --configuration Release --no-restore \
+  -p:PaketDisableCliTest=true -p:BuildInParallel=false --output "$candidate_dir"
+test -f "$api_package"
+dotnet fsi scripts/validate_fsi_authoring.fsx "$api_package" examples/AsciiUppercase.fsx
 cp examples/AsciiUppercase.fsx "$ide_root/workspace/AsciiUppercase.fsx"
-api_feed="$(realpath ./artifacts/second-prerelease/plugins)"
-FSharpCoreImplicitPackageVersion=10.1.401 \
-  RestoreSources="$api_feed;https://api.nuget.org/v3/index.json" \
-  NUGET_PACKAGES="$ide_root/packages" NUGET_HTTP_CACHE_PATH="$ide_root/http-cache" \
-  DOTNET_CLI_HOME="$ide_root/dotnet-home" HOME="$ide_root/home" \
+cat > "$ide_root/workspace/global.json" <<EOF
+{"sdk":{"version":"$repo_sdk","rollForward":"disable"}}
+EOF
+if ! test -f "$fsharp_package"; then
+  dotnet new classlib --language F# --framework net10.0 --output "$ide_root/core-stage" --no-restore
+  dotnet restore "$ide_root/core-stage/core-stage.fsproj" --source https://api.nuget.org/v3/index.json
+fi
+cp "$api_package" "$api_feed/"
+cp "$fsharp_package" "$api_feed/"
+cat > "$ide_root/workspace/NuGet.Config" <<EOF
+<configuration>
+  <packageSources>
+    <clear />
+    <add key="candidate" value="$api_feed" />
+  </packageSources>
+</configuration>
+EOF
+(
+  cd "$ide_root/workspace"
+  unset FSharpCoreImplicitPackageVersion NoWarn
+  export RestoreSources="$api_feed" NUGET_PACKAGES="$ide_root/packages" NUGET_HTTP_CACHE_PATH="$ide_root/http-cache"
+  export DOTNET_CLI_HOME="$ide_root/dotnet-home" HOME="$ide_root/home" XDG_RUNTIME_DIR="$ide_root/runtime"
+  workspace_sdk="$(dotnet --version)"
+  printf 'Workspace SDK: %s\n' "$workspace_sdk"
+  test "$workspace_sdk" = "$repo_sdk"
+  test "$(dotnet msbuild "$repo_root/src/PipeL4.Plugins/PipeL4.Plugins.fsproj" -getProperty:FSCorePackageVersion)" = "$sdk_fsharp_version"
+  dotnet fsi --exec ./AsciiUppercase.fsx
+  cmp "$api_package" "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/pipel4.plugins.0.1.0-alpha.2.nupkg"
   code --new-window --user-data-dir "$ide_root/vscode-data" \
-    --extensions-dir "$HOME/.vscode/extensions" "$ide_root/workspace"
+    --extensions-dir "$extensions_dir" "$ide_root/workspace"
+)
 ```
 
 The `--extensions-dir` path assumes the normal VS Code extension directory on Linux; adjust it to
 the actual directory containing Ionide. Keep this window separate from an existing VS Code process
-so the environment reaches Ionide and FSI. The local feed supplies the unpublished API candidate;
-NuGet.org supplies dependencies such as `FSharp.Core`. The empty cache and home prevent an older
-package or a previous FSI dependency-manager result from satisfying the check. Inspect the
-`#if INTERACTIVE` reference in the copied file and confirm that it names
-`PipeL4.Plugins, 0.1.0-alpha.2`.
+so the environment reaches Ionide and FSI. FSI's script dependency restore did not honor Package
+Source Mapping in this workflow: with an empty candidate feed, it loaded the published alpha.2
+package from another configured source. The sole restore source makes that impossible while the
+staged `FSharp.Core` package supplies the SDK default. NuGet.org is used only during setup if that
+package is not cached. The empty package cache and home prevent an older package or a previous FSI
+dependency-manager result from satisfying the check. The workspace-local `global.json` requires
+the exact repository-selected SDK; a missing SDK stops the workflow instead of selecting another
+feature band. Keep `ide_root` until the manual check is complete. Inspect the `#if INTERACTIVE`
+reference in the copied file and confirm that it names `PipeL4.Plugins, 0.1.0-alpha.2`.
 
 In that external workspace, open `AsciiUppercase.fsx`. Wait for Ionide to finish, then confirm
 `IByteStreamProcessor` and `ProcessorResult` resolve, hover shows their F# types, and diagnostics
 appear for a temporary `let intentionalError: int = "wrong type"` line and clear when it is
-removed. Use **F#: Send File to F# Interactive** and confirm successful evaluation. Confirm that no
-PipeL4 source project or project reference is present in the workspace. After FSI restore, compare
-the cached candidate with the reviewed package:
+removed. Use **F#: Send File to F# Interactive** and confirm successful evaluation. In that FSI
+session, evaluate `typeof<IByteStreamProcessor>.Assembly.Location` and record the returned path.
+In VS Code's integrated terminal at the workspace root, run `dotnet --version` and
+`dotnet fsi --version`; confirm the SDK matches `repo_sdk` and inspect Ionide's F# output for the
+SDK/toolchain path it selected. Stop if Ionide reports a different SDK or cannot resolve the script.
+Confirm that no PipeL4 source project or project reference is present in the workspace. After FSI
+restore, check the selected SDK-default package (currently `10.0.115`), compare the cached package
+with the candidate, and compare the DLL loaded by FSI with the DLL inside that candidate:
 
 ```sh
-sha256sum ./artifacts/second-prerelease/plugins/PipeL4.Plugins.0.1.0-alpha.2.nupkg \
-  "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/pipel4.plugins.0.1.0-alpha.2.nupkg"
+test "$sdk_fsharp_version" = 10.0.115 # expected for the currently installed SDK
+test -f "$ide_root/packages/fsharp.core/$sdk_fsharp_version/fsharp.core.$sdk_fsharp_version.nupkg"
+cmp "$api_package" "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/pipel4.plugins.0.1.0-alpha.2.nupkg"
+test "$fsi_dll" = "$ide_root/packages/pipel4.plugins/0.1.0-alpha.2/lib/net10.0/PipeL4.Plugins.dll"
+unzip -p "$api_package" lib/net10.0/PipeL4.Plugins.dll | sha256sum
+sha256sum "$fsi_dll"
 ```
 
-Record the IDE/extension and SDK versions, the observed type information, diagnostics, FSI result,
-and matching checksums. A failure or an unperformed IDE check blocks release approval. Repository
-FSI validation is separate evidence and does not complete this manual gate. **Execution pending:**
-this procedure has not itself been performed in an IDE as part of the documentation change.
+Set `fsi_dll` to the exact path printed by FSI before running the last three commands. If the
+installed SDK default changes, record the observed version instead of using the `10.0.115` check.
+The two DLL hashes must match. Record the IDE/extension and SDK versions, the
+observed type information, diagnostics, FSI result, and matching hashes. A failure or an unperformed
+IDE check blocks release approval. Repository FSI validation is separate evidence and does not
+complete this manual gate. **Execution pending:** this procedure has not itself been performed in an
+IDE as part of the documentation change.
 
 ### 4. Independent release audit
 
@@ -221,16 +331,17 @@ Stop for an unresolved finding.
 Before squash-merging, require both GitHub Actions checks to succeed for the latest pull request
 revision:
 
-- `CI / Build and test`
+- `CI / Build and test (.NET SDK 10.0.115)`
+- `CI / Build and test (.NET SDK 10.0.404)`
 - `Distribution validation / Build and validate distributable packages`
 
 Confirm each run belongs to this pull request and corresponds to its current head and base
-revisions. Both workflows use `actions/checkout@v7` without a `ref` override. For a
-`pull_request` event, that checks out GitHub's synthetic pull request merge ref; the run's tested
-`GITHUB_SHA` can therefore differ from the pull request branch's head SHA. Do not require those
-SHAs to be equal. Record both run URLs, the pull request head and base SHAs, the event, and each
-run's tested SHA. If the pull request head or base changes after validation, require both checks to
-pass again for the updated pull request state and record the new runs before merging.
+revisions. CI uses `actions/checkout@v7` without a `ref` override; Distribution explicitly checks
+out the event's `github.sha`. For a `pull_request` event, both identify GitHub's synthetic pull
+request merge revision, which can differ from the pull request branch's head SHA. Do not require
+those SHAs to be equal. Record both run URLs, the pull request head and base SHAs, the event, and
+each run's tested SHA. If the pull request head or base changes after validation, require both
+checks to pass again for the updated pull request state and record the new runs before merging.
 
 ### 5. Squash merge into `master`
 
@@ -245,10 +356,15 @@ from the pre-merge pull request checks in step 4a:
 
 - [CI](../.github/workflows/ci.yml) restores, builds, tests, packs, and validates the `PipeL4` tool
   package. It does not validate the `PipeL4.Plugins` distribution by itself.
-- [Distribution validation](../.github/workflows/distribution-validation.yml) packs both packages,
-  validates each package and their matching versions, builds the independent public API consumer,
-  checks FSI authoring, runs the package-backed solution suite, and uploads both candidates with
-  `source-revision.txt` files.
+- [Distribution validation](../.github/workflows/distribution-validation.yml) runs independent
+  exact-SDK producers for `10.0.115` (canonical) and `10.0.404` (compatibility). Both build and
+  validate the lockstep packages and record package and source provenance. The canonical producer
+  runs the full package-backed solution suite. All four consumer jobs validate the package, Public
+  API, FSI authoring, and tool smoke behavior. Consumers of the canonical artifact also run the
+  API and FSI regression harnesses once per consumer SDK. Each producer uploads a separately named
+  artifact with its role, SDK, source SHA, run attempt, manifest, checksums, and per-package
+  `source-revision.txt` files. Only the `10.0.115` canonical artifact is eligible for public release
+  review.
 
 Both workflows run on pushes and pull requests targeting `master` and support manual dispatch.
 Neither workflow publishes NuGet packages, creates a Git tag, or publishes a GitHub Release. Save
@@ -258,11 +374,11 @@ merged commit. Do not use an artifact from a pre-merge or unrelated run.
 ### 7. Verify the final source SHA
 
 Before tagging, check the clean `master` checkout, remote branch, both downloaded
-`source-revision.txt` files, and the `repository commit` attributes in both package nuspecs. Each
-must identify the same full squash-merge commit SHA. Distribution records the source revision in
-the artifact but does not compare it with both nuspec commits, so make that comparison explicitly.
-Re-run package validators on the downloaded files and record their SHA-256 checksums. Stop if the
-workflow, source revision, nuspec commit, or local `master` SHA differs.
+`source-revision.txt` files, the manifest, and both package `repository commit` attributes. Each
+must identify the same full squash-merge commit SHA. Distribution verifies the package commits and
+source revision files against the tested checkout and records package SHA-256 digests in both the
+manifest and `SHA256SUMS`. Re-run package validators on the downloaded canonical files and verify
+their checksums. Stop if the workflow, source revision, nuspec commit, or local `master` SHA differs.
 
 ```sh
 git status --short

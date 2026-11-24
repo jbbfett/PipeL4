@@ -14,28 +14,62 @@ permissions:
 
 jobs:
   validate:
-    name: Build and test
+    name: Build and test (.NET SDK ${{ matrix.sdk }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: ['10.0.115', '10.0.404']
     steps:
       - name: Check out source
         uses: actions/checkout@v7
 
-      - name: Set up .NET SDK from global.json
+      - name: Install matrix .NET SDK
         uses: actions/setup-dotnet@v6
         with:
-          global-json-file: global.json
+          dotnet-version: ${{ matrix.sdk }}
 
-      - name: Print selected .NET SDK
-        run: dotnet --version
+      - name: Select and verify exact .NET SDK
+        env:
+          SDK_VERSION: ${{ matrix.sdk }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp global.json "$RUNNER_TEMP/pipel4-global.json"
+          jq --arg sdk "$SDK_VERSION" '.sdk.version = $sdk | .sdk.rollForward = "disable"' \
+            global.json > "$RUNNER_TEMP/pipel4-matrix-global.json"
+          cp "$RUNNER_TEMP/pipel4-matrix-global.json" global.json
+          selected_sdk="$(dotnet --version)"
+          printf 'Requested .NET SDK: %s; selected .NET SDK: %s\n' "$SDK_VERSION" "$selected_sdk"
+          if [[ "$selected_sdk" != "$SDK_VERSION" ]]; then
+            echo "SDK selection failed: expected $SDK_VERSION, got $selected_sdk." >&2
+            exit 1
+          fi
+
+          # Paket appends NU1605 during target execution; remove its suppression and preserve the existing error list.
+          warning_policy_targets="$RUNNER_TEMP/pipel4-ci-warning-policy.targets"
+          cat > "$warning_policy_targets" <<'EOF'
+          <Project>
+            <Target Name="Pipel4EnforceNu1605AfterPaket" AfterTargets="PaketRestore">
+              <PropertyGroup>
+                <NoWarn>$([System.Text.RegularExpressions.Regex]::Replace('$(NoWarn)', '(?i)(^|[;,])\s*NU1605\s*(?=[;,]|$)', '$1'))</NoWarn>
+                <WarningsAsErrors>$(WarningsAsErrors);NU1605</WarningsAsErrors>
+              </PropertyGroup>
+            </Target>
+          </Project>
+          EOF
 
       - name: Restore Paket tool
         run: dotnet tool restore
+
+      - name: Restore Paket dependencies
+        run: dotnet paket restore
 
       - name: Clean Release outputs
         run: dotnet clean src/PipeL4/PipeL4.fsproj --configuration Release -p:PaketDisableCliTest=true -p:BuildInParallel=false
 
       - name: Restore dependencies
-        run: dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
+        run: CustomAfterMicrosoftCommonTargets="$RUNNER_TEMP/pipel4-ci-warning-policy.targets" dotnet restore PipeL4.sln -p:PaketDisableCliTest=true -p:BuildInParallel=false
 
       - name: Build Release
         run: dotnet build PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true
@@ -89,3 +123,13 @@ jobs:
         env:
           PIPEL4_PACKAGE_PATH: ${{ steps.validated_package.outputs.path }}
         run: dotnet test --solution PipeL4.sln --configuration Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false
+
+      - name: Restore SDK policy and verify dependency files are unchanged
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "$RUNNER_TEMP/pipel4-global.json" ]]; then
+            cp "$RUNNER_TEMP/pipel4-global.json" global.json
+          fi
+          git diff --exit-code -- global.json paket.dependencies paket.lock
