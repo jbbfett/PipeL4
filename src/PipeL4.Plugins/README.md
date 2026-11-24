@@ -38,3 +38,105 @@ form; arbitrary package dependencies, assembly paths, `#load`, and `#I` are unsu
 repository's [F# script authoring guide](https://github.com/jbbfett/PipeL4#f-script-authoring) for
 VS Code/Ionide setup, the accepted directive restrictions, and how to run the same script through
 PipeL4.
+
+## Functional processor contracts
+
+The public library also provides `CreateContext`, `ProcessContext`, and the automatically opened
+`FunctionalProcessor` module. These are contracts and helpers only: the script host still requires
+an `IByteStreamProcessor` class. It does not discover or invoke functional `create`, `handle`, or
+`dispose` functions yet. The snippets below illustrate intended authoring syntax and can be
+typechecked against the contract assembly; they are not standalone runnable PipeL4 plugins.
+
+Both contexts are immutable struct records with no equality or comparison:
+
+```fsharp
+type CreateContext =
+    { ConnectionState: IConnectionState }
+
+type ProcessContext =
+    { Input: System.Buffers.ReadOnlySequence<byte>
+      IsCompleted: bool
+      Output: IProcessorOutput
+      CancellationToken: System.Threading.CancellationToken
+      ConnectionState: IConnectionState }
+```
+
+Opening `PipeL4.Plugins` makes these helpers available:
+
+```fsharp
+val emitInput: ctx: ProcessContext -> offset: int64 -> length: int64 -> unit
+val emitBytes: ctx: ProcessContext -> bytes: System.ReadOnlySpan<byte> -> unit
+val releaseAll: ProcessorResult
+val retainSuffix: length: int64 -> ProcessorResult
+```
+
+For example, a stateless input-backed processor can be expressed as:
+
+```fsharp
+open PipeL4.Plugins
+
+let handle ctx =
+    emitInput ctx 0L ctx.Input.Length
+    releaseAll
+```
+
+An intended stateful form passes local state explicitly:
+
+```fsharp
+open PipeL4.Plugins
+
+let create () = ref 0L
+
+let handle ctx (state: int64 ref) =
+    state.Value <- state.Value + ctx.Input.Length
+    emitInput ctx 0L ctx.Input.Length
+    releaseAll
+
+let dispose (state: int64 ref) =
+    printfn "Total: %d" state.Value
+```
+
+F# needs the local-state type annotation before resolving `.Value`. `handle` is the single
+supported functional entry point for future ScriptCompiler discovery. It requires no backticks
+and compiles without a reserved-word warning.
+
+The future lifecycle supports either `create () : 'State` or
+`create (ctx: CreateContext) : 'State`, a mandatory `handle` with or without an explicit state
+argument, and optional `dispose (state: 'State) : unit`. A future adapter will keep a fresh strongly
+typed state value per processor instance and pass it to `handle` and explicit `dispose`. Local
+state will not be automatically disposed, even if it implements disposal interfaces. There is no
+local-state registry. `IConnectionState` remains a separate runtime-managed, connection-wide
+registry; mutable values shared across concurrent directions require their own synchronization.
+Only the contracts are present here; async handler/disposal return forms, adapter storage,
+discovery, invocation, and lifecycle tests remain deferred. The contexts are ordinary structs,
+not byref-like types, so they do not prevent future asynchronous invocation forms.
+
+`Input` is the original segmented, non-owning sequence. `emitInput` forwards its offset and length
+directly to `Output.AppendInput`, preserving input-backed zero-copy emission, repetition, and
+ordering with generated output. `emitBytes` makes one copy directly from its span into
+`Output.GetSpan(bytes.Length)`, then calls `Advance(bytes.Length)`; it creates no intermediate
+array. Empty spans request no storage and emit nothing. For arrays or slices, explicit
+`System.ReadOnlySpan<byte>(bytes)` or `System.ReadOnlySpan<byte>(bytes, offset, count)` avoids
+implicit-conversion warnings; read-only memory can be passed as `memory.Span`. Pass both arguments
+to `emitBytes` together: a span cannot be captured in an ordinary F# first-class function value.
+Direct `ctx.Output.GetSpan`, `GetMemory`, and `Advance` remain available. Advance previously
+requested writable memory before another output operation, and never use that memory afterward.
+
+Emission does not select retention. `releaseAll` is `{ RetainedLength = 0L }`, and
+`retainSuffix length` is `{ RetainedLength = length }`. Neither helper emits, schedules work, or
+validates the result. The runtime still validates the suffix against the current input and requires
+zero retention at normal upstream completion. `IsCompleted` describes normal completion only;
+cancellation and failure do not synthesize EOF. Helpers do not add cancellation checks or wrap
+output failures; processor code can observe `ctx.CancellationToken` cooperatively.
+
+The context and all invocation input/output memory must not escape the invocation, including into
+local state or connection state. A future async invocation must preserve the existing lifetime
+through completion, including across suspension. Runtime memory accounting, synchronous output
+capacity failures, and downstream backpressure continue to belong to the existing runtime.
+
+There is no runtime execution path for functional processors to benchmark yet. Throughput,
+latency, allocations, copied-byte ratio, logical buffering, and physical capacity benchmarks for
+that path are deferred until the adapter exists. These helpers only forward existing output
+operations or construct the existing result struct; the contexts require no heap allocation when
+used directly. No SDK, package alignment, runtime dependency, or class-based processor behavior
+changes are required.

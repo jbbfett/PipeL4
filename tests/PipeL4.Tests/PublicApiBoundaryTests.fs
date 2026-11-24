@@ -13,7 +13,9 @@ module PublicApiBoundaryTests =
            typeof<ProcessorInput>
            typeof<ProcessorResult>
            typeof<IProcessorOutput>
-           typeof<IByteStreamProcessor> |]
+           typeof<IByteStreamProcessor>
+           typeof<CreateContext>
+           typeof<ProcessContext> |]
         |> Array.iter (fun contract ->
             Assert.Same(assembly, contract.Assembly)
             Assert.Equal("PipeL4.Plugins", contract.Namespace))

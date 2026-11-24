@@ -17,6 +17,7 @@
     <Compile Include="TcpForwarderIntegrationTests.fs" />
     <Compile Include="ProcessorContractTests.fs" />
     <Compile Include="PublicApiBoundaryTests.fs" />
+    <Compile Include="FunctionalProcessorApiTests.fs" />
     <Compile Include="ProcessorPipelineTests.fs" />
     <Compile Include="ScriptProcessorTests.fs" />
     <Compile Include="ScriptCompilerTests.fs" />
