@@ -24,6 +24,7 @@
     <Compile Include="FunctionalProcessorLifecycleTests.fs" />
     <Compile Include="FunctionalProcessorAsyncTests.fs" />
     <Compile Include="ScriptCompilerTests.fs" />
+    <Compile Include="FunctionalScriptTests.fs" />
     <Compile Include="ScriptPipelineTests.fs" />
     <Compile Include="ScriptTcpForwarderIntegrationTests.fs" />
     <Compile Include="ExampleProcessorTests.fs" />

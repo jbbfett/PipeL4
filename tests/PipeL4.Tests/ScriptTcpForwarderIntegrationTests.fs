@@ -4990,3 +4990,138 @@ type Processor(connectionState: IConnectionState) =
                             do! expectEndOfStream clientStream timeout.Token
                         })
         }
+
+    [<Fact>]
+    let ``discovered functional scripts share connection state while directions execute concurrently over TCP`` () =
+        task {
+            use timeout = new CancellationTokenSource(30_000: int)
+            use workspace = new TestWorkspace()
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let source = """module FunctionalTcp
+open System
+open System.Collections.Concurrent
+open System.Threading
+open System.Threading.Tasks
+open PipeL4.Plugins
+
+type Coordination private () =
+    static let states = ConcurrentQueue<obj>()
+    static let views = ConcurrentQueue<IConnectionState>()
+    static let shared = ConcurrentQueue<obj>()
+    static let events = ConcurrentQueue<string>()
+    static let firstCompleted = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let completed = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    static let mutable closed = 0
+    static member Record(state, view, value) = states.Enqueue(state); views.Enqueue(view); shared.Enqueue(value)
+    static member Cleanup() = events.Enqueue("processor")
+    static member ConnectionClosed() =
+        events.Enqueue("connection")
+        if Interlocked.Increment(&closed) = 1 then firstCompleted.SetResult(())
+        else completed.SetResult(())
+    static member States = states.ToArray()
+    static member Views = views.ToArray()
+    static member Shared = shared.ToArray()
+    static member Events = events.ToArray()
+    static member FirstCompleted = firstCompleted.Task
+    static member Completed = completed.Task
+
+type Shared() =
+    let ready = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+    let mutable entered = 0
+    member _.Enter() =
+        if Interlocked.Increment(&entered) = 2 then ready.TrySetResult(()) |> ignore
+        ready.Task
+    interface IDisposable with member _.Dispose() = Coordination.ConnectionClosed()
+
+type State = { Shared: Shared; View: IConnectionState; mutable Count: int64 }
+let create (ctx: CreateContext) =
+    let shared = ctx.ConnectionState.GetOrAdd("shared", fun () -> new Shared())
+    let state = { Shared = shared; View = ctx.ConnectionState; Count = 0L }
+    Coordination.Record(state, ctx.ConnectionState, shared)
+    state
+let handle ctx (state: State) = task {
+    if not (obj.ReferenceEquals(state.View, ctx.ConnectionState)) then failwith "wrong connection view"
+    if not ctx.Input.IsEmpty then
+        if state.Count = 0L then do! state.Shared.Enter().WaitAsync(ctx.CancellationToken)
+        state.Count <- state.Count + ctx.Input.Length
+    emitInput ctx 0L ctx.Input.Length
+    return releaseAll
+}
+let dispose (state: State) = ValueTask<unit>(task {
+    do! Task.Yield()
+    if state.Count = 0L then failwith "unused state"
+    Coordination.Cleanup()
+})
+"""
+            let path = workspace.WriteSource("FunctionalTcp.fsx", source)
+            let! plugin = compilePlugin workspace path
+            let classPath = workspace.WriteSource("Identity.fsx", generatedTransformSource "Identity" 0)
+            let listenPort = reservePort ()
+            let configuration = createConfiguration listenPort (endpointPort backendListener) [| path; classPath; path |] [| path |]
+            let mutable functionalCompilations = 0
+            let compiler script token =
+                if script = path then
+                    functionalCompilations <- functionalCompilations + 1
+                    Task.FromResult(Compiled(plugin, [||]))
+                else workspace.Compiler.CompileAndLoadAsync(script, token)
+            let logger = RecordingLogger()
+            do! runWithForwarder
+                    (fun token -> ScriptTcpForwarder.runWithCompilerAsync compiler configuration logger token)
+                    listenPort timeout.Token
+                    (fun proxy -> task {
+                        for index in 1 .. 2 do
+                            let accepted = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                            use! client = connectEventually proxy timeout.Token
+                            use! backend = accepted
+                            let clientStream, backendStream = client.GetStream(), backend.GetStream()
+                            // Both first handlers must enter before either can finish.
+                            do! clientStream.WriteAsync(bytes "request", timeout.Token)
+                            do! backendStream.WriteAsync(bytes "response", timeout.Token)
+                            let! request = readExactly backendStream 7 timeout.Token
+                            let! response = readExactly clientStream 8 timeout.Token
+                            request |> should equal (bytes "request")
+                            response |> should equal (bytes "response")
+                            client.Client.Shutdown(SocketShutdown.Send)
+                            backend.Client.Shutdown(SocketShutdown.Send)
+                            do! expectEndOfStream backendStream timeout.Token
+                            do! expectEndOfStream clientStream timeout.Token
+                            let coordination = requireType plugin.Assembly "Coordination"
+                            let completion = if index = 1 then "FirstCompleted" else "Completed"
+                            do! (requireStaticTask coordination completion).WaitAsync(timeout.Token)
+                        let coordination = requireType plugin.Assembly "Coordination"
+                        do! (requireStaticTask coordination "Completed").WaitAsync(timeout.Token)
+                    })
+            functionalCompilations |> should equal 1
+            logger.Failures |> should be Empty
+            let coordination = requireType plugin.Assembly "Coordination"
+            let states = staticProperty<obj array> coordination "States"
+            let views = staticProperty<IConnectionState array> coordination "Views"
+            let shared = staticProperty<obj array> coordination "Shared"
+            states.Length |> should equal 6
+            for index in 0 .. 5 do
+                for previous in 0 .. index - 1 do Assert.NotSame(states[index], states[previous])
+                Assert.Same(views[index / 3 * 3], views[index])
+                Assert.Same(shared[index / 3 * 3], shared[index])
+            Assert.NotSame(views[0], views[3])
+            Assert.NotSame(shared[0], shared[3])
+            staticProperty<string array> coordination "Events"
+            |> should equal [| "processor"; "processor"; "processor"; "connection"; "processor"; "processor"; "processor"; "connection" |]
+        }
+
+    [<Fact>]
+    let ``invalid functional signature prevents listener startup`` () =
+        task {
+            use timeout = new CancellationTokenSource(10_000: int)
+            use workspace = new TestWorkspace()
+            let path = workspace.WriteSource("InvalidFunctional.fsx", "open PipeL4.Plugins\nlet handle (ctx: ProcessContext) = 42")
+            let listenPort, backendPort = reservePort (), reservePort ()
+            let configuration = createConfiguration listenPort backendPort [| path |] [||]
+            let! error = Assert.ThrowsAsync<ScriptPluginConfigurationException>(fun () ->
+                ScriptTcpForwarder.runWithCompilerAsync
+                    (fun script token -> workspace.Compiler.CompileAndLoadAsync(script, token))
+                    configuration NullLogger.Instance timeout.Token)
+            error.Message.Contains(path, StringComparison.Ordinal) |> should equal true
+            error.Message.Contains("handle", StringComparison.Ordinal) |> should equal true
+            do! expectConnectionFailure listenPort timeout.Token
+        }

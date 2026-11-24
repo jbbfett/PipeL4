@@ -112,7 +112,7 @@ type internal ConfiguredScriptStage private
     new(scriptPath: string, plugin: CompiledScriptProcessor) =
         ConfiguredScriptStage(scriptPath, plugin.CreateProcessor)
 
-    // Typed construction only; script discovery continues to select class processors.
+    // Direct typed construction and compiled scripts share the same adapters.
     new(scriptPath: string, handle: ProcessContext -> PipeL4.Plugins.ProcessorResult) =
         ConfiguredScriptStage(
             scriptPath,

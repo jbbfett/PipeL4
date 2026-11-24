@@ -1375,3 +1375,86 @@ per-iteration durations, not loopback TCP scheduling. Repeating the TCP cases on
 host with longer iteration times would be needed for a stronger large-payload conclusion.
 
 Generated BenchmarkDotNet artifacts remain ignored and were not added to the commit.
+
+## Compiled functional script binding
+
+`FunctionalProcessorAdapterBenchmarks` also compiles real stateless and `int64 ref` stateful
+scripts through the production `ScriptCompiler`. Their factories construct the same typed adapters
+used by the directly configured functional cases. Compilation, delegate preparation, creation,
+and preflight checks run in setup, outside measured pushes. These cases measure synchronous
+4 KiB input-backed emission and direct copying into runtime-owned generated output.
+
+Command executed on 2026-11-24, with builds and tests finished before measurements:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
+  --filter '*FunctionalProcessorAdapterBenchmarks.Functional4KiB*' \
+           '*FunctionalProcessorAdapterBenchmarks.StatefulFunctional4KiB*' \
+           '*FunctionalProcessorAdapterBenchmarks.Discovered*' \
+  --job short --warmupCount 1 --iterationCount 3 --invocationCount 262144 --unrollFactor 16 \
+  --artifacts /tmp/pipel4-functional-benchmarks
+```
+
+All eight cases completed successfully (BenchmarkDotNet 0.15.8, Ubuntu 24.04.5,
+Intel Core i5-8365U, SDK 10.0.115 selected under `global.json`, .NET 10.0.15). Derived throughput
+is `3906.25 / mean microseconds`, counting one 4 KiB push. The existing request/response throughput
+column prints `?` for these socket-independent cases; it does not calculate this derived value.
+
+| Output | Handler construction | Mean push latency | 99.9% CI half-width | Derived MiB/s | Managed allocation/push |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Input-backed | Typed stateless | 1.133 us | 2.3893 us | 3,447.7 | 1.51 KiB |
+| Input-backed | Typed stateful | 1.144 us | 1.3866 us | 3,414.6 | 1.51 KiB |
+| Input-backed | Discovered stateless | 1.178 us | 1.7216 us | 3,316.0 | 1.51 KiB |
+| Input-backed | Discovered stateful | 1.141 us | 2.0637 us | 3,423.5 | 1.51 KiB |
+| Generated copy | Typed stateless | 1.697 us | 5.0915 us | 2,301.9 | 1.76 KiB |
+| Generated copy | Typed stateful | 1.614 us | 1.6750 us | 2,420.2 | 1.76 KiB |
+| Generated copy | Discovered stateless | 1.892 us | 4.1593 us | 2,064.6 | 1.76 KiB |
+| Generated copy | Discovered stateful | 1.346 us | 0.2800 us | 2,902.1 | 1.76 KiB |
+
+All preflights matched: input-backed emission copied zero payload bytes (ratio 0), with an
+8 KiB logical buffered-byte peak and 4 KiB active physical-capacity peak. Generated emission copied
+4 KiB (ratio 1), with 8 KiB logical and physical peaks. Every preflight ended at zero logical and
+physical occupancy. Copy counts cover the fixture's explicit payload copies; physical accounting
+covers active runtime-owned leases, not process RSS or inactive pool capacity.
+
+Allocations match between directly configured and discovered handlers, including stateful
+handlers. This short run has wide latency confidence intervals and unavailable process-priority
+elevation. It supports the allocation and accounting observations, not a latency improvement or
+throughput-equivalence claim. It does not benchmark cold script loading, TCP throughput, or
+asynchronous suspension.
+
+Related verification commands executed from the repository root:
+
+```sh
+dotnet build PipeL4.sln -c Debug --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false -m:1 -nr:false
+dotnet build PipeL4.sln -c Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false -m:1 -nr:false
+dotnet test --project tests/PipeL4.Tests/PipeL4.Tests.fsproj -c Release --no-build \
+  --filter-class PipeL4.Tests.FunctionalScriptTests \
+  --filter-class PipeL4.Tests.ScriptCompilerTests \
+  --filter-class PipeL4.Tests.ScriptPipelineTests \
+  --filter-class PipeL4.Tests.FunctionalProcessorAdapterTests \
+  --filter-class PipeL4.Tests.FunctionalProcessorLifecycleTests \
+  --filter-class PipeL4.Tests.FunctionalProcessorAsyncTests
+dotnet test --project tests/PipeL4.Tests/PipeL4.Tests.fsproj -c Release --no-build --filter-class PipeL4.Tests.ScriptTcpForwarderIntegrationTests
+dotnet test --solution PipeL4.sln -c Release --no-build
+dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj -c Release --no-build --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false --output /tmp/pipel4-functional-authoring
+dotnet fsi scripts/validate_fsi_authoring.fsx /tmp/pipel4-functional-authoring/PipeL4.Plugins.0.1.0-alpha.2.nupkg tests/fixtures/functional/Passthrough.fsx
+dotnet fsi scripts/validate_fsi_authoring.fsx /tmp/pipel4-functional-authoring/PipeL4.Plugins.0.1.0-alpha.2.nupkg tests/fixtures/functional/Counter.fsx
+dotnet fsi scripts/validate_fsi_authoring.fsx /tmp/pipel4-functional-authoring/PipeL4.Plugins.0.1.0-alpha.2.nupkg tests/fixtures/functional/ContextInferenceRepro.fsx
+git diff --check
+git status --short
+```
+
+Debug and Release builds passed; the final Debug build reported no warnings, and Release reported
+only the three existing FS3511 warnings in `FunctionalProcessorAdapterTests.fs` and
+`CliAcceptanceTests.fs`. Focused compiler/functional/pipeline/lifecycle tests passed 175/175;
+TCP integration tests passed 51/51. The first full run passed 632/633, with one CLI `--help`
+subprocess exiting 147. The executable then returned 0 when run directly, and the full-suite rerun
+passed 633/633 with no source changes between the runs and no skips. The transient exit's cause
+was not established; unrelated CLI tests were not modified.
+
+The temporary API package and both positive FSI checks succeeded, restoring only from isolated
+local feeds. The intentionally failing inference reproduction exited 1 with FS0001, as expected;
+its annotated form also passes the production host test. Early development invocations encountered
+sandbox IPC denial and zero-test/help handshake errors; successful verification used unsandboxed
+local IPC, a separate build, and direct Microsoft.Testing.Platform options with `--no-build`.

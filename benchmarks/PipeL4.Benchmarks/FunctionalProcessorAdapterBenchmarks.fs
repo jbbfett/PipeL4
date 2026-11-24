@@ -2,6 +2,7 @@ namespace PipeL4.Benchmarks
 
 open System
 open System.Buffers
+open System.IO
 open System.Threading
 open System.Threading.Tasks
 open BenchmarkDotNet.Attributes
@@ -50,6 +51,8 @@ type FunctionalProcessorAdapterBenchmarks() =
     let mutable statefulFunctionalPipeline = Unchecked.defaultof<ProcessorPipeline>
     let mutable valueTaskPipeline = Unchecked.defaultof<ProcessorPipeline>
     let mutable statefulValueTaskPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable discoveredPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable discoveredStatefulPipeline = Unchecked.defaultof<ProcessorPipeline>
     let state = new ConnectionState()
 
     [<Params(false, true)>]
@@ -113,13 +116,46 @@ type FunctionalProcessorAdapterBenchmarks() =
                        None, publicState) |],
                 FunctionalAdapterSink(), MemoryPool<byte>.Shared)
 
+        // Discovery and delegate preparation stay outside measured pushes, just as typed
+        // adapter construction does. These use real scripts and the production compiler.
+        let compileFunctional stateful =
+            let root = Path.Combine(Path.GetTempPath(), "PipeL4.Benchmarks", Guid.NewGuid().ToString("N"))
+            Directory.CreateDirectory(root) |> ignore
+            try
+                let path = Path.Combine(root, "Functional.fsx")
+                let state = if stateful then "let create () = ref 0L\n" else ""
+                let argument = if stateful then " (total: int64 ref)" else ""
+                let update = if stateful then "    total.Value <- total.Value + ctx.Input.Length\n" else ""
+                let output =
+                    if this.Generated then
+                        "    for segment in ctx.Input do emitBytes ctx segment.Span\n"
+                    else
+                        "    emitInput ctx 0L ctx.Input.Length\n"
+                File.WriteAllText(path,
+                    "open PipeL4.Plugins\n" + state + "let handle ctx" + argument + " =\n" +
+                    update + output + "    releaseAll\n")
+                match ScriptCompiler(Path.Combine(root, "compiler")).CompileAndLoadAsync(path, CancellationToken.None).GetAwaiter().GetResult() with
+                | Compiled(plugin, _) -> plugin
+                | Failed diagnostics ->
+                    diagnostics |> Array.map _.Message |> String.concat "\n" |> invalidOp
+            finally
+                Directory.Delete(root, true)
+        discoveredPipeline <-
+            new ProcessorPipeline([| (compileFunctional false).CreateProcessor(publicState) |],
+                                  FunctionalAdapterSink(), MemoryPool<byte>.Shared)
+        discoveredStatefulPipeline <-
+            new ProcessorPipeline([| (compileFunctional true).CreateProcessor(publicState) |],
+                                  FunctionalAdapterSink(), MemoryPool<byte>.Shared)
+
         for name, pipeline in
             [ "class", classPipeline
               "functional", functionalPipeline
               "stateful class", statefulClassPipeline
               "stateful functional", statefulFunctionalPipeline
               "completed ValueTask", valueTaskPipeline
-              "stateful completed ValueTask", statefulValueTaskPipeline ] do
+              "stateful completed ValueTask", statefulValueTaskPipeline
+              "discovered functional", discoveredPipeline
+              "discovered stateful functional", discoveredStatefulPipeline ] do
             let owner = MemoryPool<byte>.Shared.Rent(4096)
             pipeline.PushAsync(owner, 4096, CancellationToken.None).GetAwaiter().GetResult()
             let metrics = pipeline.GetStageMetricsSnapshot() |> List.exactlyOne
@@ -149,6 +185,10 @@ type FunctionalProcessorAdapterBenchmarks() =
             (valueTaskPipeline :> IDisposable).Dispose()
         if not (obj.ReferenceEquals(statefulValueTaskPipeline, null)) then
             (statefulValueTaskPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(discoveredPipeline, null)) then
+            (discoveredPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(discoveredStatefulPipeline, null)) then
+            (discoveredStatefulPipeline :> IDisposable).Dispose()
         (state :> IAsyncDisposable).DisposeAsync().GetAwaiter().GetResult()
 
     [<Benchmark(Baseline = true)>]
@@ -180,3 +220,13 @@ type FunctionalProcessorAdapterBenchmarks() =
     member _.StatefulCompletedValueTask4KiB() =
         let owner = MemoryPool<byte>.Shared.Rent(4096)
         statefulValueTaskPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.DiscoveredFunctional4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        discoveredPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.DiscoveredStatefulFunctional4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        discoveredStatefulPipeline.PushAsync(owner, 4096, CancellationToken.None)

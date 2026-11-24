@@ -198,95 +198,43 @@ type internal FunctionalProcessorAdapter<'State>
 type internal ProcessorConstructor =
     | Parameterless of ConstructorInfo
     | ConnectionStateAware of ConstructorInfo
+    | Functional of moduleType: Type * factory: (IConnectionState -> PipeL4.Core.IByteStreamProcessor)
 
 type internal CompiledScriptProcessor internal (assembly: Assembly, constructor: ProcessorConstructor) =
     member _.Assembly = assembly
 
     member _.ProcessorType =
-        let constructorInfo =
-            match constructor with
-            | Parameterless value
-            | ConnectionStateAware value -> value
-
-        match constructorInfo.DeclaringType with
-        | null -> invalidOp "The discovered processor constructor has no declaring type."
-        | processorType -> processorType
+        match constructor with
+        | Functional(moduleType, _) -> moduleType
+        | Parameterless value
+        | ConnectionStateAware value ->
+            match value.DeclaringType with
+            | null -> invalidOp "The discovered processor constructor has no declaring type."
+            | processorType -> processorType
 
     member _.CreateProcessor(connectionState: IConnectionState) : PipeL4.Core.IByteStreamProcessor =
         if obj.ReferenceEquals(connectionState, null) then
             nullArg (nameof connectionState)
 
-        let instance =
-            try
-                match constructor with
-                | Parameterless value -> value.Invoke(Array.empty)
-                | ConnectionStateAware value -> value.Invoke([| box connectionState |])
-            with :? TargetInvocationException as error ->
-                match Option.ofObj error.InnerException with
-                | Some innerError ->
-                    ExceptionDispatchInfo.Capture(innerError).Throw()
-                    Unchecked.defaultof<obj>
-                | None -> raise error
+        match constructor with
+        | Functional(_, factory) -> factory connectionState
+        | _ ->
+            let instance =
+                try
+                    match constructor with
+                    | Parameterless value -> value.Invoke(Array.empty)
+                    | ConnectionStateAware value -> value.Invoke([| box connectionState |])
+                    | Functional _ -> invalidOp "Expected a class processor constructor."
+                with :? TargetInvocationException as error ->
+                    match Option.ofObj error.InnerException with
+                    | Some innerError ->
+                        ExceptionDispatchInfo.Capture(innerError).Throw()
+                        Unchecked.defaultof<obj>
+                    | None -> raise error
 
-        let processor =
-            match instance with
-            | :? IByteStreamProcessor as value -> value
-            | _ -> invalidOp "The discovered processor type did not create an IByteStreamProcessor instance."
+            let processor =
+                match instance with
+                | :? IByteStreamProcessor as value -> value
+                | _ -> invalidOp "The discovered processor type did not create an IByteStreamProcessor instance."
 
-        ScriptProcessorAdapter(processor) :> PipeL4.Core.IByteStreamProcessor
-
-[<RequireQualifiedAccess>]
-module internal ScriptProcessorDiscovery =
-    let private displayName (processorType: Type) =
-        processorType.FullName
-        |> Option.ofObj
-        |> Option.filter (String.IsNullOrWhiteSpace >> not)
-        |> Option.defaultValue processorType.Name
-
-    let discover (assembly: Assembly) =
-        try
-            let candidates =
-                assembly.GetTypes()
-                |> Array.choose (fun processorType ->
-                    if
-                        processorType.IsVisible
-                        && processorType.IsClass
-                        && not processorType.IsAbstract
-                        && not processorType.ContainsGenericParameters
-                        && typeof<IByteStreamProcessor>.IsAssignableFrom processorType
-                    then
-                        match processorType.GetConstructor([| typeof<IConnectionState> |]) with
-                        | null ->
-                            match processorType.GetConstructor(Type.EmptyTypes) with
-                            | null -> None
-                            | constructor -> Some(processorType, Parameterless constructor)
-                        | constructor -> Some(processorType, ConnectionStateAware constructor)
-                    else
-                        None)
-                |> Array.sortBy (fun (processorType, _) -> displayName processorType)
-
-            match candidates with
-            | [| _, constructor |] -> Ok(CompiledScriptProcessor(assembly, constructor))
-            | [||] ->
-                Error
-                    "The script must define exactly one public, concrete, non-generic IByteStreamProcessor class with a public parameterless or IConnectionState constructor; no usable implementation was found."
-            | values ->
-                let names =
-                    values
-                    |> Array.map (fun (processorType, _) -> displayName processorType)
-                    |> String.concat ", "
-
-                Error
-                    $"The script must define exactly one usable IByteStreamProcessor implementation, but multiple implementations were found: {names}."
-        with :? ReflectionTypeLoadException as error ->
-            let details =
-                error.LoaderExceptions
-                |> Array.choose Option.ofObj
-                |> Array.map _.Message
-                |> Array.distinct
-                |> String.concat "; "
-
-            if String.IsNullOrWhiteSpace details then
-                Error "The compiled script types could not be inspected for a processor implementation."
-            else
-                Error $"The compiled script types could not be inspected for a processor implementation: {details}"
+            ScriptProcessorAdapter(processor) :> PipeL4.Core.IByteStreamProcessor
