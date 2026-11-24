@@ -20,6 +20,7 @@
     <Compile Include="FunctionalProcessorApiTests.fs" />
     <Compile Include="ProcessorPipelineTests.fs" />
     <Compile Include="ScriptProcessorTests.fs" />
+    <Compile Include="FunctionalProcessorAdapterTests.fs" />
     <Compile Include="ScriptCompilerTests.fs" />
     <Compile Include="ScriptPipelineTests.fs" />
     <Compile Include="ScriptTcpForwarderIntegrationTests.fs" />

@@ -252,6 +252,14 @@ processors. The invocation input, output object, and uncommitted writable memory
 across asynchronous suspension. Advancing writable memory commits it to the runtime, after which
 the plugin must not use it; no invocation memory or output object may be retained after completion.
 
+The host also has an internal typed adapter for a synchronous
+`handle: ProcessContext -> ProcessorResult`. It passes the original segmented input, completion
+flag, runtime output writer through the same non-owning writer adapter, cancellation token, and
+connection-state view to each invocation, returning a completed core value task. Typed stage
+construction creates a fresh adapter for each configured stage, direction, and connection through
+the existing pipeline builder. Functional script discovery, local-state creation, functional
+disposal, and asynchronous functional handlers are not implemented.
+
 Each compiled script must contain exactly one visible, concrete, non-generic class that implements
 `PipeL4.Plugins.IByteStreamProcessor` and has either a public parameterless constructor or a public
 constructor accepting `PipeL4.Plugins.IConnectionState`. The state-aware constructor is preferred

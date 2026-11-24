@@ -58,6 +58,31 @@ type internal ScriptProcessorAdapter(processor: IByteStreamProcessor) =
                 ValueTask()
             | _ -> ValueTask()
 
+/// Bridges a synchronous handle to the same executor and writer used by class processors.
+type internal FunctionalProcessorAdapter
+    (handle: ProcessContext -> ProcessorResult, connectionState: IConnectionState) =
+    do
+        if obj.ReferenceEquals(handle, null) then
+            nullArg (nameof handle)
+
+        if obj.ReferenceEquals(connectionState, null) then
+            nullArg (nameof connectionState)
+
+    interface PipeL4.Core.IByteStreamProcessor with
+        member _.ProcessAsync(input, output, cancellationToken) =
+            let context =
+                { Input = input.Bytes
+                  IsCompleted = input.IsCompleted
+                  Output = ProcessorOutputAdapter(output) :> IProcessorOutput
+                  CancellationToken = cancellationToken
+                  ConnectionState = connectionState }
+
+            let result = handle context
+
+            ValueTask<PipeL4.Core.ProcessorResult>(
+                ({ RetainedLength = result.RetainedLength }: PipeL4.Core.ProcessorResult)
+            )
+
 [<NoEquality; NoComparison>]
 type internal ProcessorConstructor =
     | Parameterless of ConstructorInfo

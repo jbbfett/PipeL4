@@ -70,6 +70,39 @@ dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- \
   --filter '*ProcessorPipelineAllocationBenchmarks*' --job short
 ```
 
+Compare the synchronous functional adapter with the public class adapter through the production
+executor (4 KiB input-backed and generated-copy cases):
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- \
+  --filter '*FunctionalProcessorAdapterBenchmarks*' --job short
+```
+
+This comparison reports push latency and managed allocations. Throughput in MiB/s is
+`3906.25 / mean latency in microseconds`. Preflight checks print copied payload bytes, copy ratio,
+logical buffered-byte peaks, and physical reserved-memory peaks for both adapters and verify zero
+remaining occupancy. Copy counts describe the fixture's explicit payload copies, not all runtime
+metadata or process-wide copying. These socket-independent cases do not measure script loading,
+network latency, concurrent directions, retention pressure, or connection startup.
+
+Observation on 2026-11-24 (Ubuntu 24.04.5, Intel Core i5-8365U, .NET 10.0.15,
+BenchmarkDotNet 0.15.8 ShortRun, three measured iterations):
+
+| Output | Adapter | Mean push latency | Derived MiB/s | Managed allocation/push |
+| --- | --- | ---: | ---: | ---: |
+| Input-backed | Class | 1.380 us | 2,830.6 | 1.51 KiB |
+| Input-backed | Functional | 1.463 us | 2,670.0 | 1.51 KiB |
+| Generated copy | Class | 1.971 us | 1,981.9 | 1.76 KiB |
+| Generated copy | Functional | 1.853 us | 2,108.1 | 1.76 KiB |
+
+Both adapters reported the same preflight accounting: input-backed output copied zero payload
+bytes (ratio 0), with an 8 KiB logical peak and 4 KiB physical peak; generated output copied
+4 KiB (ratio 1), with 8 KiB logical and physical peaks. Every preflight ended at zero occupancy.
+The 99.9% latency confidence margins were 0.388, 0.820, 2.226, and 0.896 us respectively;
+this short run demonstrates matching allocation and accounting observations, not a latency
+improvement or throughput equivalence. Benchmark process priority elevation was unavailable,
+and test compilation overlapped part of the run.
+
 Run the full-job internal diagnostics allocation comparison:
 
 ```sh

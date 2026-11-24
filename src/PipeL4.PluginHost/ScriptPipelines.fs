@@ -107,13 +107,23 @@ type private ContextualScriptProcessor(
                 }
             )
 
-type internal ConfiguredScriptStage(scriptPath: string, plugin: CompiledScriptProcessor) =
+type internal ConfiguredScriptStage private
+    (scriptPath: string, createProcessor: IConnectionState -> PipeL4.Core.IByteStreamProcessor) =
+    new(scriptPath: string, plugin: CompiledScriptProcessor) =
+        ConfiguredScriptStage(scriptPath, plugin.CreateProcessor)
+
+    // Typed construction only; script discovery continues to select class processors.
+    new(scriptPath: string, handle: ProcessContext -> PipeL4.Plugins.ProcessorResult) =
+        ConfiguredScriptStage(
+            scriptPath,
+            fun state -> FunctionalProcessorAdapter(handle, state) :> PipeL4.Core.IByteStreamProcessor
+        )
+
     member _.ScriptPath = scriptPath
-    member _.Plugin = plugin
 
     member _.CreateProcessor(connectionState, direction, stageNumber) =
         try
-            let processor = plugin.CreateProcessor(connectionState)
+            let processor = createProcessor connectionState
 
             ContextualScriptProcessor(
                 scriptPath,
