@@ -768,6 +768,22 @@ type Processor(_connectionState: IConnectionState) =
             cancellationToken.ThrowIfCancellationRequested()
             let result: ProcessorResult = { RetainedLength = input.Bytes.Length }
             ValueTask<ProcessorResult>(result)
+
+module Functional =
+    let create (ctx: CreateContext) =
+        ctx.ConnectionState.GetOrAdd("shared", fun () -> ref 0L) |> ignore
+        ref 0L
+
+    let handle ctx (state: int64 ref) =
+        state.Value <- state.Value + ctx.Input.Length
+        emitInput ctx 0L ctx.Input.Length
+        emitBytes ctx (System.ReadOnlySpan<byte>([| 33uy |]))
+        releaseAll
+
+    let retained (ctx: ProcessContext) =
+        if ctx.IsCompleted then releaseAll else retainSuffix ctx.Input.Length
+
+    let dispose (state: int64 ref) = task { state.Value <- 0L }
 """
         File.WriteAllText(Path.Combine(project, "Consumer.fs"), source)
 

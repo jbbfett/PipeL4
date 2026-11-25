@@ -252,6 +252,10 @@ processors. The invocation input, output object, and uncommitted writable memory
 across asynchronous suspension. Advancing writable memory commits it to the runtime, after which
 the plugin must not use it; no invocation memory or output object may be retained after completion.
 
+Functional scripts are runnable through the same configured `.fsx` pipeline as class scripts;
+see the [public API guide](../src/PipeL4.Plugins/README.md#functional-processors) and
+[functional examples](../examples/functional). Only `handle` is mandatory for a stateless script.
+
 The host also has an internal typed adapter for functional handlers returning `ProcessorResult`,
 `Task<ProcessorResult>`, or `ValueTask<ProcessorResult>`. It passes the original segmented input, completion
 flag, runtime output writer through the same non-owning writer adapter, cancellation token, and

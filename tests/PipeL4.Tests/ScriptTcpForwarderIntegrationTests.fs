@@ -5125,3 +5125,38 @@ let dispose (state: State) = ValueTask<unit>(task {
             error.Message.Contains("handle", StringComparison.Ordinal) |> should equal true
             do! expectConnectionFailure listenPort timeout.Token
         }
+
+    [<Theory>]
+    [<InlineData("AsciiUppercase", "a1z!", "A1Z!")>]
+    [<InlineData("PrefixMode", "MASK12z", "MASKXXz")>]
+    [<InlineData("BytePatternReplace", "HEHELLOHELL", "HEWORLDHELL")>]
+    [<InlineData("RetainedTail", "abcdef", "abcdef")>]
+    [<InlineData("AsyncCount", "abcdef", "abcdef")>]
+    let ``repository functional examples run through configured TCP pipelines and half close`` name input (expected: string) =
+        task {
+            use timeout = new CancellationTokenSource(30_000)
+            use backendListener = new TcpListener(loopback, 0)
+            backendListener.Start()
+            let path = Path.Combine(TestRepository.repositoryRoot, "examples", "functional", name + ".fsx")
+            do! runWithScriptProxy [| path |] [| path |] (endpointPort backendListener) timeout.Token (fun proxy -> task {
+                let acceptBackend = backendListener.AcceptTcpClientAsync(timeout.Token).AsTask()
+                use! client = connectEventually proxy timeout.Token
+                use! backend = acceptBackend
+                let clientStream = client.GetStream()
+                let backendStream = backend.GetStream()
+                // Writes are deliberately small; TCP is free to coalesce them. The pipeline
+                // tests separately force every relevant invocation and segment boundary.
+                for value in bytes input do
+                    do! clientStream.WriteAsync(ReadOnlyMemory<byte>([| value |]), timeout.Token)
+                client.Client.Shutdown(SocketShutdown.Send)
+                let! forwarded = readExactly backendStream expected.Length timeout.Token
+                forwarded |> should equal (bytes expected)
+                do! expectEndOfStream backendStream timeout.Token
+                // The opposite direction remains usable after client half-close.
+                do! backendStream.WriteAsync(bytes input, timeout.Token)
+                backend.Client.Shutdown(SocketShutdown.Send)
+                let! returned = readExactly clientStream expected.Length timeout.Token
+                returned |> should equal (bytes expected)
+                do! expectEndOfStream clientStream timeout.Token
+            })
+        }

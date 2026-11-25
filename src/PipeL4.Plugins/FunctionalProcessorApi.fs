@@ -25,7 +25,7 @@ type ProcessContext =
       ConnectionState: IConnectionState }
 
 /// Functional conveniences over the existing processor output and retained-suffix contracts.
-/// These contracts do not provide script discovery or invocation of handle/create/dispose.
+/// The script host discovers handle and optional create/dispose functions using these contracts.
 [<AutoOpen>]
 module FunctionalProcessor =
     /// Appends the given range of the current input without copying its bytes.

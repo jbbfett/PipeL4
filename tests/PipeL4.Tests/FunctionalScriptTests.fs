@@ -1117,3 +1117,74 @@ let dispose (state: int ref) = disposed.Enqueue(state)
             do! (pipeline :> IAsyncDisposable).DisposeAsync()
             (property<bool ref> plugin "cleaned").Value |> should equal true
         }
+
+    [<Theory>]
+    [<InlineData("RetainedTail", "", "")>]
+    [<InlineData("RetainedTail", "ABC", "")>]
+    [<InlineData("RetainedTail", "ABCDEF", "AB")>]
+    [<InlineData("AsyncCount", "", "")>]
+    [<InlineData("AsyncCount", "ABCDEF", "ABCDEF")>]
+    let ``user facing streaming examples compile warning free and flush exactly once`` name (input: string) beforeEof =
+        task {
+            use workspace = new Workspace()
+            let path = Path.Combine(TestRepository.repositoryRoot, "examples", "functional", name + ".fsx")
+            let! result = workspace.Compiler.CompileAndLoadAsync(path, CancellationToken.None)
+            let plugin = compiled result
+            match result with
+            | Compiled(_, diagnostics) -> diagnostics |> should be Empty
+            | Failed _ -> failwith "Expected a compiled example"
+
+            // Check one push and one-byte pushes against the same expected stream.
+            for chunks in [| [| input |]; input |> Seq.map string |> Seq.toArray |] do
+                use state = new ConnectionState()
+                let sink = Sink()
+                let pipeline = new ProcessorPipeline([| plugin.CreateProcessor(publicState state) |], sink, MemoryPool<byte>.Shared)
+                for chunk in chunks do
+                    if chunk.Length > 0 then do! push pipeline chunk
+                sink.Text |> should equal beforeEof
+                let before = pipeline.GetStageMetricsSnapshot() |> List.exactlyOne
+                before.CurrentRetainedBytes |> should equal (if name = "RetainedTail" then min 4L (int64 input.Length) else 0L)
+                do! pipeline.CompleteAsync(CancellationToken.None)
+                sink.Text |> should equal input
+                let after = pipeline.GetStageMetricsSnapshot() |> List.exactlyOne
+                after.GeneratedOutputBytes |> should equal 0L
+                after.InputBackedOutputBytes |> should equal (int64 input.Length)
+                after.CurrentRetainedBytes |> should equal 0L
+                do! (pipeline :> IAsyncDisposable).DisposeAsync()
+                pipeline.GetLogicalCapacitySnapshot().CurrentBytes |> should equal 0L
+                pipeline.GetConnectionMemorySnapshot().CurrentPhysicalBufferCapacityBytes |> should equal 0L
+        }
+
+    [<Theory>]
+    [<InlineData("AsciiUppercase")>]
+    [<InlineData("PrefixMode")>]
+    [<InlineData("BytePatternReplace")>]
+    let ``functional transformation examples compile without diagnostics`` name =
+        task {
+            use workspace = new Workspace()
+            let path = Path.Combine(TestRepository.repositoryRoot, "examples", "functional", name + ".fsx")
+            let! result = workspace.Compiler.CompileAndLoadAsync(path, CancellationToken.None)
+            compiled result |> ignore
+            match result with
+            | Compiled(_, diagnostics) -> diagnostics |> should be Empty
+            | Failed _ -> failwith "Expected a compiled example"
+        }
+
+    [<Fact>]
+    let ``public guide processor snippets compile through the production host`` () =
+        task {
+            use workspace = new Workspace()
+            let guide = File.ReadAllText(Path.Combine(TestRepository.repositoryRoot, "src", "PipeL4.Plugins", "README.md"))
+            let snippets =
+                System.Text.RegularExpressions.Regex.Matches(guide, @"(?s)```fsharp\r?\n(.*?)```")
+                |> Seq.map (fun matched -> matched.Groups[1].Value)
+                |> Seq.filter (fun source -> source.Contains("let handle") || source.Contains("type Processor"))
+                |> Seq.toArray
+            snippets.Length |> should equal 6
+            for index, source in Array.indexed snippets do
+                let path = workspace.Write($"Guide{index}", source)
+                let! result = workspace.Compiler.CompileAndLoadAsync(path, CancellationToken.None)
+                match result with
+                | Compiled(_, diagnostics) -> diagnostics |> should be Empty
+                | Failed diagnostics -> failwith (diagnosticsText diagnostics)
+        }

@@ -684,6 +684,29 @@ module InstalledToolIntegrationTests =
                     cancellationToken
         }
 
+    let private verifyFunctionalExampleTrafficAsync
+        (installedToolPath: string)
+        (workspace: TestWorkspace)
+        (cancellationToken: CancellationToken)
+        =
+        task {
+            let ascii (value: string) = Encoding.ASCII.GetBytes value
+            let cases =
+                [| "AsciiUppercase", [ [| ascii "a"; ascii "Z1" |], ascii "AZ1" ]
+                   "BytePatternReplace", [ [| ascii "HE"; ascii "HELLO"; ascii "HELL" |], ascii "HEWORLDHELL" ]
+                   "PrefixMode", [ [| ascii "MAS"; ascii "K123" |], ascii "MASKXXX"
+                                   [| ascii "PASSMASK123" |], ascii "PASSMASK123"
+                                   [| ascii "MA" |], ascii "MA" ]
+                   "RetainedTail", [ [| ascii "ab"; ascii "cd"; ascii "ef" |], ascii "abcdef" ]
+                   "AsyncCount", [ [| ascii "ab"; ascii "cd" |], ascii "abcd" ] |]
+
+            for name, sessions in cases do
+                let sourcePath = Path.Combine(repositoryRoot (), "examples", "functional", name + ".fsx")
+                // Author code outside the checkout; only the installed distribution supplies APIs.
+                let scriptPath = workspace.WriteScript("Functional" + name + ".fsx", File.ReadAllText sourcePath)
+                do! runInstalledPluginSessionsAsync installedToolPath workspace.RootPath scriptPath sessions cancellationToken
+        }
+
     let private runFailingTrafficAsync
         (installedToolPath: string)
         (scriptPath: string)
@@ -848,6 +871,7 @@ module InstalledToolIntegrationTests =
 
             do! verifyInstalledExamplesAsync installedToolPath repository workspace
             do! verifyExtractedExampleTrafficAsync installedToolPath workspace timeout.Token
+            do! verifyFunctionalExampleTrafficAsync installedToolPath workspace timeout.Token
         }
 
     [<Fact>]

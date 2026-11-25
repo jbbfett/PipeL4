@@ -14,8 +14,8 @@ open PipeL4.Plugins
 open Xunit
 
 module BytePatternReplaceTests =
-    let private examplePath =
-        Path.Combine(TestRepository.repositoryRoot, "examples", "BytePatternReplace.fsx")
+    let private examplePath functional =
+        Path.Combine(TestRepository.repositoryRoot, "examples", (if functional then "functional" else ""), "BytePatternReplace.fsx")
 
     let private ascii (value: string) = Encoding.ASCII.GetBytes value
 
@@ -292,22 +292,26 @@ module BytePatternReplaceTests =
                     ValueTask()
                 | _ -> ValueTask()
 
-    [<Fact>]
-    let ``complete HELLO in one segment is replaced`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``complete HELLO in one segment is replaced`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
             let! result = runConnection definition [| ascii "HELLO" |] Int64.MaxValue id
 
             result.Bytes |> should equal (ascii "WORLD")
             result.CompletionCount |> should equal 1
         }
 
-    [<Fact>]
-    let ``every split position across separate pushes has the same result`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``every split position across separate pushes has the same result`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
             let input = ascii "HELLO"
 
             for split in 1 .. input.Length - 1 do
@@ -317,11 +321,13 @@ module BytePatternReplaceTests =
                 result.CompletionCount |> should equal 1
         }
 
-    [<Fact>]
-    let ``one invocation containing multiple input segments is processed as one stream`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``one invocation containing multiple input segments is processed as one stream`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
             let observedSegmentCounts = ResizeArray<int>()
 
             let createStages (configured: PipeL4.Core.IByteStreamProcessor array) :
@@ -344,11 +350,13 @@ module BytePatternReplaceTests =
             result.CompletionCount |> should equal 1
         }
 
-    [<Fact>]
-    let ``adjacent repeated and near-miss patterns preserve non-matches`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``adjacent repeated and near-miss patterns preserve non-matches`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
 
             let cases =
                 [| ascii "HELLOHELLO", ascii "WORLDWORLD"
@@ -361,11 +369,13 @@ module BytePatternReplaceTests =
                 result.Bytes |> should equal expected
         }
 
-    [<Fact>]
-    let ``incomplete matches flush unchanged at EOF and empty input completes`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``incomplete matches flush unchanged at EOF and empty input completes`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
 
             for length in 1 .. 4 do
                 let partial = ("HELLO").Substring(0, length) |> ascii
@@ -378,11 +388,13 @@ module BytePatternReplaceTests =
             empty.CompletionCount |> should equal 1
         }
 
-    [<Fact>]
-    let ``binary data and zero bytes are preserved`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``binary data and zero bytes are preserved`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
 
             let input =
                 [| 0uy; 0xFFuy; byte 'H'; 0uy; byte 'E'; byte 'L'; byte 'L'; byte 'O'; 0uy
@@ -397,11 +409,13 @@ module BytePatternReplaceTests =
             result.Bytes.Length |> should equal input.Length
         }
 
-    [<Fact>]
-    let ``output is independent of input partitioning`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``output is independent of input partitioning`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
 
             let input = Array.concat [| ascii "xHELLOHE-HELLO"; [| 0uy |]; ascii "HELLO" |]
             let expected = Array.concat [| ascii "xWORLDHE-WORLD"; [| 0uy |]; ascii "WORLD" |]
@@ -416,11 +430,13 @@ module BytePatternReplaceTests =
                 result.Bytes |> should equal expected
         }
 
-    [<Fact>]
-    let ``state is isolated across interleaved live connections and directions`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``state is isolated across interleaved live connections and directions`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] [| examplePath |]
+            let! definition = loadDefinition workspace [| examplePath functional |] [| examplePath functional |]
 
             let stateA = ConnectionState()
             let stateB = ConnectionState()
@@ -490,11 +506,13 @@ module BytePatternReplaceTests =
             poolB.Owners |> Seq.forall (fun owner -> owner.DisposeCount = 1) |> should equal true
         }
 
-    [<Fact>]
-    let ``batched output keeps 5000 non-matching bytes within the finite physical share`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``batched output keeps 5000 non-matching bytes within the finite physical share`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
             let input = Array.create 5_000 0x41uy
             let! result =
                 runProductionDirectional
@@ -516,11 +534,13 @@ module BytePatternReplaceTests =
             result.Logical.PeakBytes |> should be (lessThanOrEqualTo 12_000L)
         }
 
-    [<Fact>]
-    let ``one byte output fits the 256 byte directional share`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``one byte output fits the 256 byte directional share`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
             let! result =
                 runProductionDirectional
                     definition
@@ -541,11 +561,13 @@ module BytePatternReplaceTests =
             result.Logical.PeakBytes |> should equal 2L
         }
 
-    [<Fact>]
-    let ``output sizes around the batch boundary use bounded partial batches`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``output sizes around the batch boundary use bounded partial batches`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
 
             for length in [| 255; 256; 257 |] do
                 let input = Array.create length 0x41uy
@@ -568,11 +590,13 @@ module BytePatternReplaceTests =
                 result.Logical.PeakBytes |> should equal (int64 (2 * length))
         }
 
-    [<Fact>]
-    let ``delayed output after HELL fits finite logical and physical limits`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``delayed output after HELL fits finite logical and physical limits`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
             let! result =
                 runProductionDirectional
                     definition
@@ -592,11 +616,13 @@ module BytePatternReplaceTests =
             result.Logical.PeakBytes |> should equal 6L
         }
 
-    [<Fact>]
-    let ``EOF flushes a pending prefix within finite capacity`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``EOF flushes a pending prefix within finite capacity`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
             let! result =
                 runProductionDirectional
                     definition
@@ -616,11 +642,13 @@ module BytePatternReplaceTests =
             result.Logical.PeakBytes |> should equal 4L
         }
 
-    [<Fact>]
-    let ``matching state stays bounded without runtime retention`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``matching state stays bounded without runtime retention`` functional =
         task {
             use workspace = new TestWorkspace()
-            let! definition = loadDefinition workspace [| examplePath |] Array.empty
+            let! definition = loadDefinition workspace [| examplePath functional |] Array.empty
             let input = Array.concat (Array.init 20 (fun _ -> ascii "HELLO"))
             let chunks = input |> Array.map (fun value -> [| value |])
             let! result = runConnection definition chunks 6L id

@@ -13,8 +13,8 @@ open PipeL4.Plugins
 open Xunit
 
 module ExampleProcessorTests =
-    let private examplePath =
-        Path.Combine(TestRepository.repositoryRoot, "examples", "AsciiUppercase.fsx")
+    let private examplePath functional =
+        Path.Combine(TestRepository.repositoryRoot, "examples", (if functional then "functional" else ""), "AsciiUppercase.fsx")
 
     let private sequenceSegmentCount (sequence: ReadOnlySequence<byte>) =
         let mutable position = sequence.Start
@@ -34,12 +34,12 @@ module ExampleProcessorTests =
 
         member _.Compiler = compiler
 
-        member _.CopyExampleToExternalDirectory() =
+        member _.CopyExampleToExternalDirectory(functional) =
             let externalDirectory = Path.Combine(rootPath, "external-example")
             Directory.CreateDirectory externalDirectory |> ignore
 
             let externalPath = Path.Combine(externalDirectory, "AsciiUppercase.fsx")
-            File.Copy(examplePath, externalPath)
+            File.Copy(examplePath functional, externalPath)
             externalPath
 
         interface IDisposable with
@@ -175,20 +175,20 @@ module ExampleProcessorTests =
             return sink, pool, owners, metrics
         }
 
-    let private runPipeline createStages chunks =
+    let private runPipeline functional createStages chunks =
         task {
             use workspace = new TestWorkspace()
-            return! runPipelineInWorkspace workspace examplePath createStages chunks ignore None
+            return! runPipelineInWorkspace workspace (examplePath functional) createStages chunks ignore None
         }
 
-    let private runPipelineWithPushAssertions createStages chunks expectedAfterPushes =
+    let private runPipelineWithPushAssertions functional createStages chunks expectedAfterPushes =
         task {
             use workspace = new TestWorkspace()
 
             return!
                 runPipelineInWorkspace
                     workspace
-                    examplePath
+                    (examplePath functional)
                     createStages
                     chunks
                     ignore
@@ -259,8 +259,10 @@ module ExampleProcessorTests =
                       ValueTask()
                   | _ -> ValueTask() }
 
-    [<Fact>]
-    let ``repository example compiles and transforms real segmented input`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``repository example compiles and transforms real segmented input`` functional =
         task {
             let expectedAfterPushes =
                 [| [| 0x41uy; 0x5Auy; 0x2Duy |]
@@ -268,7 +270,7 @@ module ExampleProcessorTests =
                    [| 0x41uy; 0x5Auy; 0x2Duy; 0x42uy; 0x31uy; 0x80uy; 0x5Auy; 0x21uy |] |]
 
             let! sink, pool, owners, metrics =
-                runPipelineWithPushAssertions
+                runPipelineWithPushAssertions functional
                     id
                     [| ascii "aZ-"
                        [| 0x62uy; 0x31uy; 0x80uy |]
@@ -284,11 +286,13 @@ module ExampleProcessorTests =
             pool.Owners |> Seq.forall (fun owner -> owner.DisposeCount = 1) |> should equal true
         }
 
-    [<Fact>]
-    let ``canonical example loads externally with its editor-only package reference`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``canonical example loads externally with its editor-only package reference`` functional =
         task {
             use workspace = new TestWorkspace()
-            let externalPath = workspace.CopyExampleToExternalDirectory()
+            let externalPath = workspace.CopyExampleToExternalDirectory(functional)
             let source = File.ReadAllText externalPath
             let compilerPaths = ResizeArray<string>()
 
@@ -314,13 +318,15 @@ module ExampleProcessorTests =
             owners |> Array.forall (fun owner -> owner.DisposeCount = 1) |> should equal true
         }
 
-    [<Fact>]
-    let ``repository example handles empty input and EOF completion`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``repository example handles empty input and EOF completion`` functional =
         task {
             let completionFlags = ResizeArray<bool>()
 
             let! sink, pool, owners, _ =
-                runPipeline
+                runPipeline functional
                     (fun configured -> [| observeCompletion completionFlags configured[0] |])
                     Array.empty
 
@@ -331,13 +337,15 @@ module ExampleProcessorTests =
             pool.Owners |> should be Empty
         }
 
-    [<Fact>]
-    let ``repository example transforms three segments in one loaded-processor invocation`` () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let ``repository example transforms three segments in one loaded-processor invocation`` functional =
         task {
             let observedSegmentCounts = ResizeArray<int>()
 
             let! sink, pool, owners, metrics =
-                runPipeline
+                runPipeline functional
                     (fun configured ->
                         [| collectThreeSegments ()
                            observeSegments observedSegmentCounts configured[0] |])
