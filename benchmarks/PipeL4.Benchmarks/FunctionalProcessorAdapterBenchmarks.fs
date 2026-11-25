@@ -1,0 +1,232 @@
+namespace PipeL4.Benchmarks
+
+open System
+open System.Buffers
+open System.IO
+open System.Threading
+open System.Threading.Tasks
+open BenchmarkDotNet.Attributes
+open PipeL4.Core
+open PipeL4.PluginHost
+open PipeL4.Plugins
+
+type private FunctionalAdapterSink() =
+    interface IProcessorPipelineSink with
+        member _.WriteAsync(_, _) = ValueTask()
+        member _.CompleteAsync _ = ValueTask()
+
+type private AdapterClassProcessor(generated: bool) =
+    interface PipeL4.Plugins.IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            if generated then
+                for segment in input.Bytes do
+                    segment.Span.CopyTo(output.GetSpan(segment.Length))
+                    output.Advance(segment.Length)
+            else
+                output.AppendInput(0L, input.Bytes.Length)
+
+            ValueTask<PipeL4.Plugins.ProcessorResult>(releaseAll)
+
+type private StatefulAdapterClassProcessor(generated: bool) =
+    let mutable total = 0L
+
+    interface PipeL4.Plugins.IByteStreamProcessor with
+        member _.ProcessAsync(input, output, _) =
+            total <- total + input.Bytes.Length
+            if generated then
+                for segment in input.Bytes do
+                    segment.Span.CopyTo(output.GetSpan(segment.Length))
+                    output.Advance(segment.Length)
+            else
+                output.AppendInput(0L, input.Bytes.Length)
+
+            ValueTask<PipeL4.Plugins.ProcessorResult>(releaseAll)
+
+/// Matched public class/functional adapters through the production executor, without sockets.
+[<MemoryDiagnoser>]
+type FunctionalProcessorAdapterBenchmarks() =
+    let mutable classPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable functionalPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable statefulClassPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable statefulFunctionalPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable valueTaskPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable statefulValueTaskPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable discoveredPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let mutable discoveredStatefulPipeline = Unchecked.defaultof<ProcessorPipeline>
+    let state = new ConnectionState()
+
+    [<Params(false, true)>]
+    member val Generated = false with get, set
+
+    [<GlobalSetup>]
+    member this.Setup() =
+        let publicState = ConnectionStateAdapter(state) :> IConnectionState
+        let handle ctx =
+            if this.Generated then
+                for segment in ctx.Input do
+                    emitBytes ctx segment.Span
+            else
+                emitInput ctx 0L ctx.Input.Length
+            releaseAll
+
+        classPipeline <-
+            new ProcessorPipeline(
+                [| ScriptProcessorAdapter(AdapterClassProcessor(this.Generated)) |],
+                FunctionalAdapterSink(),
+                MemoryPool<byte>.Shared
+            )
+        functionalPipeline <-
+            new ProcessorPipeline(
+                [| FunctionalProcessorAdapter(handle, publicState) |],
+                FunctionalAdapterSink(),
+                MemoryPool<byte>.Shared
+            )
+
+        statefulClassPipeline <-
+            new ProcessorPipeline(
+                [| ScriptProcessorAdapter(StatefulAdapterClassProcessor(this.Generated)) |],
+                FunctionalAdapterSink(),
+                MemoryPool<byte>.Shared
+            )
+        statefulFunctionalPipeline <-
+            new ProcessorPipeline(
+                [| new FunctionalProcessorAdapter<int64 ref>(
+                       (fun _ -> ref 0L),
+                       (fun ctx total ->
+                           total.Value <- total.Value + ctx.Input.Length
+                           handle ctx),
+                       None,
+                       publicState
+                   ) |],
+                FunctionalAdapterSink(),
+                MemoryPool<byte>.Shared
+            )
+
+        valueTaskPipeline <-
+            new ProcessorPipeline(
+                [| FunctionalProcessorAdapter((fun ctx -> ValueTask<PipeL4.Plugins.ProcessorResult>(handle ctx)), publicState) |],
+                FunctionalAdapterSink(), MemoryPool<byte>.Shared)
+        statefulValueTaskPipeline <-
+            new ProcessorPipeline(
+                [| new FunctionalProcessorAdapter<int64 ref>(
+                       (fun _ -> ref 0L),
+                       FunctionalHandler<int64 ref>.Create(fun ctx total ->
+                           total.Value <- total.Value + ctx.Input.Length
+                           ValueTask<PipeL4.Plugins.ProcessorResult>(handle ctx)),
+                       None, publicState) |],
+                FunctionalAdapterSink(), MemoryPool<byte>.Shared)
+
+        // Discovery and delegate preparation stay outside measured pushes, just as typed
+        // adapter construction does. These use real scripts and the production compiler.
+        let compileFunctional stateful =
+            let root = Path.Combine(Path.GetTempPath(), "PipeL4.Benchmarks", Guid.NewGuid().ToString("N"))
+            Directory.CreateDirectory(root) |> ignore
+            try
+                let path = Path.Combine(root, "Functional.fsx")
+                let state = if stateful then "let create () = ref 0L\n" else ""
+                let argument = if stateful then " (total: int64 ref)" else ""
+                let update = if stateful then "    total.Value <- total.Value + ctx.Input.Length\n" else ""
+                let output =
+                    if this.Generated then
+                        "    for segment in ctx.Input do emitBytes ctx segment.Span\n"
+                    else
+                        "    emitInput ctx 0L ctx.Input.Length\n"
+                File.WriteAllText(path,
+                    "open PipeL4.Plugins\n" + state + "let handle ctx" + argument + " =\n" +
+                    update + output + "    releaseAll\n")
+                match ScriptCompiler(Path.Combine(root, "compiler")).CompileAndLoadAsync(path, CancellationToken.None).GetAwaiter().GetResult() with
+                | Compiled(plugin, _) -> plugin
+                | Failed diagnostics ->
+                    diagnostics |> Array.map _.Message |> String.concat "\n" |> invalidOp
+            finally
+                Directory.Delete(root, true)
+        discoveredPipeline <-
+            new ProcessorPipeline([| (compileFunctional false).CreateProcessor(publicState) |],
+                                  FunctionalAdapterSink(), MemoryPool<byte>.Shared)
+        discoveredStatefulPipeline <-
+            new ProcessorPipeline([| (compileFunctional true).CreateProcessor(publicState) |],
+                                  FunctionalAdapterSink(), MemoryPool<byte>.Shared)
+
+        for name, pipeline in
+            [ "class", classPipeline
+              "functional", functionalPipeline
+              "stateful class", statefulClassPipeline
+              "stateful functional", statefulFunctionalPipeline
+              "completed ValueTask", valueTaskPipeline
+              "stateful completed ValueTask", statefulValueTaskPipeline
+              "discovered functional", discoveredPipeline
+              "discovered stateful functional", discoveredStatefulPipeline ] do
+            let owner = MemoryPool<byte>.Shared.Rent(4096)
+            pipeline.PushAsync(owner, 4096, CancellationToken.None).GetAwaiter().GetResult()
+            let metrics = pipeline.GetStageMetricsSnapshot() |> List.exactlyOne
+            let logical = pipeline.GetLogicalCapacitySnapshot()
+            let physical = pipeline.GetConnectionMemorySnapshot()
+            let copied = if this.Generated then 4096L else 0L
+            if metrics.GeneratedOutputBytes <> copied
+               || metrics.InputBackedOutputBytes <> 4096L - copied
+               || logical.CurrentBytes <> 0L
+               || physical.CurrentPhysicalBufferCapacityBytes <> 0L then
+                invalidOp "Adapter preflight output accounting or cleanup failed."
+            printfn
+                "%s preflight: copied=%d B, copy ratio=%.1f, logical peak=%d B, physical peak=%d B"
+                name copied (float copied / 4096.0) logical.PeakBytes physical.PeakPhysicalBufferCapacityBytes
+
+    [<GlobalCleanup>]
+    member _.Cleanup() =
+        if not (obj.ReferenceEquals(classPipeline, null)) then
+            (classPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(functionalPipeline, null)) then
+            (functionalPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(statefulClassPipeline, null)) then
+            (statefulClassPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(statefulFunctionalPipeline, null)) then
+            (statefulFunctionalPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(valueTaskPipeline, null)) then
+            (valueTaskPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(statefulValueTaskPipeline, null)) then
+            (statefulValueTaskPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(discoveredPipeline, null)) then
+            (discoveredPipeline :> IDisposable).Dispose()
+        if not (obj.ReferenceEquals(discoveredStatefulPipeline, null)) then
+            (discoveredStatefulPipeline :> IDisposable).Dispose()
+        (state :> IAsyncDisposable).DisposeAsync().GetAwaiter().GetResult()
+
+    [<Benchmark(Baseline = true)>]
+    member _.Class4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        classPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.Functional4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        functionalPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.StatefulClass4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        statefulClassPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.StatefulFunctional4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        statefulFunctionalPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.CompletedValueTask4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        valueTaskPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.StatefulCompletedValueTask4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        statefulValueTaskPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.DiscoveredFunctional4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        discoveredPipeline.PushAsync(owner, 4096, CancellationToken.None)
+
+    [<Benchmark>]
+    member _.DiscoveredStatefulFunctional4KiB() =
+        let owner = MemoryPool<byte>.Shared.Rent(4096)
+        discoveredStatefulPipeline.PushAsync(owner, 4096, CancellationToken.None)

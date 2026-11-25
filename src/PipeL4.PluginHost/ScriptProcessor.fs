@@ -58,99 +58,183 @@ type internal ScriptProcessorAdapter(processor: IByteStreamProcessor) =
                 ValueTask()
             | _ -> ValueTask()
 
+/// Construction-time normalization; the synchronous case never creates a task.
+[<RequireQualifiedAccess; NoEquality; NoComparison>]
+type internal FunctionalHandler<'State> =
+    private
+    | Synchronous of OptimizedClosures.FSharpFunc<ProcessContext, 'State, ProcessorResult>
+    | Asynchronous of OptimizedClosures.FSharpFunc<ProcessContext, 'State, ValueTask<ProcessorResult>>
+
+    static member Create(handle: ProcessContext -> 'State -> ProcessorResult) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        Synchronous(OptimizedClosures.FSharpFunc<_, _, _>.Adapt handle)
+
+    static member Create(handle: ProcessContext -> 'State -> ValueTask<ProcessorResult>) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        Asynchronous(OptimizedClosures.FSharpFunc<_, _, _>.Adapt handle)
+
+    static member Create(handle: ProcessContext -> 'State -> Task<ProcessorResult>) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        let invoke = OptimizedClosures.FSharpFunc<_, _, _>.Adapt handle
+        FunctionalHandler<'State>.Create(fun ctx state -> ValueTask<ProcessorResult>(invoke.Invoke(ctx, state)))
+
+    member this.Invoke(context, state) =
+        let adapt (result: ProcessorResult) : PipeL4.Core.ProcessorResult =
+            { RetainedLength = result.RetainedLength }
+
+        match this with
+        | Synchronous invoke ->
+            ValueTask<PipeL4.Core.ProcessorResult>(adapt (invoke.Invoke(context, state)))
+        | Asynchronous invoke ->
+            let operation = invoke.Invoke(context, state)
+            if operation.IsCompletedSuccessfully then
+                ValueTask<PipeL4.Core.ProcessorResult>(adapt operation.Result)
+            else
+                ValueTask<PipeL4.Core.ProcessorResult>(task {
+                    let! result = operation.AsTask()
+                    return adapt result
+                })
+
+/// Only explicitly supplied cleanup is normalized, once, to the existing async lifecycle.
+type internal FunctionalDisposal<'State> private (invoke: 'State -> ValueTask) =
+    member _.Invoke(state) = invoke state
+
+    static member Create(dispose: 'State -> unit) =
+        if obj.ReferenceEquals(dispose, null) then nullArg (nameof dispose)
+        FunctionalDisposal(fun state -> dispose state; ValueTask())
+
+    static member Create(dispose: 'State -> ValueTask) =
+        if obj.ReferenceEquals(dispose, null) then nullArg (nameof dispose)
+        FunctionalDisposal(dispose)
+
+    static member Create(dispose: 'State -> Task<unit>) =
+        if obj.ReferenceEquals(dispose, null) then nullArg (nameof dispose)
+        FunctionalDisposal(fun state -> ValueTask(dispose state :> Task))
+
+    static member Create(dispose: 'State -> ValueTask<unit>) =
+        if obj.ReferenceEquals(dispose, null) then nullArg (nameof dispose)
+        FunctionalDisposal(fun state -> ValueTask(task { do! dispose state }))
+
+/// Bridges typed handlers to the same executor and writer used by class processors.
+type internal FunctionalProcessorAdapter
+    private (handle: FunctionalHandler<unit>, connectionState: IConnectionState) =
+    do
+        if obj.ReferenceEquals(handle, null) then
+            nullArg (nameof handle)
+
+        if obj.ReferenceEquals(connectionState, null) then
+            nullArg (nameof connectionState)
+
+    new(handle: ProcessContext -> ProcessorResult, connectionState) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        FunctionalProcessorAdapter(FunctionalHandler<unit>.Create(fun ctx () -> handle ctx), connectionState)
+
+    new(handle: ProcessContext -> Task<ProcessorResult>, connectionState) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        FunctionalProcessorAdapter(FunctionalHandler<unit>.Create(fun ctx () -> handle ctx), connectionState)
+
+    new(handle: ProcessContext -> ValueTask<ProcessorResult>, connectionState) =
+        if obj.ReferenceEquals(handle, null) then nullArg (nameof handle)
+        FunctionalProcessorAdapter(FunctionalHandler<unit>.Create(fun ctx () -> handle ctx), connectionState)
+
+    interface PipeL4.Core.IByteStreamProcessor with
+        member _.ProcessAsync(input, output, cancellationToken) =
+            let context =
+                { Input = input.Bytes
+                  IsCompleted = input.IsCompleted
+                  Output = ProcessorOutputAdapter(output) :> IProcessorOutput
+                  CancellationToken = cancellationToken
+                  ConnectionState = connectionState }
+
+            handle.Invoke(context, ())
+
+/// Owns one eagerly created, strongly typed local state value. Only explicit user cleanup runs.
+type internal FunctionalProcessorAdapter<'State>
+    (
+        create: CreateContext -> 'State,
+        handle: FunctionalHandler<'State>,
+        dispose: FunctionalDisposal<'State> option,
+        connectionState: IConnectionState
+    ) =
+    do
+        if obj.ReferenceEquals(create, null) then
+            nullArg (nameof create)
+
+        if obj.ReferenceEquals(handle, null) then
+            nullArg (nameof handle)
+
+        if obj.ReferenceEquals(connectionState, null) then
+            nullArg (nameof connectionState)
+
+        match dispose with
+        | Some cleanup when obj.ReferenceEquals(cleanup, null) -> nullArg (nameof dispose)
+        | _ -> ()
+
+    let state = create { ConnectionState = connectionState }
+
+    new(create, handle: ProcessContext -> 'State -> ProcessorResult, dispose: ('State -> unit) option, connectionState) =
+        new FunctionalProcessorAdapter<'State>(
+            create, FunctionalHandler<'State>.Create(handle),
+            Option.map (fun (cleanup: 'State -> unit) -> FunctionalDisposal<'State>.Create(cleanup)) dispose, connectionState)
+
+    interface PipeL4.Core.IByteStreamProcessor with
+        member _.ProcessAsync(input, output, cancellationToken) =
+            let context =
+                { Input = input.Bytes
+                  IsCompleted = input.IsCompleted
+                  Output = ProcessorOutputAdapter(output) :> IProcessorOutput
+                  CancellationToken = cancellationToken
+                  ConnectionState = connectionState }
+
+            handle.Invoke(context, state)
+
+    interface IAsyncDisposable with
+        member _.DisposeAsync() =
+            match dispose with
+            | Some cleanup -> cleanup.Invoke(state)
+            | None -> ValueTask()
+
 [<NoEquality; NoComparison>]
 type internal ProcessorConstructor =
     | Parameterless of ConstructorInfo
     | ConnectionStateAware of ConstructorInfo
+    | Functional of moduleType: Type * factory: (IConnectionState -> PipeL4.Core.IByteStreamProcessor)
 
 type internal CompiledScriptProcessor internal (assembly: Assembly, constructor: ProcessorConstructor) =
     member _.Assembly = assembly
 
     member _.ProcessorType =
-        let constructorInfo =
-            match constructor with
-            | Parameterless value
-            | ConnectionStateAware value -> value
-
-        match constructorInfo.DeclaringType with
-        | null -> invalidOp "The discovered processor constructor has no declaring type."
-        | processorType -> processorType
+        match constructor with
+        | Functional(moduleType, _) -> moduleType
+        | Parameterless value
+        | ConnectionStateAware value ->
+            match value.DeclaringType with
+            | null -> invalidOp "The discovered processor constructor has no declaring type."
+            | processorType -> processorType
 
     member _.CreateProcessor(connectionState: IConnectionState) : PipeL4.Core.IByteStreamProcessor =
         if obj.ReferenceEquals(connectionState, null) then
             nullArg (nameof connectionState)
 
-        let instance =
-            try
-                match constructor with
-                | Parameterless value -> value.Invoke(Array.empty)
-                | ConnectionStateAware value -> value.Invoke([| box connectionState |])
-            with :? TargetInvocationException as error ->
-                match Option.ofObj error.InnerException with
-                | Some innerError ->
-                    ExceptionDispatchInfo.Capture(innerError).Throw()
-                    Unchecked.defaultof<obj>
-                | None -> raise error
+        match constructor with
+        | Functional(_, factory) -> factory connectionState
+        | _ ->
+            let instance =
+                try
+                    match constructor with
+                    | Parameterless value -> value.Invoke(Array.empty)
+                    | ConnectionStateAware value -> value.Invoke([| box connectionState |])
+                    | Functional _ -> invalidOp "Expected a class processor constructor."
+                with :? TargetInvocationException as error ->
+                    match Option.ofObj error.InnerException with
+                    | Some innerError ->
+                        ExceptionDispatchInfo.Capture(innerError).Throw()
+                        Unchecked.defaultof<obj>
+                    | None -> raise error
 
-        let processor =
-            match instance with
-            | :? IByteStreamProcessor as value -> value
-            | _ -> invalidOp "The discovered processor type did not create an IByteStreamProcessor instance."
+            let processor =
+                match instance with
+                | :? IByteStreamProcessor as value -> value
+                | _ -> invalidOp "The discovered processor type did not create an IByteStreamProcessor instance."
 
-        ScriptProcessorAdapter(processor) :> PipeL4.Core.IByteStreamProcessor
-
-[<RequireQualifiedAccess>]
-module internal ScriptProcessorDiscovery =
-    let private displayName (processorType: Type) =
-        processorType.FullName
-        |> Option.ofObj
-        |> Option.filter (String.IsNullOrWhiteSpace >> not)
-        |> Option.defaultValue processorType.Name
-
-    let discover (assembly: Assembly) =
-        try
-            let candidates =
-                assembly.GetTypes()
-                |> Array.choose (fun processorType ->
-                    if
-                        processorType.IsVisible
-                        && processorType.IsClass
-                        && not processorType.IsAbstract
-                        && not processorType.ContainsGenericParameters
-                        && typeof<IByteStreamProcessor>.IsAssignableFrom processorType
-                    then
-                        match processorType.GetConstructor([| typeof<IConnectionState> |]) with
-                        | null ->
-                            match processorType.GetConstructor(Type.EmptyTypes) with
-                            | null -> None
-                            | constructor -> Some(processorType, Parameterless constructor)
-                        | constructor -> Some(processorType, ConnectionStateAware constructor)
-                    else
-                        None)
-                |> Array.sortBy (fun (processorType, _) -> displayName processorType)
-
-            match candidates with
-            | [| _, constructor |] -> Ok(CompiledScriptProcessor(assembly, constructor))
-            | [||] ->
-                Error
-                    "The script must define exactly one public, concrete, non-generic IByteStreamProcessor class with a public parameterless or IConnectionState constructor; no usable implementation was found."
-            | values ->
-                let names =
-                    values
-                    |> Array.map (fun (processorType, _) -> displayName processorType)
-                    |> String.concat ", "
-
-                Error
-                    $"The script must define exactly one usable IByteStreamProcessor implementation, but multiple implementations were found: {names}."
-        with :? ReflectionTypeLoadException as error ->
-            let details =
-                error.LoaderExceptions
-                |> Array.choose Option.ofObj
-                |> Array.map _.Message
-                |> Array.distinct
-                |> String.concat "; "
-
-            if String.IsNullOrWhiteSpace details then
-                Error "The compiled script types could not be inspected for a processor implementation."
-            else
-                Error $"The compiled script types could not be inspected for a processor implementation: {details}"
+            ScriptProcessorAdapter(processor) :> PipeL4.Core.IByteStreamProcessor

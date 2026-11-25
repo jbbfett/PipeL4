@@ -13,8 +13,8 @@ open PipeL4.Plugins
 open Xunit
 
 module PrefixModeTests =
-    let private examplePath =
-        Path.Combine(TestRepository.repositoryRoot, "examples", "PrefixMode.fsx")
+    let private examplePath functional =
+        Path.Combine(TestRepository.repositoryRoot, "examples", (if functional then "functional" else ""), "PrefixMode.fsx")
 
     let private ascii (value: string) = System.Text.Encoding.ASCII.GetBytes value
 
@@ -92,14 +92,14 @@ module PrefixModeTests =
           OutputLeaseRequests: int array
           Capacity: ConnectionCapacitySnapshot }
 
-    let private loadDefinition (workspace: Workspace) =
+    let private loadDefinition functional (workspace: Workspace) =
         task {
             let args =
                 [| "--listen-address"; string IPAddress.Loopback
                    "--listen-port"; "5000"
                    "--backend-host"; string IPAddress.Loopback
                    "--backend-port"; "6000"
-                   "--client-to-server-plugin"; examplePath |]
+                   "--client-to-server-plugin"; examplePath functional |]
             let configuration =
                 match ForwardingConfiguration.tryParseArguments args with
                 | Ok value -> value
@@ -217,11 +217,13 @@ module PrefixModeTests =
             return result, harness.SegmentCounts.ToArray()
         }
 
-    [<Fact>]
-    let mask_prefix_is_preserved_and_binary_suffix_is_handled () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let mask_prefix_is_preserved_and_binary_suffix_is_handled functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let input = Array.concat [| ascii "MASK"; [| 0uy; byte '0'; byte '9'; byte 'A'; 0xFFuy |] |]
             let expected = Array.concat [| ascii "MASK"; [| 0uy; byte 'X'; byte 'X'; byte 'A'; 0xFFuy |] |]
             let! result, _ = run definition [| input |] 64L 1_024L false
@@ -233,11 +235,13 @@ module PrefixModeTests =
             result.OutputLeaseRequests |> should equal [| 5 |]
         }
 
-    [<Fact>]
-    let generated_output_leases_match_bounded_batch_requests () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let generated_output_leases_match_bounded_batch_requests functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let cases =
                 [| 1, [| 1 |]
                    255, [| 255 |]
@@ -268,11 +272,13 @@ module PrefixModeTests =
                     |> should be (lessThanOrEqualTo 8_192L)
         }
 
-    [<Fact>]
-    let every_two_push_prefix_split_is_handled () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let every_two_push_prefix_split_is_handled functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             for split in 1 .. 3 do
                 let prefix = ascii "MASK"
                 let chunks = [| prefix[0 .. split - 1]; Array.concat [| prefix[split ..]; ascii "4a" |] |]
@@ -280,40 +286,48 @@ module PrefixModeTests =
                 result.Bytes |> should equal (ascii "MASKXa")
         }
 
-    [<Fact>]
-    let one_byte_pushes_and_later_bytes_keep_the_selected_mode () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let one_byte_pushes_and_later_bytes_keep_the_selected_mode functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let chunks = ascii "MASK012MASK3" |> Array.map (fun value -> [| value |])
             let! result, _ = run definition chunks 128L 2_048L false
             result.Bytes |> should equal (ascii "MASKXXXMASKX")
         }
 
-    [<Fact>]
-    let multi_segment_invocation_can_contain_the_prefix () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let multi_segment_invocation_can_contain_the_prefix functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let! result, counts = run definition [| ascii "MA"; ascii "SK8" |] 64L 1_024L true
             counts |> should contain 2
             result.Bytes |> should equal (ascii "MASKX")
         }
 
-    [<Fact>]
-    let nonmatching_prefix_selects_permanent_passthrough () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let nonmatching_prefix_selects_permanent_passthrough functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let! result, _ = run definition [| ascii "PASS"; ascii "MASK123" |] 64L 1_024L false
             result.Bytes |> should equal (ascii "PASSMASK123")
         }
 
-    [<Fact>]
-    let push_boundaries_publish_only_decided_prefix_data () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let push_boundaries_publish_only_decided_prefix_data functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
 
             let! matching = createHarness definition 128L 2_048L false
             do! push matching (ascii "MAS")
@@ -338,11 +352,13 @@ module PrefixModeTests =
             short.Sink.Bytes |> should equal (ascii "MAS")
         }
 
-    [<Fact>]
-    let empty_input_and_short_eof_complete_cleanly () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let empty_input_and_short_eof_complete_cleanly functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let! empty, _ = run definition [| Array.empty |] 8L 64L false
             empty.Bytes |> should be Empty
             empty.Completions |> should equal 1
@@ -351,11 +367,13 @@ module PrefixModeTests =
             partial.Completions |> should equal 1
         }
 
-    [<Fact>]
-    let large_masked_input_is_exact_with_finite_capacity () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let large_masked_input_is_exact_with_finite_capacity functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let payload = Array.init 8_192 (fun index -> byte (index % 256))
             let expected =
                 payload
@@ -370,11 +388,13 @@ module PrefixModeTests =
             (List.last result.Metrics).GeneratedOutputBytes |> should equal (int64 payload.Length)
         }
 
-    [<Fact>]
-    let one_byte_pending_prefix_fits_finite_capacity_and_flushes_at_eof () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let one_byte_pending_prefix_fits_finite_capacity_and_flushes_at_eof functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let! result, _ = run definition [| ascii "M" |] 2L 8L false
             result.Bytes |> should equal (ascii "M")
             result.Capacity.ClientToBackendLogical.PeakBytes |> should be (lessThanOrEqualTo 2L)
@@ -382,11 +402,13 @@ module PrefixModeTests =
             result.Capacity.Physical.PeakPhysicalBufferCapacityBytes |> should be (lessThanOrEqualTo 8L)
         }
 
-    [<Fact>]
-    let live_instances_keep_independent_prefix_decisions () =
+    [<Theory>]
+    [<InlineData(false)>]
+    [<InlineData(true)>]
+    let live_instances_keep_independent_prefix_decisions functional =
         task {
             use workspace = new Workspace()
-            let! definition = loadDefinition workspace
+            let! definition = loadDefinition functional workspace
             let! a = createHarness definition 128L 2_048L false
             let! b = createHarness definition 128L 2_048L false
             do! push a (ascii "MA")

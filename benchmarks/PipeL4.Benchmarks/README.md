@@ -70,6 +70,109 @@ dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- \
   --filter '*ProcessorPipelineAllocationBenchmarks*' --job short
 ```
 
+Compare the synchronous functional adapter with the public class adapter through the production
+executor (4 KiB input-backed and generated-copy cases):
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release -- \
+  --filter '*FunctionalProcessorAdapterBenchmarks*' --job short
+```
+
+This comparison reports push latency and managed allocations. Throughput in MiB/s is
+`3906.25 / mean latency in microseconds`. Preflight checks print copied payload bytes, copy ratio,
+logical buffered-byte peaks, and physical reserved-memory peaks for both adapters and verify zero
+remaining occupancy. Copy counts describe the fixture's explicit payload copies, not all runtime
+metadata or process-wide copying. These socket-independent cases do not measure script loading,
+network latency, concurrent directions, retention pressure, or connection startup.
+
+Observation on 2026-11-24 (Ubuntu 24.04.5, Intel Core i5-8365U, .NET 10.0.15,
+BenchmarkDotNet 0.15.8 ShortRun, three measured iterations):
+
+| Output | Adapter | Mean push latency | Derived MiB/s | Managed allocation/push |
+| --- | --- | ---: | ---: | ---: |
+| Input-backed | Class | 1.380 us | 2,830.6 | 1.51 KiB |
+| Input-backed | Functional | 1.463 us | 2,670.0 | 1.51 KiB |
+| Generated copy | Class | 1.971 us | 1,981.9 | 1.76 KiB |
+| Generated copy | Functional | 1.853 us | 2,108.1 | 1.76 KiB |
+
+Both adapters reported the same preflight accounting: input-backed output copied zero payload
+bytes (ratio 0), with an 8 KiB logical peak and 4 KiB physical peak; generated output copied
+4 KiB (ratio 1), with 8 KiB logical and physical peaks. Every preflight ended at zero occupancy.
+The 99.9% latency confidence margins were 0.388, 0.820, 2.226, and 0.896 us respectively;
+this short run demonstrates matching allocation and accounting observations, not a latency
+improvement or throughput equivalence. Benchmark process priority elevation was unavailable,
+and test compilation overlapped part of the run.
+
+The fixture also compares typed local state (`int64 ref`) with a class instance counter. Both
+update the counter on each invocation. State creation is in setup, outside measured pushes:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
+  --filter '*FunctionalProcessorAdapterBenchmarks.Stateful*' --job short
+```
+
+Stateful observation on 2026-11-24 on the same host/runtime described above, SDK 10.0.115,
+BenchmarkDotNet 0.15.8 ShortRun, three measured iterations:
+
+| Output | Stateful adapter | Mean push latency | 99.9% margin | Derived MiB/s | Managed allocation/push |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Input-backed | Class | 1.304 us | 1.101 us | 2,995.6 | 1.51 KiB |
+| Input-backed | Functional | 1.429 us | 2.540 us | 2,733.6 | 1.51 KiB |
+| Generated copy | Class | 1.842 us | 1.524 us | 2,120.7 | 1.76 KiB |
+| Generated copy | Functional | 1.468 us | 1.830 us | 2,660.9 | 1.76 KiB |
+
+All four adapter preflights again reported zero copied payload bytes / ratio 0 for input-backed
+output and 4 KiB / ratio 1 for generated output. Logical peaks were 8 KiB in both modes; physical
+reserved-memory peaks were 4 KiB and 8 KiB respectively, with zero terminal occupancy. The generic
+stateful adapter matched the class adapter's measured allocation per push; adapting the curried
+handler once avoids a new partial application on each invocation. Wide confidence margins,
+unavailable process priority elevation, and overlapping test compilation limit latency and
+throughput interpretation. This run does not establish a speed improvement or throughput
+equivalence. The retained run log is `/tmp/pipel4-func03-benchmark.log`; normal BenchmarkDotNet
+reports are under the ignored `BenchmarkDotNet.Artifacts/results/` directory.
+
+The same fixture includes stateless and typed stateful handlers returning an already completed
+`ValueTask<ProcessorResult>`. Their setup, output accounting, payload, and production executor are
+identical to the synchronous and class cases. Run all six implementations in both output modes:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
+  --filter '*FunctionalProcessorAdapterBenchmarks*' --job short
+```
+
+Asynchronous adapter observation on 2026-11-24 (Ubuntu 24.04.5, Intel Core i5-8365U, SDK 10.0.115,
+.NET 10.0.15, BenchmarkDotNet 0.15.8 ShortRun, three warmups and three measured iterations):
+
+| Output | Adapter | Mean push latency (us) | 99.9% margin (us) | Derived MiB/s | Managed KiB/push |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Input-backed | Class | 1.304 | 1.974 | 2,994.9 | 1.51 |
+| Input-backed | Synchronous functional | 1.373 | 1.599 | 2,845.0 | 1.51 |
+| Input-backed | Stateful class | 1.009 | 0.699 | 3,872.9 | 1.51 |
+| Input-backed | Stateful synchronous functional | 1.037 | 2.345 | 3,766.5 | 1.51 |
+| Input-backed | Completed ValueTask | 0.984 | 0.067 | 3,968.6 | 1.51 |
+| Input-backed | Stateful completed ValueTask | 1.044 | 0.648 | 3,740.2 | 1.51 |
+| Generated copy | Class | 1.671 | 3.965 | 2,338.2 | 1.76 |
+| Generated copy | Synchronous functional | 1.445 | 1.696 | 2,704.0 | 1.76 |
+| Generated copy | Stateful class | 1.317 | 0.806 | 2,966.5 | 1.76 |
+| Generated copy | Stateful synchronous functional | 1.313 | 0.247 | 2,975.3 | 1.76 |
+| Generated copy | Completed ValueTask | 1.307 | 1.091 | 2,988.5 | 1.76 |
+| Generated copy | Stateful completed ValueTask | 1.307 | 0.959 | 2,988.9 | 1.76 |
+
+All six implementations matched the preceding synchronous allocation observations: completed
+value tasks add no measured allocation per push. Input-backed preflights copied zero payload
+bytes (ratio 0), with an 8 KiB logical peak and 4 KiB active physical-capacity peak. Generated
+preflights copied 4 KiB (ratio 1), with 8 KiB logical and physical peaks. Every preflight ended
+with zero logical and physical occupancy. These metrics describe runtime-owned storage and the
+fixture's explicit payload copies, not process memory or all runtime metadata copying.
+
+The generated benchmark runner used Release configuration. No build or test run overlapped the
+measurements. Process priority elevation was unavailable, and the wide ShortRun confidence
+margins do not establish latency or throughput equivalence or improvement. Suspended handlers
+are covered by deterministic correctness tests; these measurements cover completed operations.
+The initial sandboxed attempt failed to restore the generated runner and executed no benchmarks;
+the successful run outside that sandbox completed all 12 cases. Its retained log is
+`/tmp/pipel4-func04-benchmark.log`; normal reports are under `BenchmarkDotNet.Artifacts/results/`.
+
 Run the full-job internal diagnostics allocation comparison:
 
 ```sh
@@ -1272,3 +1375,86 @@ per-iteration durations, not loopback TCP scheduling. Repeating the TCP cases on
 host with longer iteration times would be needed for a stronger large-payload conclusion.
 
 Generated BenchmarkDotNet artifacts remain ignored and were not added to the commit.
+
+## Compiled functional script binding
+
+`FunctionalProcessorAdapterBenchmarks` also compiles real stateless and `int64 ref` stateful
+scripts through the production `ScriptCompiler`. Their factories construct the same typed adapters
+used by the directly configured functional cases. Compilation, delegate preparation, creation,
+and preflight checks run in setup, outside measured pushes. These cases measure synchronous
+4 KiB input-backed emission and direct copying into runtime-owned generated output.
+
+Command executed on 2026-11-24, with builds and tests finished before measurements:
+
+```sh
+dotnet run --project benchmarks/PipeL4.Benchmarks -c Release --no-build -- \
+  --filter '*FunctionalProcessorAdapterBenchmarks.Functional4KiB*' \
+           '*FunctionalProcessorAdapterBenchmarks.StatefulFunctional4KiB*' \
+           '*FunctionalProcessorAdapterBenchmarks.Discovered*' \
+  --job short --warmupCount 1 --iterationCount 3 --invocationCount 262144 --unrollFactor 16 \
+  --artifacts /tmp/pipel4-functional-benchmarks
+```
+
+All eight cases completed successfully (BenchmarkDotNet 0.15.8, Ubuntu 24.04.5,
+Intel Core i5-8365U, SDK 10.0.115 selected under `global.json`, .NET 10.0.15). Derived throughput
+is `3906.25 / mean microseconds`, counting one 4 KiB push. The existing request/response throughput
+column prints `?` for these socket-independent cases; it does not calculate this derived value.
+
+| Output | Handler construction | Mean push latency | 99.9% CI half-width | Derived MiB/s | Managed allocation/push |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Input-backed | Typed stateless | 1.133 us | 2.3893 us | 3,447.7 | 1.51 KiB |
+| Input-backed | Typed stateful | 1.144 us | 1.3866 us | 3,414.6 | 1.51 KiB |
+| Input-backed | Discovered stateless | 1.178 us | 1.7216 us | 3,316.0 | 1.51 KiB |
+| Input-backed | Discovered stateful | 1.141 us | 2.0637 us | 3,423.5 | 1.51 KiB |
+| Generated copy | Typed stateless | 1.697 us | 5.0915 us | 2,301.9 | 1.76 KiB |
+| Generated copy | Typed stateful | 1.614 us | 1.6750 us | 2,420.2 | 1.76 KiB |
+| Generated copy | Discovered stateless | 1.892 us | 4.1593 us | 2,064.6 | 1.76 KiB |
+| Generated copy | Discovered stateful | 1.346 us | 0.2800 us | 2,902.1 | 1.76 KiB |
+
+All preflights matched: input-backed emission copied zero payload bytes (ratio 0), with an
+8 KiB logical buffered-byte peak and 4 KiB active physical-capacity peak. Generated emission copied
+4 KiB (ratio 1), with 8 KiB logical and physical peaks. Every preflight ended at zero logical and
+physical occupancy. Copy counts cover the fixture's explicit payload copies; physical accounting
+covers active runtime-owned leases, not process RSS or inactive pool capacity.
+
+Allocations match between directly configured and discovered handlers, including stateful
+handlers. This short run has wide latency confidence intervals and unavailable process-priority
+elevation. It supports the allocation and accounting observations, not a latency improvement or
+throughput-equivalence claim. It does not benchmark cold script loading, TCP throughput, or
+asynchronous suspension.
+
+Related verification commands executed from the repository root:
+
+```sh
+dotnet build PipeL4.sln -c Debug --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false -m:1 -nr:false
+dotnet build PipeL4.sln -c Release --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false -m:1 -nr:false
+dotnet test --project tests/PipeL4.Tests/PipeL4.Tests.fsproj -c Release --no-build \
+  --filter-class PipeL4.Tests.FunctionalScriptTests \
+  --filter-class PipeL4.Tests.ScriptCompilerTests \
+  --filter-class PipeL4.Tests.ScriptPipelineTests \
+  --filter-class PipeL4.Tests.FunctionalProcessorAdapterTests \
+  --filter-class PipeL4.Tests.FunctionalProcessorLifecycleTests \
+  --filter-class PipeL4.Tests.FunctionalProcessorAsyncTests
+dotnet test --project tests/PipeL4.Tests/PipeL4.Tests.fsproj -c Release --no-build --filter-class PipeL4.Tests.ScriptTcpForwarderIntegrationTests
+dotnet test --solution PipeL4.sln -c Release --no-build
+dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj -c Release --no-build --no-restore -p:PaketDisableCliTest=true -p:BuildInParallel=false --output /tmp/pipel4-functional-authoring
+dotnet fsi scripts/validate_fsi_authoring.fsx /tmp/pipel4-functional-authoring/PipeL4.Plugins.0.1.0-alpha.2.nupkg tests/fixtures/functional/Passthrough.fsx
+dotnet fsi scripts/validate_fsi_authoring.fsx /tmp/pipel4-functional-authoring/PipeL4.Plugins.0.1.0-alpha.2.nupkg tests/fixtures/functional/Counter.fsx
+dotnet fsi scripts/validate_fsi_authoring.fsx /tmp/pipel4-functional-authoring/PipeL4.Plugins.0.1.0-alpha.2.nupkg tests/fixtures/functional/ContextInferenceRepro.fsx
+git diff --check
+git status --short
+```
+
+Debug and Release builds passed; the final Debug build reported no warnings, and Release reported
+only the three existing FS3511 warnings in `FunctionalProcessorAdapterTests.fs` and
+`CliAcceptanceTests.fs`. Focused compiler/functional/pipeline/lifecycle tests passed 175/175;
+TCP integration tests passed 51/51. The first full run passed 632/633, with one CLI `--help`
+subprocess exiting 147. The executable then returned 0 when run directly, and the full-suite rerun
+passed 633/633 with no source changes between the runs and no skips. The transient exit's cause
+was not established; unrelated CLI tests were not modified.
+
+The temporary API package and both positive FSI checks succeeded, restoring only from isolated
+local feeds. The intentionally failing inference reproduction exited 1 with FS0001, as expected;
+its annotated form also passes the production host test. Early development invocations encountered
+sandbox IPC denial and zero-test/help handshake errors; successful verification used unsandboxed
+local IPC, a separate build, and direct Microsoft.Testing.Platform options with `--no-build`.

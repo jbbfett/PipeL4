@@ -164,6 +164,64 @@ let count = [ 1; 2; 3 ] |> List.length
         }
 
     [<Fact>]
+    let ``functional contracts typecheck naturally in a public API script`` () =
+        task {
+            use workspace = new TestWorkspace()
+
+            let scriptPath =
+                workspace.WriteSource(
+                    "FunctionalContracts.fsx",
+                    withIdentityProcessor
+                        """module FunctionalContracts
+
+open System
+open PipeL4.Plugins
+
+module Stateless =
+    let handle ctx =
+        emitInput ctx 0L ctx.Input.Length
+        releaseAll
+
+module Stateful =
+    let create () = ref 0L
+
+    let handle ctx (state: int64 ref) =
+        state.Value <- state.Value + ctx.Input.Length
+        emitInput ctx 0L ctx.Input.Length
+        releaseAll
+
+    let dispose (state: int64 ref) = printfn "Total: %d" state.Value
+
+module Shared =
+    let create (ctx: CreateContext) =
+        ctx.ConnectionState.GetOrAdd("total", fun () -> ref 0L)
+
+    let handle ctx =
+        ctx.CancellationToken.ThrowIfCancellationRequested()
+        emitBytes ctx (ReadOnlySpan<byte>([| 1uy; 2uy |]))
+        let bytes = [| 3uy; 4uy; 5uy |]
+        emitBytes ctx (ReadOnlySpan<byte>(bytes, 1, 2))
+        let memory = ReadOnlyMemory<byte>(bytes)
+        emitBytes ctx memory.Span
+        if ctx.IsCompleted then releaseAll else retainSuffix ctx.Input.Length
+
+let _: ProcessContext -> ProcessorResult = Stateless.handle
+let _: unit -> int64 ref = Stateful.create
+let _: ProcessContext -> int64 ref -> ProcessorResult = Stateful.handle
+let _: int64 ref -> unit = Stateful.dispose
+let _: CreateContext -> int64 ref = Shared.create
+let _: ProcessContext -> ProcessorResult = Shared.handle
+"""
+                )
+
+            // Existing class-based discovery still requires a class; the functional definitions
+            // above are only typechecked, with no functional discovery or lifecycle invocation.
+            let! result = compile workspace.Compiler scriptPath
+            let _, diagnostics = expectCompiled result
+            diagnostics |> should be Empty
+        }
+
+    [<Fact>]
     let ``loads the compiled assembly for ordinary reflection and use`` () =
         task {
             use workspace = new TestWorkspace()

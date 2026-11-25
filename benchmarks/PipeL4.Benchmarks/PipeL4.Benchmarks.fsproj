@@ -9,6 +9,7 @@
     <Compile Include="ConnectionStateBenchmarks.fs" />
     <Compile Include="SnapshotBenchmarks.fs" />
     <Compile Include="ProcessorPipelineAllocationBenchmarks.fs" />
+    <Compile Include="FunctionalProcessorAdapterBenchmarks.fs" />
     <Compile Include="LogicalAdmissionBenchmarks.fs" />
     <Compile Include="ProcessorPipelineDiagnosticsAllocationBenchmarks.fs" />
     <Compile Include="BackpressurePressureBenchmarks.fs" />

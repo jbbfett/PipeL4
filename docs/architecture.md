@@ -252,7 +252,22 @@ processors. The invocation input, output object, and uncommitted writable memory
 across asynchronous suspension. Advancing writable memory commits it to the runtime, after which
 the plugin must not use it; no invocation memory or output object may be retained after completion.
 
-Each compiled script must contain exactly one visible, concrete, non-generic class that implements
+Functional scripts are runnable through the same configured `.fsx` pipeline as class scripts;
+see the [public API guide](../src/PipeL4.Plugins/README.md#functional-processors) and
+[functional examples](../examples/functional). Only `handle` is mandatory for a stateless script.
+
+The host also has an internal typed adapter for functional handlers returning `ProcessorResult`,
+`Task<ProcessorResult>`, or `ValueTask<ProcessorResult>`. It passes the original segmented input, completion
+flag, runtime output writer through the same non-owning writer adapter, cancellation token, and
+connection-state view to each invocation. Synchronous handlers and successfully completed value tasks
+return a completed core value task without allocating an intermediate task. Suspended handlers are
+awaited by the existing executor before retention validation or downstream output publication; they
+use the same invocation memory lifetime, cancellation, and backpressure rules as class processors.
+Typed stage construction creates a fresh adapter for each configured stage, direction, and connection through
+the existing pipeline builder. Typed local-state creation and explicit functional disposal are
+described under State below.
+
+Class-based discovery selects exactly one visible, concrete, non-generic class that implements
 `PipeL4.Plugins.IByteStreamProcessor` and has either a public parameterless constructor or a public
 constructor accepting `PipeL4.Plugins.IConnectionState`. The state-aware constructor is preferred
 when both are present. Discovery uses the explicit processor interface rather than compiler-generated
@@ -262,6 +277,78 @@ it, and does not invalidate the reusable compiled definition. Every configured s
 fresh processor instance for each connection direction; compiled definitions and their constructor
 metadata are reused, but mutable processor instances are not shared across connections, opposite
 directions, or repeated stages.
+
+If no class implements the processor interface, discovery instead selects a top-level
+`handle` function from the compiled script assembly. F# module metadata identifies the top-level
+modules, and source-name and curried-argument metadata identify their definitions; discovery does
+not depend on generated script module names or inspect referenced assemblies. Nested modules are
+helpers and do not supply entry points. Exactly one `handle` is allowed; optional `create` and
+`dispose` must be unambiguous definitions in the same top-level module. A usable class retains
+precedence over functions, including the existing state-aware constructor preference and class
+ambiguity errors. Unusable processor classes retain their class validation error rather than
+falling back to functions.
+
+A stateless handler accepts `ProcessContext`; a stateful handler accepts `ProcessContext` followed
+by one curried, explicitly typed local-state argument. Both may return `ProcessorResult`,
+`Task<ProcessorResult>`, or `ValueTask<ProcessorResult>`. Stateful handlers require synchronous
+`create ()` or `create (ctx: CreateContext)` returning exactly the handler's state type. Closed
+generic and value state types are supported; open generic functions and byref-like local state
+cannot be stored by the typed adapter. Optional `dispose` takes that same state type and returns
+`unit`, `Task<unit>`, `ValueTask`, or `ValueTask<unit>`. A stateless handler cannot declare creation
+or disposal. No other functional entry point or implicit local-state cleanup is provided.
+
+Simple stateless scripts need no context annotation: `let handle ctx = emitInput ctx 0L
+ctx.Input.Length; releaseAll` infers `ProcessContext` through the helper. F# record-field inference
+can instead choose `ProcessorInput` if `ctx.IsCompleted` is used before a helper or the unique
+`Input` field. In that case use `let handle (ctx: ProcessContext) = ...`; discovery and contracts
+are unchanged. The intentionally failing
+[`ContextInferenceRepro.fsx`](../tests/fixtures/functional/ContextInferenceRepro.fsx) is a minimal
+reproduction for both the host compiler and F# Interactive; the integration test also compiles its
+annotated form. With a locally built API package, run
+`dotnet fsi scripts/validate_fsi_authoring.fsx <package-path> tests/fixtures/functional/ContextInferenceRepro.fsx`
+from the repository root to reproduce the compiler error. The matching `Passthrough.fsx` and
+`Counter.fsx` fixtures pass the same command. The required `handle` name is not reserved and
+produces no FS0046 warning.
+
+Source-level argument groups are distinct from CLR parameters. Creation accepts both erased
+`()` and explicit `(_: unit)` arguments. Unit-valued state likewise permits erased or explicit
+unit cleanup arguments. Reference-tuple state may flatten into several CLR parameters;
+`CompilationArgumentCounts` preserves the distinction between curried `handle ctx state` and a
+single tupled `handle (ctx, state)` declaration. Validation matches each logical argument group
+against the creation result type, including reference tuples, struct tuples, and nested tuples.
+When needed, load-time expression compilation prepares typed delegates that project tuple fields
+from the adapter's original state or supply/erase unit. Ordinary matching CLR signatures keep
+direct delegate binding. No argument arrays, reflection, state casts, or tuple construction are
+added by these projections during processing.
+
+Function-valued bindings are discovered through top-level property getters and validated using
+their `FSharpFunc` types. Compatible `create`, `handle`, and `dispose` aliases and captured closures
+are read once at load time and passed to the existing typed adapters. Fetching a creation function
+does not invoke its body. The cached object is the reusable function, never its per-stage creation
+result. Nonfunction values remain signature errors, and methods and getters participate in the
+same deterministic ambiguity checks.
+
+A stateful handler may also be a CLR method taking `ProcessContext` and returning an F# function
+of the local state. Discovery normalizes that result as the second logical argument. A typed
+method delegate is prepared at load time; the context-dependent function is evaluated and applied
+to state on every processing invocation, preserving captures and any source-authored allocation.
+
+The adapter retains the original typed state. F# itself can reconstruct a reference-tuple
+container inside a flattened function, so `ReferenceEquals` on that container is not preserved
+even by a native F# call. Component references remain unchanged; the binding follows that same
+calling convention. [`TupleIdentityRepro.fsx`](../tests/fixtures/functional/TupleIdentityRepro.fsx)
+is an executable reproduction using a native call, and the production compiler regression checks
+that discovered invocation has the same observation. This does not require changing the public
+state type or rejecting tuple state.
+
+Signatures and state relationships are checked before listener startup, without calling `create`.
+Diagnostics include the script path, function, and expected and actual signatures when available.
+At load time, static methods bind to typed delegates; one generic binding method is closed over
+the discovered state type and prepares a reusable factory. Processing invokes the existing typed
+adapters without reflection, runtime casts, state boxing, or intermediate input arrays. Factories
+create local state once for each stage instance, independently across repeated stages, directions,
+and connections. Creation exceptions follow the existing connection construction and rollback
+path; processing and explicit cleanup failures retain script, direction, and stage context.
 
 When a directional pipeline ends, its processor instances are disposed in reverse stage order.
 Processors may implement the standard `IAsyncDisposable` or `IDisposable` interfaces for their own
@@ -293,6 +380,30 @@ unchanged, and parameterless processors do not need state-related boilerplate.
 
 Processor instance fields remain the natural place for stage-local state. The runtime does not
 provide additional per-stage, per-direction, per-plugin, per-listener, or process-wide registries.
+
+Functional stages may instead create a typed local state value.
+Creation accepts `unit` or `CreateContext` and runs exactly once during processor construction,
+before processing, even when the stage never receives input. The context carries the same
+non-owning connection-state view used by the other stages in both directions. Each constructed
+adapter stores its own creation result and passes that value to every handler invocation and to
+optional explicit `dispose state` cleanup. Handlers may return `ProcessorResult`,
+`Task<ProcessorResult>`, or `ValueTask<ProcessorResult>` while retaining the same strongly typed state.
+Cleanup may return `unit`, `Task<unit>`, `ValueTask`, or `ValueTask<unit>` and is awaited through
+the existing asynchronous processor lifetime path. Internal typed handler and cleanup wrappers
+normalize reusable delegates during construction, keeping a separate synchronous handler fast path
+and avoiding reflection, state boxing, and partial application during invocation.
+Creation functions must allocate any local mutable state that needs isolation; the host does not
+clone values returned by user code. Stateless stages
+continue to use `handle ctx`; stateful stages use `handle ctx state`.
+
+Local state is not automatically disposed, even if it implements a disposal interface; fields are
+not recursively disposed. Only an explicitly supplied cleanup function runs, through the existing
+processor lifetime mechanism, in reverse stage order within each direction. Cleanup must respect
+connection-resource and runtime-memory ownership. A throwing creation function never yields a
+successfully constructed processor and receives no local cleanup callback; previously constructed
+stages still receive cleanup attempts. Handler and cleanup failures retain the existing contextual
+diagnostics and failure ordering. Typed adapter construction remains internal; compiled functional scripts use the same factories.
+Asynchronous functional creation is unsupported.
 
 Connection state uses ordinal string keys and exact declared .NET types. A key publishes at most
 one value through thread-safe `GetOrAdd` initialization; concurrent first access executes the

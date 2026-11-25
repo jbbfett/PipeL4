@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <Compile Include="ProcessorApi.fs" />
+    <Compile Include="FunctionalProcessorApi.fs" />
   </ItemGroup>
 
   <ItemGroup>

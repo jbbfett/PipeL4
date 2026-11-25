@@ -78,6 +78,66 @@ If the exchange fails, check that the .NET 10 runtime is installed, the backend 
 `127.0.0.1:6000`, and the script path exists; compilation errors appear before PipeL4 starts
 listening. OpenBSD netcat needs `-N` for this EOF-driven example.
 
+## Functional processors
+
+The current checkout supports a small functional API alongside the existing class-based API.
+For a complete passthrough plugin, save this as `Passthrough.fsx`:
+
+```fsharp
+#if INTERACTIVE
+#r "nuget: PipeL4.Plugins, 0.1.0-alpha.2"
+#endif
+
+open PipeL4.Plugins
+
+let handle ctx =
+    emitInput ctx 0L ctx.Input.Length
+    releaseAll
+```
+
+Run it with the existing configuration (from the repository root after building):
+
+```sh
+dotnet run --project src/PipeL4 --no-build -- \
+  --listen-address 127.0.0.1 --listen-port 5000 \
+  --backend-host 127.0.0.1 --backend-port 6000 \
+  --client-to-server-plugin ./Passthrough.fsx
+```
+
+Only `handle` is required. Optional synchronous `create` supplies fresh typed state per stage;
+optional `dispose` provides explicit cleanup. Handlers and disposal may be asynchronous. Input
+can span segments and invocations; emission and retained-suffix selection are independent.
+See the [complete public contract](src/PipeL4.Plugins/README.md#functional-processors), including
+[EOF-first type inference](src/PipeL4.Plugins/README.md#f-inference-and-editor-authoring).
+
+[Functional examples](examples/functional) include equivalents of AsciiUppercase, PrefixMode, and
+BytePatternReplace, plus bounded suffix retention and asynchronous lifecycle examples. Existing
+[class-based examples](examples) remain available and bundled by `pipel4 examples`; the new
+functional scripts are repository examples, loaded with the same plugin options. The existing
+[Passthrough](tests/fixtures/functional/Passthrough.fsx) and
+[Counter](tests/fixtures/functional/Counter.fsx) fixtures also demonstrate minimal authoring.
+
+The source package version remains `0.1.0-alpha.2`. The functional additions require tool and API
+binaries built from this checkout; the published release instructions below do not imply that
+older published binaries contain them. To check FSI and editor syntax against this local candidate,
+first build Release, then run these repository-relative commands:
+
+```sh
+mkdir -p ./artifacts/functional-api
+dotnet pack src/PipeL4.Plugins/PipeL4.Plugins.fsproj -c Release --no-build --no-restore \
+  -p:PaketDisableCliTest=true -p:BuildInParallel=false --output ./artifacts/functional-api
+dotnet fsi scripts/validate_fsi_authoring.fsx \
+  ./artifacts/functional-api/PipeL4.Plugins.0.1.0-alpha.2.nupkg \
+  ./examples/functional/PrefixMode.fsx
+```
+
+This is an isolated **local-package** FSI check, not a published NuGet consumer test. The validator
+uses the supplied candidate and its cached FSharp.Core dependency, and does not populate the
+editor's normal cache. For VS Code/Ionide, configure that local candidate feed and use an isolated
+NuGet cache when working with the unchanged version; restart the editor with those settings so
+it resolves the matching assembly. See [F# script authoring](#f-script-authoring) for conditional
+references and [release verification](docs/releasing.md#3a-manual-vs-codeionide-authoring-gate) for manual IDE checks.
+
 ## Core ideas
 
 - TCP only.
@@ -262,8 +322,8 @@ the PipeL4 process and are not sandboxed. See the [processor contract](docs/arch
 [plugin ownership](docs/architecture.md#plugins), and [EOF contract](docs/backpressure.md#eof-and-half-close)
 for the complete rules.
 
-User-facing processor examples live in `examples/` and use one descriptive PascalCase `.fsx` file
-per processor. `AsciiUppercase.fsx` is the canonical stateless example and
+Class-based processor examples live directly in `examples/`; functional equivalents live in
+`examples/functional/`. Each uses one descriptive PascalCase `.fsx` file per processor. `AsciiUppercase.fsx` is the canonical stateless example and
 `BytePatternReplace.fsx` demonstrates bounded stateful matching, while
 `PrefixMode.fsx` demonstrates bounded prefix-based mode selection; the `.fsx` files under
 `benchmarks/` are benchmark fixtures, not user-facing examples. The example intentionally has no
